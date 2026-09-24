@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/director-domain",
+    "crates/director-adapters",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/abyyxhek/orqyn"
+authors = ["Director Brain contributors"]
+
+[workspace.dependencies]
+# Inter-crate dependencies.
+director-domain = { path = "crates/director-domain" }
+director-adapters = { path = "crates/director-adapters" }
+
+# Shared runtime + serialization.
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+
+[profile.release]
+strip = "debuginfo"
+lto = "thin"
+codegen-units = 1

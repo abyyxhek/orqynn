@@ -1,0 +1,24 @@
+# Rust build artifacts.
+/target
+/target*/
+**/*.rs.bk
+
+# Cargo lockfile is committed for a binary/workspace; uncomment if publishing
+# libraries individually and you want the old convention.
+#Cargo.lock
+
+# IDE and editor state.
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+
+# Local environment and OS cruft.
+.env
+.env.*
+.DS_Store
+Thumbs.db
+
+# Redirected target directory used to dodge OneDrive sync locks (see README).
+.director-brain-target/
