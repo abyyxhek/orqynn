@@ -14,10 +14,13 @@ their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
-> **Status: Phase 1 complete.** The canonical domain model and the provider
-> trait boundary are in place, with zero substrate coupling and a passing test
-> suite. There is no MCP server, no persistence, no loop, and no substrate
-> adapter yet — those are later phases, and their absence here is deliberate.
+> **Status: Phase 1 complete, Phase 2 in progress.** The canonical domain model
+> and the provider trait boundary are in place, with zero substrate coupling and
+> a passing test suite. The handoff-mcp adapter's three building blocks — wire
+> types, a stdio JSON-RPC transport, and the bidirectional mapping — are in
+> place; the `HandoffAdapter` struct that composes them is the remaining step.
+> There is no MCP server of Director's own, no persistence, and no loop yet —
+> those are later phases, and their absence here is deliberate.
 
 ---
 
@@ -135,10 +138,27 @@ to become authoritative over Director's own state.
   fallback the verification engine will use when a substrate cannot execute
   commands.
 
-The real substrate adapters — `HandoffAdapter` and `AiMemoryAdapter` — are
-Phase 2 and Phase 3 and are **deliberately absent**. Director's core must be
-provably independent of the substrates before any substrate is wired in, and
-this crate is the proof.
+The real substrate adapters are **partly built**. `crates/director-adapters/src/handoff/`
+holds the handoff-mcp adapter's three layers:
+
+- **`wire`** — serde mirrors of handoff-mcp's JSON shapes. Deliberately not the
+  domain types and unable to become them, so every schema difference lives in
+  one place.
+- **`transport`** — a stdio JSON-RPC client. Director spawns the server as a
+  child process and speaks line-delimited JSON-RPC 2.0 over stdin/stdout. It
+  never links the substrate's code; it crosses a process boundary.
+- **`mapping`** — the bidirectional translation, and the layer that earns its
+  keep. The two models are not isomorphic: task statuses (6 vs 8 states),
+  priorities, and — critically — the meaning of `done`. handoff-mcp's `done` is
+  an agent self-report, so it becomes `VerificationPending`, not `Done`, unless
+  Director itself produced it (a marker stashed in the substrate's `extra`
+  map). That is the acceptance criterion "agent claims done, tests fail → must
+  not become COMPLETED", enforced at the boundary.
+
+The `HandoffAdapter` struct that composes these into `TaskProvider`,
+`AgentProvider`, and `SessionProvider` is the remaining Phase 2 step. The
+`AiMemoryAdapter` is Phase 3. Until they land, Director's core must remain
+provably independent of the substrates — `InMemoryProvider` is the proof.
 
 ---
 
@@ -281,7 +301,7 @@ than the plumbing:
 |---|---|
 | **0** ✅ | Repository forensics: read-only audit of both substrates. |
 | **1** ✅ | Canonical domain model + provider trait boundary, zero substrate coupling. |
-| 2 | `HandoffAdapter` — MCP client for handoff-mcp. |
+| 2 🚧 | `HandoffAdapter` — MCP client for handoff-mcp. Wire types, transport, and mapping done; the adapter struct is next. |
 | 3 | `AiMemoryAdapter` — MCP client for ai-memory. |
 | 5 | `director-store` — Director's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
 | 10 | The verification engine. |

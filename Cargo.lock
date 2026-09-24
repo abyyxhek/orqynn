@@ -89,6 +89,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "director-domain",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

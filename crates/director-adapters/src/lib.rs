@@ -27,8 +27,15 @@
 #![forbid(unsafe_code)]
 
 pub mod executor;
+pub mod handoff;
 pub mod memory;
 
 pub use executor::LocalExecutor;
 pub use memory::InMemoryError;
 pub use memory::InMemoryProvider;
+
+// The handoff adapter's sub-modules are re-exported flat so callers can reach
+// the transport and the mapping without knowing the internal split.
+pub use handoff::mapping;
+pub use handoff::transport::{McpTransport, TransportError};
+pub use handoff::wire;
