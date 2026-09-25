@@ -232,6 +232,9 @@ mod tests {
                 summary: "c".into(),
                 author: "a".into(),
                 committed_at: chrono::Utc::now(),
+                parents: vec![],
+                committer: "a".into(),
+                message: "c".into(),
             })
             .collect()
     }

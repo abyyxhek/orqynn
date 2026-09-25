@@ -17,6 +17,14 @@
 //! be provably independent of the substrates before any substrate is wired in,
 //! and this crate is the proof.
 //!
+//! ## Git observation
+//!
+//! The [`git`] module is the Phase 2 observation layer: a git2-backed
+//! observer, a file-backed store, and the service that composes them into
+//! project state. Like [`LocalExecutor`], it is concrete tool integration
+//! rather than substrate coupling — git is a tool Director reads, not a
+//! substrate Director talks to over MCP.
+//!
 //! ## The coupling rule
 //!
 //! This is the **only** crate that is permitted to know a substrate's name.
@@ -27,12 +35,17 @@
 #![forbid(unsafe_code)]
 
 pub mod executor;
+pub mod git;
 pub mod handoff;
 pub mod memory;
 
 pub use executor::LocalExecutor;
 pub use memory::InMemoryError;
 pub use memory::InMemoryProvider;
+
+// The git observation layer, re-exported flat: callers say `GitService`, not
+// `git::service::GitService`.
+pub use git::{GitObserver, GitService, RangeWalk, RepositoryStatusView, RepositoryStore};
 
 // The handoff adapter's sub-modules are re-exported flat so callers can reach
 // the transport and the mapping without knowing the internal split.

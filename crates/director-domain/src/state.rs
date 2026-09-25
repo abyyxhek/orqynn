@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{CheckpointId, MachineId};
 
 /// A commit as reported by git.
+///
+/// Phase 2 widened this from a summary-only record to the full canonical commit
+/// model: parents, committer, and the complete message body are now carried
+/// alongside the summary. Older payloads serialized before those fields existed
+/// still deserialize — the fields default — so checkpoints written by Phase 1
+/// remain readable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitInfo {
     /// Full 40-character SHA.
@@ -22,6 +28,23 @@ pub struct CommitInfo {
     pub author: String,
     /// When the commit was made.
     pub committed_at: chrono::DateTime<chrono::Utc>,
+    /// SHAs of the commit's parents. Empty for a root commit; two for a merge.
+    ///
+    /// Defaults to empty when deserializing a pre-Phase-2 payload.
+    #[serde(default)]
+    pub parents: Vec<String>,
+    /// Who committed the change, when that differs from the author.
+    ///
+    /// Defaults to the author's name when deserializing a pre-Phase-2 payload,
+    /// because git reports a committer only as a separate identity.
+    #[serde(default)]
+    pub committer: String,
+    /// The full commit message, including body. The summary is its first line.
+    ///
+    /// A commit message is **evidence, not verified truth**: Director records it,
+    /// but no task is ever completed because a message says "done".
+    #[serde(default)]
+    pub message: String,
 }
 
 /// One entry in the working tree status.
@@ -49,6 +72,22 @@ pub enum FileChange {
     Untracked,
     /// A path with unresolved merge markers.
     Conflicted,
+    /// A file copied to a new path. Only detectable when git's rename/copy
+    /// detection is enabled, and only meaningful alongside [`FileChangeRecord::old_path`].
+    Copied,
+}
+
+impl FileChange {
+    /// Whether this change carries a *previous* path the reader must know about
+    /// to understand what happened. Only renames and copies do.
+    pub fn has_old_path(self) -> bool {
+        matches!(self, FileChange::Renamed | FileChange::Copied)
+    }
+
+    /// Whether a change of this kind means a path entered the tracked tree.
+    pub fn is_addition(self) -> bool {
+        matches!(self, FileChange::Added | FileChange::Copied)
+    }
 }
 
 /// Outcome of a test run Director observed (not an agent's claim).

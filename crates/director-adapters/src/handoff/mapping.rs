@@ -25,10 +25,10 @@
 
 use serde_json::Value;
 
+use director_domain::agent::{Agent, AgentStatus, Harness};
 use director_domain::ids::{AgentId, MachineId, SessionId, TaskId};
 use director_domain::session::{AgentSession, SessionEnd, SessionStatus};
 use director_domain::task::{Complexity, ExpectedOutput, Priority, Task, TaskStatus};
-use director_domain::agent::{Agent, AgentStatus, Harness};
 
 use crate::handoff::wire::{AgentRecord, Schedule, TaskData};
 
@@ -50,17 +50,21 @@ pub const DIRECTOR_CAPABILITIES_KEY: &str = "director_capabilities";
 /// Key for Director's `Complexity`, which the substrate does not model.
 pub const DIRECTOR_COMPLEXITY_KEY: &str = "director_complexity";
 
-/// Marker written alongside Director-only statuses so a read can tell whether
-/// the substrate state is authoritative or a fallback.
-const FALLBACK_MARKER: &str = "director_status_is_fallback";
-
 /// Convert a substrate task into Director's task.
 ///
 /// `trusted_done_ids` is the set of task ids whose `done` state Director itself
 /// produced. Everything else reported `done` by the substrate is an agent
 /// self-report and becomes `VerificationPending`.
-pub fn task_from_wire(data: &TaskData, trusted_done_ids: &std::collections::HashSet<String>) -> Task {
-    let status = status_from_wire(&data.status, &data.extra, data.id.as_str(), trusted_done_ids);
+pub fn task_from_wire(
+    data: &TaskData,
+    trusted_done_ids: &std::collections::HashSet<String>,
+) -> Task {
+    let status = status_from_wire(
+        &data.status,
+        &data.extra,
+        data.id.as_str(),
+        trusted_done_ids,
+    );
     let priority = priority_from_wire(&data.priority, &data.extra);
     let complexity = data
         .extra
@@ -81,7 +85,11 @@ pub fn task_from_wire(data: &TaskData, trusted_done_ids: &std::collections::Hash
         })
         .unwrap_or_default();
 
-    let mut task = Task::new(TaskId::from_string(data.id.clone()), data.title.clone(), objective_of(data));
+    let mut task = Task::new(
+        TaskId::from_string(data.id.clone()),
+        data.title.clone(),
+        objective_of(data),
+    );
     task.status = status;
     task.priority = priority;
     task.complexity = complexity;
@@ -192,7 +200,7 @@ pub fn task_to_wire(task: &Task) -> TaskData {
         assignee: None,
         lock: None,
         scope_paths: task.scope_paths.clone(),
-        extra: extra,
+        extra,
     }
 }
 
@@ -246,9 +254,10 @@ pub fn status_to_wire(status: TaskStatus) -> (String, Option<String>) {
         // Director's Done is written together with the verified marker.
         TaskStatus::Done => ("done".to_string(), None),
         TaskStatus::Backlog => ("todo".to_string(), Some("backlog".to_string())),
-        TaskStatus::VerificationPending => {
-            ("in_progress".to_string(), Some("verification_pending".to_string()))
-        }
+        TaskStatus::VerificationPending => (
+            "in_progress".to_string(),
+            Some("verification_pending".to_string()),
+        ),
         // The substrate has no failure state. `done` is the nearest honest
         // terminal state; the real status is preserved in `extra`.
         TaskStatus::Failed => ("done".to_string(), Some("failed".to_string())),
@@ -270,7 +279,10 @@ fn status_from_director_string(s: &str) -> TaskStatus {
     }
 }
 
-fn priority_from_wire(substrate: &Option<String>, extra: &std::collections::HashMap<String, Value>) -> Option<Priority> {
+fn priority_from_wire(
+    substrate: &Option<String>,
+    extra: &std::collections::HashMap<String, Value>,
+) -> Option<Priority> {
     // Director's Critical is recovered before the substrate value is consulted.
     if let Some(p) = extra.get(DIRECTOR_PRIORITY_KEY).and_then(Value::as_str) {
         if p == "critical" {
@@ -389,7 +401,13 @@ fn machine_id_for(worktree: &str) -> String {
     // the same machine as far as the substrate can tell.
     let slug: String = worktree
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     format!("MACH-{slug}")
 }
@@ -429,7 +447,9 @@ pub fn session_from_wire(summary: &crate::handoff::wire::SessionSummary) -> Agen
         _ => SessionStatus::Closed,
     };
     session.ended_at = summary.ended_at.as_deref().and_then(parse_timestamp);
-    session.end = session.ended_at.map(|_| session_end_from_wire(&summary.status));
+    session.end = session
+        .ended_at
+        .map(|_| session_end_from_wire(&summary.status));
     session
 }
 
@@ -454,9 +474,12 @@ pub fn parse_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             // The server emits 9 fractional digits (`...427288500+00:00`);
             // chrono accepts these directly, but if it ever does not, truncate
             // to the seconds boundary rather than losing the timestamp.
-            s.split('.').next().and_then(|secs| {
-                chrono::NaiveDateTime::parse_from_str(secs, "%Y-%m-%dT%H:%M:%S").ok()
-            }).map(|naive| naive.and_utc())
+            s.split('.')
+                .next()
+                .and_then(|secs| {
+                    chrono::NaiveDateTime::parse_from_str(secs, "%Y-%m-%dT%H:%M:%S").ok()
+                })
+                .map(|naive| naive.and_utc())
         })
 }
 
@@ -518,7 +541,8 @@ mod tests {
             Some(&Value::Bool(true))
         );
 
-        let trusted: std::collections::HashSet<String> = ["AUTH-42".to_string()].into_iter().collect();
+        let trusted: std::collections::HashSet<String> =
+            ["AUTH-42".to_string()].into_iter().collect();
         let back = task_from_wire(&wire, &trusted);
         assert_eq!(back.status, TaskStatus::Done);
     }
@@ -644,10 +668,7 @@ mod tests {
     fn timestamp_parsing_handles_the_servers_form() {
         let parsed = parse_timestamp("2026-09-24T19:34:17.427288500+00:00");
         assert!(parsed.is_some());
-        assert_eq!(
-            parsed.unwrap().format("%Y-%m-%d").to_string(),
-            "2026-09-24"
-        );
+        assert_eq!(parsed.unwrap().format("%Y-%m-%d").to_string(), "2026-09-24");
     }
 
     #[test]
@@ -662,10 +683,7 @@ mod tests {
             last_heartbeat: "2026-09-24T20:00:00+00:00".into(),
             claimed_tasks: vec![],
         };
-        assert_eq!(
-            agent_from_wire(&record).status,
-            AgentStatus::Available
-        );
+        assert_eq!(agent_from_wire(&record).status, AgentStatus::Available);
         record.claimed_tasks = vec!["AUTH-42".into()];
         assert_eq!(agent_from_wire(&record).status, AgentStatus::Busy);
     }

@@ -34,6 +34,8 @@
 //!
 //! - [`ids`] — identity newtypes, one per entity kind.
 //! - [`project`] / [`task`] / [`agent`] / [`session`] — the nouns.
+//! - [`repository`] — a git working tree Director observes, and the
+//!   deterministic change detection over its state.
 //! - [`assignment`] / [`capability`] — who does what, and on what basis.
 //! - [`plan`] / [`decision`] / [`blocker`] — planning artifacts.
 //! - [`checkpoint`] / [`context`] / [`action`] — continuity and evidence.
@@ -57,6 +59,7 @@ pub mod ids;
 pub mod plan;
 pub mod project;
 pub mod providers;
+pub mod repository;
 pub mod session;
 pub mod state;
 pub mod task;
@@ -74,11 +77,16 @@ pub use context::{ContextSnapshot, RecentContext, DEFAULT_MAX_ACTIONS};
 pub use decision::{Decision, DecisionStatus};
 pub use handoff::{Handoff, HandoffError, HandoffState};
 pub use ids::{
-    ActionId, AgentId, AssignmentId, BlockerId, CheckpointId, DecisionId, HandoffId, Id,
-    IdGenerator, MachineId, PlanId, ProjectId, SessionId, SubtaskId, TaskId,
+    ActionId, AgentId, AssignmentId, BlockerId, CheckpointId, DecisionId, EventId, HandoffId, Id,
+    IdGenerator, MachineId, PlanId, ProjectId, RepositoryId, SessionId, SubtaskId, TaskId,
 };
 pub use plan::{Plan, PlanStatus};
 pub use project::{DefaultBranch, Project};
+pub use repository::{
+    DiffInfo, EventData, EventKind, FileChangeRecord, ObservationEvent, ProjectStateSnapshot,
+    Repository, RepositoryError, RepositoryStatus, SyncResult, SyncStatus, WorktreeState,
+    EVENT_SOURCE_GIT, SHORT_SHA_LEN,
+};
 pub use session::{AgentSession, SessionEnd, SessionStatus};
 pub use state::{
     ChangedFile, CommitInfo, FileChange, ProjectState, ProjectStateRef, StateComparison,

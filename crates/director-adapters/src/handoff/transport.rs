@@ -51,8 +51,10 @@ pub enum TransportError {
     /// The handoff-mcp binary could not be started.
     #[error("could not spawn handoff-mcp at {path}: {source}")]
     SpawnFailed {
+        /// The binary path we tried to launch.
         path: String,
         #[source]
+        /// Why the spawn failed.
         source: std::io::Error,
     },
     /// The server closed or produced malformed JSON-RPC.
@@ -69,32 +71,43 @@ pub enum TransportError {
 /// A request we send over the wire.
 #[derive(Debug, Serialize)]
 struct Request {
+    /// Fixed JSON-RPC version marker.
     jsonrpc: &'static str,
+    /// The caller-allocated request id, matched against the reply.
     id: u64,
+    /// The MCP method being invoked.
     method: String,
+    /// Its arguments, if any.
     params: Value,
 }
 
 /// A notification (no id, no reply expected).
 #[derive(Debug, Serialize)]
 struct Notification {
+    /// Fixed JSON-RPC version marker.
     jsonrpc: &'static str,
+    /// The MCP method being notified.
     method: String,
 }
 
 /// The envelope a `tools/call` result arrives in.
 #[derive(Debug, Deserialize)]
 struct ToolResult {
+    /// Content blocks the tool returned; empty means no content.
     #[serde(default)]
     content: Vec<ContentBlock>,
+    /// True when the tool itself reports the call failed.
     #[serde(default)]
     is_error: bool,
 }
 
+/// One block inside a tool result.
 #[derive(Debug, Deserialize)]
 struct ContentBlock {
+    /// The block type, e.g. `"text"`.
     #[serde(rename = "type")]
     kind: String,
+    /// The block's text payload, when it carries one.
     #[serde(default)]
     text: Option<String>,
 }
@@ -102,21 +115,30 @@ struct ContentBlock {
 /// One half of the raw JSON-RPC reply: either a result or an error.
 #[derive(Debug, Deserialize)]
 struct Reply {
+    /// The id matching the request, when the server echoes one.
     id: Option<u64>,
+    /// The successful result payload, when this is not an error reply.
     result: Option<Value>,
+    /// The JSON-RPC error object, when the call failed at the protocol level.
     error: Option<JsonRpcError>,
 }
 
+/// A protocol-level error object.
 #[derive(Debug, Deserialize)]
 struct JsonRpcError {
+    /// The human-oriented error message.
     message: String,
 }
 
 /// A live JSON-RPC connection to one handoff-mcp child process.
 pub struct McpTransport {
+    /// The spawned server process.
     child: Child,
+    /// Our write end of its stdin.
     stdin: ChildStdin,
+    /// Buffered read end of its stdout.
     stdout: BufReader<ChildStdout>,
+    /// The next request id to allocate.
     next_id: AtomicU64,
     /// The identity baked into this connection's environment at spawn time.
     agent_id: AgentId,
@@ -300,13 +322,7 @@ impl McpTransport {
             .content
             .into_iter()
             .next()
-            .and_then(|c| {
-                if c.kind == "text" {
-                    c.text
-                } else {
-                    None
-                }
-            })
+            .and_then(|c| if c.kind == "text" { c.text } else { None })
             .ok_or(TransportError::NoContent)
     }
 

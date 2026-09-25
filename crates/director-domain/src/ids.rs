@@ -193,6 +193,24 @@ define_id!(
     "ASG"
 );
 
+define_id!(
+    /// Unique identifier for a [Repository](crate::repository::Repository) that
+    /// Director observes.
+    ///
+    /// Example: `REPO-checkout`
+    RepositoryId,
+    "REPO"
+);
+
+define_id!(
+    /// Unique identifier for an [ObservationEvent](crate::repository::ObservationEvent)
+    /// — one fact that Director learned by looking at git.
+    ///
+    /// Example: `EVT-a1b2c3`
+    EventId,
+    "EVT"
+);
+
 /// Generates ids with a monotonic per-generator counter.
 ///
 /// Director never relies on an external id service: a new machine with no
