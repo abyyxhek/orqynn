@@ -81,16 +81,19 @@ pub struct TaskData {
 }
 
 /// A typed link attached to a task.
+///
+/// Field names are exactly what `handoff_get_task` puts in `task_links`: the
+/// target first, then its kind, then an optional label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskLink {
-    /// Link kind — e.g. `commit`, `pr`, `doc` — renamed from the wire's `type`.
-    #[serde(rename = "type")]
-    pub kind: String,
+    /// What the link points at — a URL, a commit ref, a document id.
+    pub target: String,
+    /// Link kind, e.g. `doc`, `url`, `file`, `task`. The substrate's legacy
+    /// `links` array becomes `file` links in the normalized view.
+    pub link_type: String,
     /// Optional human label for the link.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// The link target as a URL or reference string.
-    pub url: String,
 }
 
 /// One acceptance criterion. On the substrate side this is a self-reportable
@@ -99,7 +102,7 @@ pub struct TaskLink {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoneCriterion {
     /// The criterion's wording.
-    pub text: String,
+    pub item: String,
     /// Whether some agent reported the criterion met. **Never** treated as
     /// verification by Director — see Phase 0 finding R6.
     #[serde(default)]
@@ -177,6 +180,9 @@ pub struct AgentList {
 ///
 /// Note this is a *summary*, not the full `SessionData`: `handoff_list_sessions`
 /// reports counts and progress rather than the full decisions/checklist arrays.
+/// It does, however, carry ownership and lineage — `agent_id` and
+/// `parent_session_id` are present on the wire whenever the underlying session
+/// record has them, so the adapter does not have to guess at either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     /// The session's id.
@@ -203,6 +209,15 @@ pub struct SessionSummary {
     /// Progress summary like `"3/7"`, as a raw string.
     #[serde(default)]
     pub checklist_progress: String,
+    /// The agent that ran this session, when the record carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// The session this one forked from, when it is a fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Working tree the session ran in, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
 }
 
 /// Wrapper shape of `handoff_list_tasks` — a tree of summaries, not full tasks.

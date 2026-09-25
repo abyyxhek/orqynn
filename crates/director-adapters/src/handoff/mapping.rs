@@ -22,6 +22,29 @@
 //!
 //! 3. **Priority.** The substrate has `low`/`medium`/`high`. Director adds
 //!    `Critical`, which maps down to `high` and is recovered from `extra`.
+//!
+//! ## The `extra` channel, and what it can and cannot carry
+//!
+//! `TaskData.extra` is a real `#[serde(flatten)]` map *inside* the substrate's
+//! storage layer, and this mapping writes Director-only state into it. But
+//! against the live v0.35.1 server that channel is closed at the MCP boundary
+//! in both directions:
+//!
+//! - **Reads.** `handoff_get_task` builds its reply from named fields only;
+//!   `extra` is never serialized onto the wire.
+//! - **Writes.** `handoff_update_task` reconstructs the record from named
+//!   fields. A *create* starts from `extra: HashMap::new()`, and an *update*
+//!   copies only known fields out of the request — so values Director sends
+//!   in `extra` never reach the file.
+//!
+//! The consequence is stated plainly because it is easy to get wrong: **a
+//! Director-only status or a `Critical` priority does not survive a substrate
+//! round trip.** The write path still populates `extra` — it is the correct
+//! shape if the substrate ever exposes the field, and it costs nothing — but
+//! nothing here depends on it. What the boundary *can* rely on is the set of
+//! ids Director itself completed, passed as `trusted_done_ids`; that is how
+//! the verification rule holds, and that set lives in the adapter's own state
+//! ([`crate::handoff::adapter`]), not in the substrate.
 
 use serde_json::Value;
 
@@ -104,7 +127,7 @@ pub fn task_from_wire(
         .done_criteria
         .iter()
         .map(|c| ExpectedOutput {
-            criterion: c.text.clone(),
+            criterion: c.item.clone(),
             check: None,
         })
         .collect();
@@ -187,7 +210,7 @@ pub fn task_to_wire(task: &Task) -> TaskData {
             .expected_outputs
             .iter()
             .map(|o| crate::handoff::wire::DoneCriterion {
-                text: o.criterion.clone(),
+                item: o.criterion.clone(),
                 // Never checked by Director: ticking this is an agent
                 // self-report, and Director does not treat it as evidence.
                 checked: false,
@@ -429,17 +452,35 @@ fn agent_status_from_wire(substrate: &str, holds_tasks: bool) -> AgentStatus {
 }
 
 /// Map a substrate session summary to Director's session.
+///
+/// Ownership, lineage, and working directory all come from the summary itself
+/// — the substrate's `handoff_list_sessions` carries them whenever the
+/// underlying session record has them. When it does not, the caller falls back
+/// to [`unknown_agent_id`] rather than inventing an owner: Director would
+/// rather show an unattributed session than attribute it to the wrong agent.
 pub fn session_from_wire(summary: &crate::handoff::wire::SessionSummary) -> AgentSession {
+    let agent_id = summary
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| unknown_agent_id().to_string());
     let mut session = AgentSession::start(
         SessionId::from_string(summary.id.clone()),
-        // Session ownership is recorded elsewhere in the substrate's full
-        // record; the summary does not carry it. Agent id is required by
-        // Director's model, so the adapter records a placeholder that the
-        // session-service layer (Phase 8) reconciles.
-        AgentId::from_string("AGENT-unknown".to_string()),
-        MachineId::from_string("MACH-unknown"),
+        AgentId::from_string(agent_id),
+        MachineId::from_string(machine_id_for(
+            summary.worktree.as_deref().unwrap_or("unknown"),
+        )),
         None,
     );
+    session.parent_session_id = summary
+        .parent_session_id
+        .clone()
+        .map(SessionId::from_string);
+    session.workdir = summary.worktree.clone();
+    session.started_at = summary
+        .started_at
+        .as_deref()
+        .and_then(parse_timestamp)
+        .unwrap_or(session.started_at);
     session.status = match summary.status.as_str() {
         "open" => SessionStatus::Open,
         "active" => SessionStatus::Active,
@@ -451,6 +492,11 @@ pub fn session_from_wire(summary: &crate::handoff::wire::SessionSummary) -> Agen
         .ended_at
         .map(|_| session_end_from_wire(&summary.status));
     session
+}
+
+/// The agent id used when the substrate gives us no owner for a session.
+pub fn unknown_agent_id() -> &'static str {
+    "AGENT-unknown"
 }
 
 fn session_end_from_wire(substrate_status: &str) -> SessionEnd {
@@ -703,5 +749,60 @@ mod tests {
         assert_eq!(agent_from_wire(&record).status, AgentStatus::Stale);
         record.status = "disconnected".into();
         assert_eq!(agent_from_wire(&record).status, AgentStatus::Disconnected);
+    }
+
+    #[test]
+    fn a_session_summary_carries_owner_lineage_and_workdir() {
+        let summary = crate::handoff::wire::SessionSummary {
+            id: "SESS-2".into(),
+            status: "closed".into(),
+            summary: "shipped the login page".into(),
+            started_at: Some("2026-09-24T19:00:00+00:00".into()),
+            ended_at: Some("2026-09-24T21:00:00+00:00".into()),
+            branch: Some("feat/login".into()),
+            commit: Some("abc123".into()),
+            decisions_count: 3,
+            checklist_progress: "2/2".into(),
+            agent_id: Some("AGENT-7".into()),
+            parent_session_id: Some("SESS-1".into()),
+            worktree: Some("C:/repo/worktrees/login".into()),
+        };
+
+        let session = session_from_wire(&summary);
+        assert_eq!(session.id, SessionId::from_string("SESS-2"));
+        assert_eq!(session.agent_id, AgentId::from_string("AGENT-7"));
+        assert_eq!(
+            session.parent_session_id,
+            Some(SessionId::from_string("SESS-1"))
+        );
+        assert_eq!(session.status, SessionStatus::Closed);
+        assert_eq!(session.end, Some(SessionEnd::Clean));
+        assert_eq!(session.workdir.as_deref(), Some("C:/repo/worktrees/login"));
+    }
+
+    #[test]
+    fn an_unattributed_session_falls_back_to_unknown_not_to_a_guess() {
+        let summary = crate::handoff::wire::SessionSummary {
+            id: "SESS-9".into(),
+            status: "closed".into(),
+            summary: String::new(),
+            started_at: None,
+            ended_at: None,
+            branch: None,
+            commit: None,
+            decisions_count: 0,
+            checklist_progress: String::new(),
+            agent_id: None,
+            parent_session_id: None,
+            worktree: None,
+        };
+
+        let session = session_from_wire(&summary);
+        assert_eq!(session.agent_id, AgentId::from_string(unknown_agent_id()));
+        assert!(session.parent_session_id.is_none());
+        assert!(
+            session.ended_at.is_none(),
+            "a session that never ended has no end reason"
+        );
     }
 }
