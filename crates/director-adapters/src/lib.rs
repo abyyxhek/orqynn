@@ -38,6 +38,7 @@ pub mod executor;
 pub mod git;
 pub mod handoff;
 pub mod memory;
+pub mod stdio_mcp;
 
 pub use executor::LocalExecutor;
 pub use memory::InMemoryError;
@@ -49,6 +50,7 @@ pub use git::{GitObserver, GitService, RangeWalk, RepositoryStatusView, Reposito
 
 // The handoff adapter's sub-modules are re-exported flat so callers can reach
 // the transport and the mapping without knowing the internal split.
+pub use handoff::adapter::{HandoffAdapter, HandoffAdapterError, HandoffWire};
 pub use handoff::mapping;
 pub use handoff::transport::{McpTransport, TransportError};
 pub use handoff::wire;

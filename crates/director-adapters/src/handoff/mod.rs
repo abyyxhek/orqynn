@@ -1,7 +1,7 @@
 //! Adapter for the handoff-mcp substrate.
 //!
 //! This is the Phase 2 deliverable: a real substrate adapter, built on the
-//! boundary Phase 1 established. Three pieces, each with one job:
+//! boundary Phase 1 established. Four pieces, each with one job:
 //!
 //! - [`wire`] — serde mirrors of handoff-mcp's JSON shapes. Deliberately *not*
 //!   the domain types and unable to become them, so every schema difference
@@ -11,6 +11,9 @@
 //!   and speaks line-delimited JSON-RPC 2.0 over stdin/stdout. Director never
 //!   links the substrate's code; it crosses a process boundary.
 //! - [`mapping`] — the bidirectional translation between the two models.
+//! - [`adapter`] — the struct that makes the provider traits real by composing
+//!   the three above, and holds the state none of them can: which tasks
+//!   Director itself completed.
 //!
 //! ## The mapping is not boilerplate
 //!
@@ -26,14 +29,14 @@
 //!    Phase 0 finding R6: `handoff_check_criterion` is a checkbox an agent
 //!    ticks. So a substrate `done` does **not** become Director `Done`. It
 //!    becomes [`VerificationPending`](director_domain::task::TaskStatus::VerificationPending),
-//!    because nothing has been verified. Only a `done` that Director itself
-//!    produced — marked with [`DIRECTOR_VERIFIED_KEY`](mapping::DIRECTOR_VERIFIED_KEY)
-//!    — maps back to `Done`.
+//!    because nothing has been verified.
 //!
 //! That third rule is the acceptance criterion "agent claims done, tests fail →
 //! must not become COMPLETED", enforced at the boundary rather than in the
 //! loop. It is the reason the adapter exists as a separate layer instead of a
-//! set of `From` impls.
+//! set of `From` impls. See [`mapping`] for what the `extra` channel can and
+//! cannot actually carry against the live server, and [`adapter`] for how the
+//! trusted-done set makes the rule hold anyway.
 //!
 //! ## Identity: one child process per agent
 //!
@@ -49,11 +52,18 @@
 //!
 //! ## What is not here
 //!
-//! The `HandoffAdapter` struct that implements `TaskProvider`,
-//! `AgentProvider`, and `SessionProvider` by composing the transport and the
-//! mapping. The pieces it will compose are complete and tested; the struct is
-//! Phase 2's remaining step, and nothing here presupposes its shape.
+//! The `HandoffAdapter` implements `TaskProvider`, `AgentProvider`, and
+//! `SessionProvider` only. `HandoffProvider` (Director's claim-once transfer is
+//! not the substrate's session-scoped handoff notes), `MemoryProvider` (that is
+//! the ai-memory adapter, Phase 3), `ProjectStateProvider` (git observation,
+//! the [`crate::git`] module), and `ExecutionProvider` are all deliberately
+//! absent. Where the substrate has no honest equivalent for a trait method —
+//! setting an agent's status, registering an agent other than the connection's
+//! own identity — the adapter returns an error rather than approximating.
 
+pub mod adapter;
 pub mod mapping;
 pub mod transport;
 pub mod wire;
+
+pub use adapter::{HandoffAdapter, HandoffAdapterError, HandoffWire};
