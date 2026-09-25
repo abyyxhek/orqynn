@@ -16,11 +16,20 @@ crates. A boundary test in this repo enforces that — see
 
 > **Status: Phase 1 complete, Phase 2 in progress.** The canonical domain model
 > and the provider trait boundary are in place, with zero substrate coupling and
-> a passing test suite. The handoff-mcp adapter's three building blocks — wire
-> types, a stdio JSON-RPC transport, and the bidirectional mapping — are in
-> place; the `HandoffAdapter` struct that composes them is the remaining step.
-> There is no MCP server of Director's own, no persistence, and no loop yet —
-> those are later phases, and their absence here is deliberate.
+> a passing test suite (174 tests). Phase 2 has two independent halves, and both
+> halves have now landed in code:
+>
+> - **The observation half** — a git2-backed observer, a file-backed store, and
+>   the service that composes them into `ProjectStateSnapshot` with
+>   deterministic change detection. Read-only by construction: Director never
+>   mutates a repository it is verifying.
+> - **The handoff-mcp half** — wire types, a stdio JSON-RPC transport, and the
+>   bidirectional mapping.
+>
+> The remaining Phase 2 step is the `HandoffAdapter` struct that composes those
+> three into live `TaskProvider`, `AgentProvider`, and `SessionProvider`
+> implementations. There is no MCP server of Director's own, no persistence, and
+> no loop yet — those are later phases, and their absence here is deliberate.
 
 ---
 
@@ -61,9 +70,10 @@ director-brain/
 ├── crates/
 │   ├── director-domain/     # The vocabulary: every entity, identity, status
 │   │                        # enum, and provider trait. Knows no substrate.
-│   └── director-adapters/   # InMemoryProvider (all traits, in-process) +
-│                            # LocalExecutor (real command execution).
-│                            # The ONLY crate allowed to name a substrate.
+│   └── director-adapters/   # InMemoryProvider (all traits, in-process),
+│                            # LocalExecutor (real command execution), and
+│                            # the git observation layer. The ONLY crate
+│                            # allowed to name a substrate.
 ├── docs/
 │   ├── PHASE0-FORENSICS.md  # Read-only audit of both upstream repos:
 │   │                        # data models, ~30 vs ~80 MCP tools, feature
@@ -96,6 +106,7 @@ prose.
 | `blocker` | `Blocker`, `BlockerKind`, `BlockerStatus` | "Still blocked after three replans" is a reportable condition. `Obsolete` ≠ `Resolved`. |
 | `handoff` | `Handoff`, `HandoffState`, `HandoffError` | Claim-once: only the addressed agent may accept, and only while open. |
 | `project` | `Project`, `DefaultBranch` | A root, not a container — tasks are referenced by id, never nested. |
+| `repository` | `Repository`, `ProjectStateSnapshot`, `WorktreeState`, `ObservationEvent`, `SyncResult` | What Director learned by looking at git, and how it tells one observation from the next. Neither substrate has this. |
 | `providers` | 7 provider traits + `Provider`, `ProviderError`, `Memory`, `MemoryQuery`, `CommandSpec`, `CommandOutcome` | The trait boundary. |
 
 ### `providers` — the boundary
@@ -137,6 +148,26 @@ to become authoritative over Director's own state.
   `std::process` with a timeout. It is the reference local executor and the
   fallback the verification engine will use when a substrate cannot execute
   commands.
+- **The git observation layer** — `crates/director-adapters/src/git/`, the
+  Phase 2 `ProjectStateProvider` for a local working tree. Three pieces, each
+  separately testable:
+  - **`observer`** — a git2-backed read-only lens over a working tree: HEAD and
+    branch state, the commit range between two observations, working-tree
+    status with rename and copy detection, and diff contents. It never opens a
+    repository for writing.
+  - **`store`** — a JSON file store keyed by repository, holding the last
+    observed state so a subsequent observation can be compared against it
+    rather than against nothing.
+  - **`service`** — composes the two into `GitService`, producing
+    `ProjectStateSnapshot` and the `ObservationEvent`s that changed since last
+    time. This is the deterministic change detection the verification engine
+    will key on: the same walk of the same repository yields the same events.
+
+  `CommitInfo` was widened in the same step to the full canonical commit model
+  — parents, committer, and the complete message body — with `serde` defaults
+  so checkpoints written by Phase 1 stay readable. A commit message is recorded
+  as **evidence, not verified truth**: no task is ever completed because a
+  message says "done".
 
 The real substrate adapters are **partly built**. `crates/director-adapters/src/handoff/`
 holds the handoff-mcp adapter's three layers:
@@ -285,15 +316,20 @@ than the plumbing:
 
 ---
 
-## What Phase 1 deliberately does not do
+## What Director deliberately does not do yet
 
 - **No persistence.** `InMemoryProvider` is in-process only; the store crate
-  comes with checkpoints in a later phase.
+  comes with checkpoints in a later phase. (The git observation layer's JSON
+  store holds observed repository state only — it is a cache for change
+  detection, not Director's own state.)
 - **No MCP server.** Director's own tool surface is a later phase.
 - **No planner, no verification engine, no loop.** The traits exist; the
   behavior does not.
-- **No substrate adapters.** Until they land, Director has no way to reach
-  either substrate — by design.
+- **No live substrate connection.** The handoff-mcp wire types, transport, and
+  mapping are in place, but nothing composes them into a provider yet —
+  `HandoffAdapter` is the remaining Phase 2 step. Until it lands, Director's
+  core must remain provably independent of the substrates, and
+  `InMemoryProvider` is the proof.
 
 ## Roadmap
 
@@ -301,7 +337,7 @@ than the plumbing:
 |---|---|
 | **0** ✅ | Repository forensics: read-only audit of both substrates. |
 | **1** ✅ | Canonical domain model + provider trait boundary, zero substrate coupling. |
-| 2 🚧 | `HandoffAdapter` — MCP client for handoff-mcp. Wire types, transport, and mapping done; the adapter struct is next. |
+| 2 🚧 | **Git observation layer ✅** (observer, store, service, `ProjectStateSnapshot`) **+ handoff-mcp client** (wire, transport, mapping ✅; `HandoffAdapter` next). |
 | 3 | `AiMemoryAdapter` — MCP client for ai-memory. |
 | 5 | `director-store` — Director's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
 | 10 | The verification engine. |
