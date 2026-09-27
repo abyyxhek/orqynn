@@ -14,22 +14,23 @@ their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
-> **Status: Phase 1 complete, Phase 2 in progress.** The canonical domain model
-> and the provider trait boundary are in place, with zero substrate coupling and
-> a passing test suite (174 tests). Phase 2 has two independent halves, and both
-> halves have now landed in code:
+> **Status: Phases 0–2 complete.** The canonical domain model and the provider
+> trait boundary are in place, and Phase 2 has now landed in full: 191 tests
+> passing plus live tests against the real handoff-mcp server (ignored by
+> default). Phase 2 had two independent halves, and both are done:
 >
 > - **The observation half** — a git2-backed observer, a file-backed store, and
 >   the service that composes them into `ProjectStateSnapshot` with
 >   deterministic change detection. Read-only by construction: Director never
 >   mutates a repository it is verifying.
-> - **The handoff-mcp half** — wire types, a stdio JSON-RPC transport, and the
->   bidirectional mapping.
+> - **The handoff-mcp half** — wire types, a stdio JSON-RPC transport, the
+>   bidirectional mapping, and `HandoffAdapter`, which composes those three into
+>   live `TaskProvider`, `AgentProvider`, and `SessionProvider` implementations
+>   against a real substrate process.
 >
-> The remaining Phase 2 step is the `HandoffAdapter` struct that composes those
-> three into live `TaskProvider`, `AgentProvider`, and `SessionProvider`
-> implementations. There is no MCP server of Director's own, no persistence, and
-> no loop yet — those are later phases, and their absence here is deliberate.
+> Director's provider traits are now implemented against something that is not a
+> `HashMap`. There is no MCP server of Director's own, no persistence, and no
+> loop yet — those are later phases, and their absence here is deliberate.
 
 ---
 
@@ -71,14 +72,18 @@ director-brain/
 │   ├── director-domain/     # The vocabulary: every entity, identity, status
 │   │                        # enum, and provider trait. Knows no substrate.
 │   └── director-adapters/   # InMemoryProvider (all traits, in-process),
-│                            # LocalExecutor (real command execution), and
-│                            # the git observation layer. The ONLY crate
-│                            # allowed to name a substrate.
+│                            # LocalExecutor (real command execution), the
+│                            # git observation layer, and the handoff-mcp
+│                            # adapter. The ONLY crate allowed to name a
+│                            # substrate.
 ├── docs/
-│   ├── PHASE0-FORENSICS.md  # Read-only audit of both upstream repos:
-│   │                        # data models, ~30 vs ~80 MCP tools, feature
-│   │                        # comparison, integration risks, boundary design.
-│   └── PHASE1-DOMAIN.md     # This deliverable: the model and the boundary.
+│   ├── PHASE0-FORENSICS.md    # Read-only audit of both upstream repos:
+│   │                          # data models, ~30 vs ~80 MCP tools, feature
+│   │                          # comparison, integration risks, boundary design.
+│   ├── PHASE1-DOMAIN.md       # The canonical model and the provider boundary.
+│   ├── PHASE2-OBSERVATION.md  # The git observation layer.
+│   └── PHASE2-ADAPTERS.md     # The substrate adapters: mapping, transport,
+│                              # HandoffAdapter, incl. live-testing findings.
 ├── Cargo.toml               # Workspace manifest.
 ├── rust-toolchain.toml      # Pinned: stable-x86_64-pc-windows-gnu.
 └── THIRD_PARTY_LICENSES.md  # MIT notices for both substrates (© 2026 Fabio Akita).
@@ -169,8 +174,8 @@ to become authoritative over Director's own state.
   as **evidence, not verified truth**: no task is ever completed because a
   message says "done".
 
-The real substrate adapters are **partly built**. `crates/director-adapters/src/handoff/`
-holds the handoff-mcp adapter's three layers:
+The handoff-mcp adapter is built. `crates/director-adapters/src/handoff/`
+holds four layers:
 
 - **`wire`** — serde mirrors of handoff-mcp's JSON shapes. Deliberately not the
   domain types and unable to become them, so every schema difference lives in
@@ -185,10 +190,24 @@ holds the handoff-mcp adapter's three layers:
   Director itself produced it (a marker stashed in the substrate's `extra`
   map). That is the acceptance criterion "agent claims done, tests fail → must
   not become COMPLETED", enforced at the boundary.
+- **`adapter`** — [`HandoffAdapter`], composing the three above into live
+  `TaskProvider`, `AgentProvider`, and `SessionProvider` over any
+  `HandoffWire` connection. It holds the one piece of state none of those
+  layers can carry: the `trusted_done_ids` set of task ids Director itself
+  completed, which is the only thing that lets a substrate `done` come back as
+  `Done` instead of `VerificationPending`.
 
-The `HandoffAdapter` struct that composes these into `TaskProvider`,
-`AgentProvider`, and `SessionProvider` is the remaining Phase 2 step. The
-`AiMemoryAdapter` is Phase 3. Until they land, Director's core must remain
+[`HandoffAdapter`]: crates/director-adapters/src/handoff/adapter.rs
+
+The adapter is covered by 15 unit tests against a fake wire connection plus 5
+live tests that spawn the real handoff-mcp server binary (marked `#[ignore]` so
+they do not run by default). Live testing surfaced two findings recorded in
+[`docs/PHASE2-ADAPTERS.md`](docs/PHASE2-ADAPTERS.md): the substrate's `extra`
+channel is closed at the MCP boundary in both directions, so Director-only
+statuses do not round-trip; and two wire mirrors had to be corrected from the
+real server's shapes.
+
+The `AiMemoryAdapter` is Phase 3. Until it lands, Director's core must remain
 provably independent of the substrates — `InMemoryProvider` is the proof.
 
 ---
@@ -325,11 +344,10 @@ than the plumbing:
 - **No MCP server.** Director's own tool surface is a later phase.
 - **No planner, no verification engine, no loop.** The traits exist; the
   behavior does not.
-- **No live substrate connection.** The handoff-mcp wire types, transport, and
-  mapping are in place, but nothing composes them into a provider yet —
-  `HandoffAdapter` is the remaining Phase 2 step. Until it lands, Director's
-  core must remain provably independent of the substrates, and
-  `InMemoryProvider` is the proof.
+- **No ai-memory adapter yet.** The handoff-mcp side is wired end to end —
+  `HandoffAdapter` runs live against a real substrate process — but the
+  `AiMemoryAdapter` is Phase 3. Until it lands, Director's core must remain
+  provably independent of the substrates, and `InMemoryProvider` is the proof.
 
 ## Roadmap
 
@@ -337,7 +355,7 @@ than the plumbing:
 |---|---|
 | **0** ✅ | Repository forensics: read-only audit of both substrates. |
 | **1** ✅ | Canonical domain model + provider trait boundary, zero substrate coupling. |
-| 2 🚧 | **Git observation layer ✅** (observer, store, service, `ProjectStateSnapshot`) **+ handoff-mcp client** (wire, transport, mapping ✅; `HandoffAdapter` next). |
+| **2** ✅ | Git observation layer (observer, store, service, `ProjectStateSnapshot`) **+ handoff-mcp client** (wire, transport, mapping, `HandoffAdapter` running live against the real server). |
 | 3 | `AiMemoryAdapter` — MCP client for ai-memory. |
 | 5 | `director-store` — Director's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
 | 10 | The verification engine. |
