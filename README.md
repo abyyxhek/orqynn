@@ -14,23 +14,24 @@ their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
-> **Status: Phases 0–2 complete.** The canonical domain model and the provider
-> trait boundary are in place, and Phase 2 has now landed in full: 191 tests
-> passing plus live tests against the real handoff-mcp server (ignored by
-> default). Phase 2 had two independent halves, and both are done:
+> **Status: Phases 1–3 complete.** The canonical domain model, the provider
+> trait boundary, and both substrate adapters are in place, with zero substrate
+> coupling and a passing test suite (209 tests).
 >
-> - **The observation half** — a git2-backed observer, a file-backed store, and
->   the service that composes them into `ProjectStateSnapshot` with
->   deterministic change detection. Read-only by construction: Orqyn never
->   mutates a repository it is verifying.
-> - **The handoff-mcp half** — wire types, a stdio JSON-RPC transport, the
->   bidirectional mapping, and `HandoffAdapter`, which composes those three into
->   live `TaskProvider`, `AgentProvider`, and `SessionProvider` implementations
->   against a real substrate process.
+> - **Phase 1** — the domain model and the seven provider traits it depends on,
+>   plus an in-memory implementor of every one of them.
+> - **Phase 2** — the git observation layer (a git2-backed observer, a
+>   file-backed store, and the composing service) and the `HandoffAdapter`, a
+>   live `TaskProvider`/`AgentProvider`/`SessionProvider` over handoff-mcp on
+>   stdio JSON-RPC.
+> - **Phase 3** — the `AiMemoryAdapter`, a live `MemoryProvider` over
+>   ai-memory. Orqyn's long-term memory is now a substrate it reuses rather
+>   than reimplements: FTS5, entity, and graph retrieval with decay are already
+>   solved well there.
 >
-> Orqyn's provider traits are now implemented against something that is not a
-> `HashMap`. There is no MCP server of Orqyn's own, no persistence, and no
-> loop yet — those are later phases, and their absence here is deliberate.
+> There is no MCP server of Orqyn's own, no persistence of Orqyn-owned
+> entities, and no loop yet — those are later phases, and their absence here is
+> deliberate.
 
 ---
 
@@ -197,18 +198,18 @@ holds four layers:
   completed, which is the only thing that lets a substrate `done` come back as
   `Done` instead of `VerificationPending`.
 
-[`HandoffAdapter`]: crates/director-adapters/src/handoff/adapter.rs
+The `HandoffAdapter` composes these into live `TaskProvider`,
+`AgentProvider`, and `SessionProvider` implementations. Its counterpart for
+memory, `AiMemoryAdapter`, does the same for `MemoryProvider` over ai-memory —
+three modules apiece (`wire`, `transport`, `adapter`) so the two substrates read
+as one pattern. Both are landed, and both are driven by a one-method wire trait
+so their mapping logic is unit-testable without a child process, with `#[ignore]`
+live suites that verify the wire mirrors against the real servers.
 
-The adapter is covered by 15 unit tests against a fake wire connection plus 5
-live tests that spawn the real handoff-mcp server binary (marked `#[ignore]` so
-they do not run by default). Live testing surfaced two findings recorded in
-[`docs/PHASE2-ADAPTERS.md`](docs/PHASE2-ADAPTERS.md): the substrate's `extra`
-channel is closed at the MCP boundary in both directions, so Orqyn-only
-statuses do not round-trip; and two wire mirrors had to be corrected from the
-real server's shapes.
-
-The `AiMemoryAdapter` is Phase 3. Until it lands, Orqyn's core must remain
-provably independent of the substrates — `InMemoryProvider` is the proof.
+Both adapters exist to make the substrate's model honest in Orqyn's
+vocabulary — the ai-memory one, for instance, keeps the two meanings of a
+`rank` field separate: a relevance score from `memory_query` and a change time
+in microseconds from `memory_recent`.
 
 ---
 
@@ -328,6 +329,9 @@ than the plumbing:
 - A failed dependency blocks readiness.
 - The recent-context window never exceeds its bound.
 - A handoff cannot be accepted twice or by the wrong agent.
+- A memory search returns full page bodies, not `<mark>`-tagged FTS5 fragments,
+  and reports a change time only on the one read path where the substrate
+  actually sends one.
 - `StateComparison` distinguishes a head advance from a rebase.
 - Every public entity round-trips through serde — because everything Orqyn
   persists crosses a serialization boundary sooner or later.
@@ -344,10 +348,10 @@ than the plumbing:
 - **No MCP server.** Orqyn's own tool surface is a later phase.
 - **No planner, no verification engine, no loop.** The traits exist; the
   behavior does not.
-- **No ai-memory adapter yet.** The handoff-mcp side is wired end to end —
-  `HandoffAdapter` runs live against a real substrate process — but the
-  `AiMemoryAdapter` is Phase 3. Until it lands, Orqyn's core must remain
-  provably independent of the substrates, and `InMemoryProvider` is the proof.
+- **No persistence of Orqyn-owned entities.** Both substrate adapters are
+  landed, but Orqyn's own checkpoint, plan, and decision storage is Phase 5.
+  Until then, `InMemoryProvider` is the proof that Orqyn's core is
+  independent of the substrates.
 
 ## Roadmap
 
@@ -355,8 +359,8 @@ than the plumbing:
 |---|---|
 | **0** ✅ | Repository forensics: read-only audit of both substrates. |
 | **1** ✅ | Canonical domain model + provider trait boundary, zero substrate coupling. |
-| **2** ✅ | Git observation layer (observer, store, service, `ProjectStateSnapshot`) **+ handoff-mcp client** (wire, transport, mapping, `HandoffAdapter` running live against the real server). |
-| 3 | `AiMemoryAdapter` — MCP client for ai-memory. |
+| **2** ✅ | Git observation layer (observer, store, service, `ProjectStateSnapshot`) + `HandoffAdapter`: handoff-mcp client implementing `TaskProvider`/`AgentProvider`/`SessionProvider`. |
+| **3** ✅ | `AiMemoryAdapter` — ai-memory client implementing `MemoryProvider`. |
 | 5 | `director-store` — Orqyn's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
 | 10 | The verification engine. |
 | — | The loop: OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN. |

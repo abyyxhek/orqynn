@@ -89,7 +89,10 @@ struct ToolResult {
 /// One block inside a tool result.
 #[derive(Debug, Deserialize)]
 struct ContentBlock {
-    /// The block type, e.g. `"text"`.
+    /// The block type, e.g. `"text"`. Serialized as `type` by the MCP spec and
+    /// by both substrates; `kind` is accepted as an alias for a client that
+    /// sends the older name.
+    #[serde(rename = "type", alias = "kind")]
     kind: String,
     /// The block's text payload, when it carries one.
     #[serde(default)]

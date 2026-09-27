@@ -380,6 +380,10 @@ impl MemoryProvider for InMemoryProvider {
             .take(query.limit.max(1) as usize)
             .cloned()
             .collect();
+        // Records the caller stamped come first; ones with no change time sort
+        // last. `updated_at` is optional on the trait precisely so a substrate
+        // that does not report one is represented honestly rather than
+        // back-filled.
         hits.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
         Ok(hits)
     }
@@ -685,7 +689,7 @@ mod tests {
                 kind: Some("decision".into()),
                 tags: vec![],
                 score: None,
-                updated_at: now,
+                updated_at: Some(now),
             }))
             .unwrap();
         }

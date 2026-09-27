@@ -11,11 +11,11 @@
 //!
 //! ## What does *not* live here
 //!
-//! The real substrate adapters — `HandoffAdapter` (MCP client for
-//! handoff-mcp) and `AiMemoryAdapter` (MCP client for ai-memory) — are Phase 2
-//! and Phase 3. They are deliberately absent from Phase 1: Director's core must
-//! be provably independent of the substrates before any substrate is wired in,
-//! and this crate is the proof.
+//! Nothing, any more. `HandoffAdapter` (Phase 2) and `AiMemoryAdapter` (Phase
+//! 3) are both here, and that is the point: Director's core was kept
+//! independent of the substrates until both adapters existed, and this crate
+//! is the proof. Every other crate in the workspace still cannot name a
+//! substrate.
 //!
 //! ## Git observation
 //!
@@ -34,6 +34,7 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod aimemory;
 pub mod executor;
 pub mod git;
 pub mod handoff;
@@ -52,5 +53,15 @@ pub use git::{GitObserver, GitService, RangeWalk, RepositoryStatusView, Reposito
 // the transport and the mapping without knowing the internal split.
 pub use handoff::adapter::{HandoffAdapter, HandoffAdapterError, HandoffWire};
 pub use handoff::mapping;
-pub use handoff::transport::{McpTransport, TransportError};
+pub use handoff::transport::{McpTransport, TransportError as HandoffTransportError};
 pub use handoff::wire;
+
+// Flat for the same reason: callers name the adapter and its seam, not the
+// module split. Its transport error is renamed on the way out so it does not
+// collide with the handoff one at the crate root — both are the shared stdio
+// error underneath, but a caller matching on one should not get the other by
+// accident. `wire` is deliberately not re-exported flat: both substrates have
+// a module of that name, so the handoff one keeps the flat slot and this
+// substrate's stays reachable as `aimemory::wire`.
+pub use aimemory::adapter::{AiMemoryAdapter, AiMemoryAdapterError, AiMemoryWire};
+pub use aimemory::transport::{MemoryTransport, TransportError as AiMemoryTransportError};

@@ -77,8 +77,13 @@ pub struct Memory {
     /// A relevance score the substrate assigned, higher = more relevant. Only
     /// meaningful relative to other results from the same query.
     pub score: Option<f64>,
-    /// When the record last changed in its substrate.
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// When the record last changed in its substrate, when the substrate
+    /// reports one. This is optional because a substrate need not expose a
+    /// change time on every read path: ai-memory, for instance, carries no
+    /// timestamp on a `memory_query` hit at all. An adapter that fills this
+    /// with "now" instead of `None` would be inventing a fact the trait exists
+    /// to keep honest.
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// How to look something up in long-term memory.
@@ -361,7 +366,7 @@ mod tests {
             kind: Some("decision".into()),
             tags: vec!["auth".into()],
             score: Some(0.9),
-            updated_at: chrono::Utc::now(),
+            updated_at: Some(chrono::Utc::now()),
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: Memory = serde_json::from_str(&json).unwrap();
