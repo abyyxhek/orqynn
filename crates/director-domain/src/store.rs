@@ -59,7 +59,12 @@ use async_trait::async_trait;
 use crate::agent::Agent;
 use crate::assignment::AgentAssignment;
 use crate::checkpoint::Checkpoint;
-use crate::ids::{AgentId, AssignmentId, CheckpointId, ProjectId, RepositoryId, SessionId, TaskId};
+use crate::decision::Decision;
+use crate::ids::{
+    AgentId, AssignmentId, CheckpointId, DecisionId, PlanId, ProjectId, RepositoryId, SessionId,
+    TaskId,
+};
+use crate::plan::Plan;
 use crate::project::Project;
 use crate::session::AgentSession;
 use crate::task::{Task, TaskStatus};
@@ -361,6 +366,73 @@ pub trait CheckpointRepository: Store {
     /// Every checkpoint for a task, newest first. Superseded ones included: the
     /// recovery history is retained, not garbage collected.
     async fn checkpoints_for_task(&self, task: &TaskId) -> Result<Vec<Checkpoint>, Self::Error>;
+}
+
+/// Persistence for plans — Orqyn's superseding artifacts.
+///
+/// A plan is never edited in place. When reality diverges, the replanner writes
+/// a *new* plan that supersedes the old one, and the old one is retained as
+/// audit trail. The store preserves that: supersession marks a row, it never
+/// deletes it, and a project is never left with two active plans because the
+/// schema refuses the second one.
+#[async_trait]
+pub trait PlanRepository: Store {
+    /// Persist a new plan. A plan is created as a [`crate::plan::PlanStatus::Draft`];
+    /// it becomes authoritative only through [`Self::activate_plan`], so an
+    /// abandoned draft never becomes the plan a project executes against.
+    async fn create_plan(&self, plan: &Plan) -> Result<Plan, Self::Error>;
+
+    /// Load a plan by id, or [`StoreError::NotFound`].
+    async fn get_plan(&self, id: &PlanId) -> Result<Plan, Self::Error>;
+
+    /// Persist an updated plan, optimistic version check included.
+    async fn update_plan(&self, plan: &Plan) -> Result<Plan, Self::Error>;
+
+    /// Promote a draft to the authoritative plan for its project. The project's
+    /// currently active plan — if any — is superseded in the same transaction,
+    /// linked both ways, and the promoted plan's `supersedes` is set. This is
+    /// the only way a plan becomes active, which is what makes "at most one
+    /// active plan per project" an invariant rather than a caller's discipline.
+    async fn activate_plan(&self, id: &PlanId, authorized_by: AgentId)
+        -> Result<Plan, Self::Error>;
+
+    /// The plan a project is currently executing against, or `None` if no plan
+    /// is active. This is what the loop's ASSIGN step reads.
+    async fn active_plan_for_project(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<Plan>, Self::Error>;
+
+    /// Every plan for a project, newest first. Superseded and archived ones are
+    /// retained: "what did we used to believe, and when" is the point of the
+    /// entity.
+    async fn plans_for_project(&self, project: &ProjectId) -> Result<Vec<Plan>, Self::Error>;
+}
+
+/// Persistence for decisions — the choices a project is committed to.
+///
+/// Like plans, decisions supersede rather than disappear. A reversed decision
+/// keeps its row and gains a `superseded_by` link, so the record stays honest
+/// when the project changes its mind.
+#[async_trait]
+pub trait DecisionRepository: Store {
+    /// Record a new active decision.
+    async fn create_decision(&self, decision: &Decision) -> Result<Decision, Self::Error>;
+
+    /// Load a decision by id, or [`StoreError::NotFound`].
+    async fn get_decision(&self, id: &DecisionId) -> Result<Decision, Self::Error>;
+
+    /// Reverse a decision, recording which later decision replaced it. The
+    /// reversed decision is marked, not deleted.
+    async fn supersede_decision(
+        &self,
+        id: &DecisionId,
+        superseded_by: &DecisionId,
+    ) -> Result<Decision, Self::Error>;
+
+    /// The decisions made in the context of a task, newest first. A resuming
+    /// agent reads these so it does not re-litigate a settled question.
+    async fn decisions_for_task(&self, task: &TaskId) -> Result<Vec<Decision>, Self::Error>;
 }
 
 /// Persistence for normalized project state — what Orqyn currently knows.

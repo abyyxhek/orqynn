@@ -8,6 +8,12 @@
 //!
 //! Each test opens its own temporary database, so they are independent and can
 //! run in parallel. The file is deleted when the handle drops.
+//!
+//! The plan tests hold the activation invariant: a plan becomes authoritative
+//! only through `activate_plan`, which supersedes the sitting active plan in the
+//! same transaction, and the partial unique index turns a forgotten supersession
+//! into an error. The decision tests hold the matching rule that reversal
+//! *marks* a decision rather than deleting it.
 
 use std::matches;
 
@@ -15,17 +21,21 @@ use director_domain::agent::{Agent, AgentStatus, Harness};
 use director_domain::assignment::{AgentAssignment, AssignmentStatus, ReleaseReason};
 use director_domain::capability::Capability;
 use director_domain::checkpoint::{Checkpoint, CheckpointStatus};
+use director_domain::decision::{Decision, DecisionStatus};
 use director_domain::ids::{
-    AgentId, AssignmentId, CheckpointId, MachineId, ProjectId, RepositoryId, SessionId, TaskId,
+    AgentId, AssignmentId, CheckpointId, DecisionId, MachineId, PlanId, ProjectId, RepositoryId,
+    SessionId, TaskId,
 };
+use director_domain::plan::{Plan, PlanStatus};
 use director_domain::project::{DefaultBranch, Project};
 use director_domain::session::{AgentSession, SessionEnd, SessionStatus};
 use director_domain::state::TestResults;
 use director_domain::store::{ProviderSync, StoredProjectState};
 use director_domain::task::{Task, TaskStatus};
 use director_domain::{
-    AgentRepository, AssignmentRepository, CheckpointRepository, ProjectRepository,
-    ProjectStateRepository, ProviderSyncRepository, SessionRepository, StoreError, TaskRepository,
+    AgentRepository, AssignmentRepository, CheckpointRepository, DecisionRepository,
+    PlanRepository, ProjectRepository, ProjectStateRepository, ProviderSyncRepository,
+    SessionRepository, StoreError, TaskRepository,
 };
 
 use director_store::Store;
@@ -46,16 +56,17 @@ async fn store() -> (Store, tempfile::TempDir) {
 async fn opening_creates_the_schema_and_is_idempotent() {
     let (store, dir) = store().await;
     let path = dir.path().join("director.db");
+    let newest = director_store::latest_version();
     assert_eq!(
         store.schema_version(),
-        1,
-        "a fresh database reaches version 1"
+        newest,
+        "a fresh database reaches the newest migration"
     );
 
     // Reopening the same file must be a no-op, not an error: this is what makes
     // `open` safe to call on every startup.
     let again = Store::open(&path).await.expect("reopening is a no-op");
-    assert_eq!(again.schema_version(), 1);
+    assert_eq!(again.schema_version(), newest);
 }
 
 #[tokio::test]
@@ -1140,6 +1151,485 @@ async fn a_checkpoint_carries_its_test_results_and_decisions() {
         vec![director_domain::ids::DecisionId::from_string("DEC-1")]
     );
     assert!(stored.test_results.is_some(), "test results round-trip");
+}
+
+// ---------------------------------------------------------------------------
+// Plans: one authoritative plan per project, superseded never deleted.
+// ---------------------------------------------------------------------------
+
+fn plan(id: &str, project: &str, objective: &str) -> Plan {
+    Plan::draft(
+        PlanId::from_string(id),
+        ProjectId::from_string(project),
+        objective,
+        "decomposed from the observed repository state",
+    )
+}
+
+/// A plan with a pinned creation time, so ordering assertions are deterministic
+/// rather than racing the clock.
+fn dated_plan(id: &str, project: &str, objective: &str, days_ago: i64) -> Plan {
+    let mut p = plan(id, project, objective);
+    let when = chrono::Utc::now() - chrono::Duration::days(days_ago);
+    p.created_at = when;
+    p.updated_at = when;
+    p
+}
+
+#[tokio::test]
+async fn a_plan_round_trips_and_starts_as_a_draft() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+
+    let mut draft = plan("PLAN-1", "PROJ-1", "ship the auth flow");
+    draft.add_task(TaskId::from_string("AUTH-1"));
+    draft.add_task(TaskId::from_string("AUTH-2"));
+
+    let stored = store
+        .plans()
+        .create_plan(&draft)
+        .await
+        .expect("plan stored");
+    assert_eq!(stored.status, PlanStatus::Draft, "a new plan is a draft");
+    assert!(!stored.status.is_authoritative());
+    assert_eq!(
+        stored.task_ids,
+        vec![TaskId::from_string("AUTH-1"), TaskId::from_string("AUTH-2")],
+        "the ordered task list round-trips"
+    );
+    assert_eq!(stored.state_version, 1);
+
+    // A draft is not authoritative, so nothing is executing against it yet.
+    assert!(store
+        .plans()
+        .active_plan_for_project(&ProjectId::from_string("PROJ-1"))
+        .await
+        .expect("the query ran")
+        .is_none());
+
+    let by_id = store
+        .plans()
+        .get_plan(&PlanId::from_string("PLAN-1"))
+        .await
+        .expect("found by id");
+    assert_eq!(by_id.objective, "ship the auth flow");
+    assert_eq!(
+        by_id.rationale,
+        "decomposed from the observed repository state"
+    );
+}
+
+#[tokio::test]
+async fn activating_a_plan_supersedes_the_sitting_plan_without_deleting_it() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+
+    let first = store
+        .plans()
+        .create_plan(&dated_plan("PLAN-1", "PROJ-1", "ship auth", 4))
+        .await
+        .expect("first plan");
+    let active = store
+        .plans()
+        .activate_plan(&first.id, AgentId::from_string("AGENT-planner"))
+        .await
+        .expect("PLAN-1 activated");
+    assert_eq!(active.status, PlanStatus::Active);
+    assert_eq!(
+        active.created_by,
+        Some(AgentId::from_string("AGENT-planner")),
+        "activation records who authorized it"
+    );
+
+    // A later plan for the same project, activated the same way.
+    let second = store
+        .plans()
+        .create_plan(&dated_plan("PLAN-2", "PROJ-1", "ship auth and sessions", 1))
+        .await
+        .expect("second plan");
+    let successor = store
+        .plans()
+        .activate_plan(&second.id, AgentId::from_string("AGENT-planner"))
+        .await
+        .expect("PLAN-2 activated");
+
+    // The links go both ways.
+    assert_eq!(successor.supersedes, Some(PlanId::from_string("PLAN-1")));
+    let retired = store
+        .plans()
+        .get_plan(&PlanId::from_string("PLAN-1"))
+        .await
+        .expect("the retired plan");
+    assert_eq!(retired.status, PlanStatus::Superseded);
+    assert_eq!(retired.superseded_by, Some(PlanId::from_string("PLAN-2")));
+
+    // Only the new plan is authoritative...
+    let current = store
+        .plans()
+        .active_plan_for_project(&ProjectId::from_string("PROJ-1"))
+        .await
+        .expect("the query ran")
+        .expect("there is one");
+    assert_eq!(current.id, PlanId::from_string("PLAN-2"));
+
+    // ...and the superseded one is still in the table, history intact.
+    let all = store
+        .plans()
+        .plans_for_project(&ProjectId::from_string("PROJ-1"))
+        .await
+        .expect("all plans");
+    assert_eq!(all.len(), 2, "the superseded plan is retained");
+    assert_eq!(all[0].id, PlanId::from_string("PLAN-2"), "newest first");
+    assert_eq!(all[1].id, PlanId::from_string("PLAN-1"));
+}
+
+#[tokio::test]
+async fn a_second_active_plan_for_one_project_is_rejected() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+
+    let first = store
+        .plans()
+        .create_plan(&plan("PLAN-1", "PROJ-1", "ship auth"))
+        .await
+        .expect("first plan");
+    store
+        .plans()
+        .activate_plan(&first.id, AgentId::from_string("AGENT-planner"))
+        .await
+        .expect("PLAN-1 activated");
+    let second = store
+        .plans()
+        .create_plan(&plan("PLAN-2", "PROJ-1", "ship sessions"))
+        .await
+        .expect("second plan");
+
+    // `activate_plan` would supersede PLAN-1 first; going around it and setting
+    // the status by hand must hit the partial unique index. A project is never
+    // left with two authoritative plans, so "forgot to supersede" is an error
+    // rather than a silent second plan.
+    let mut rogue = second;
+    rogue.status = PlanStatus::Active;
+    let err = store.plans().update_plan(&rogue).await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintViolation(_)),
+        "got {err:?}"
+    );
+
+    // The sitting plan is untouched: the refused write changed nothing.
+    let current = store
+        .plans()
+        .active_plan_for_project(&ProjectId::from_string("PROJ-1"))
+        .await
+        .expect("the query ran")
+        .expect("there is one");
+    assert_eq!(current.id, PlanId::from_string("PLAN-1"));
+}
+
+#[tokio::test]
+async fn activating_an_already_active_plan_is_refused() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+
+    let created = store
+        .plans()
+        .create_plan(&plan("PLAN-1", "PROJ-1", "ship auth"))
+        .await
+        .expect("plan");
+    store
+        .plans()
+        .activate_plan(&created.id, AgentId::from_string("AGENT-planner"))
+        .await
+        .expect("activated");
+
+    // Activating it again is a caller mistake, and resurrecting a superseded
+    // plan would rewrite history — both are refused by the same guard.
+    let err = store
+        .plans()
+        .activate_plan(&created.id, AgentId::from_string("AGENT-planner"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintViolation(_)),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_plan_update_is_a_conflict_not_an_overwrite() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+
+    let created = store
+        .plans()
+        .create_plan(&plan("PLAN-1", "PROJ-1", "ship auth"))
+        .await
+        .expect("plan");
+
+    // A concurrent change the caller did not see: the store moves the version
+    // to 2.
+    let mut newer = created.clone();
+    newer.objective = "ship auth and sessions".into();
+    let written = store
+        .plans()
+        .update_plan(&newer)
+        .await
+        .expect("first update lands");
+    assert_eq!(written.state_version, 2, "the store bumps the version");
+
+    // The stale writer, still holding version 1, must not silently win.
+    let mut stale = created;
+    stale.rationale = "a stale rationale".into();
+    let err = store.plans().update_plan(&stale).await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::StateVersionConflict { .. }),
+        "got {err:?}"
+    );
+
+    // The winner's write is what the store holds.
+    let loaded = store
+        .plans()
+        .get_plan(&PlanId::from_string("PLAN-1"))
+        .await
+        .expect("plan loaded");
+    assert_eq!(loaded.objective, "ship auth and sessions");
+    assert_eq!(
+        loaded.rationale,
+        "decomposed from the observed repository state"
+    );
+    assert_eq!(loaded.state_version, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Decisions: reversed, never deleted.
+// ---------------------------------------------------------------------------
+
+fn decision(id: &str, title: &str) -> Decision {
+    Decision::new(DecisionId::from_string(id), title, "the rationale")
+        .in_task(TaskId::from_string("TASK-1"))
+        .by(AgentId::from_string("AGENT-claude"))
+        .considered("the option that lost")
+}
+
+#[tokio::test]
+async fn a_decision_round_trips_with_its_provenance() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    let stored = store
+        .decisions()
+        .create_decision(&decision("DEC-1", "use stateless JWTs"))
+        .await
+        .expect("decision stored");
+    assert!(stored.status.stands(), "a new decision stands");
+    assert_eq!(stored.state_version, 1);
+    assert_eq!(stored.task_id, Some(TaskId::from_string("TASK-1")));
+    assert_eq!(stored.made_by, Some(AgentId::from_string("AGENT-claude")));
+    assert_eq!(
+        stored.alternatives_considered,
+        vec!["the option that lost"],
+        "rejected alternatives are retained"
+    );
+
+    let by_id = store
+        .decisions()
+        .get_decision(&DecisionId::from_string("DEC-1"))
+        .await
+        .expect("found by id");
+    assert_eq!(by_id.rationale, "the rationale");
+}
+
+#[tokio::test]
+async fn superseding_a_decision_marks_it_without_deleting_it() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    store
+        .decisions()
+        .create_decision(&decision("DEC-1", "use JWTs"))
+        .await
+        .expect("DEC-1");
+    store
+        .decisions()
+        .create_decision(&decision("DEC-2", "use server sessions"))
+        .await
+        .expect("DEC-2");
+
+    let reversed = store
+        .decisions()
+        .supersede_decision(
+            &DecisionId::from_string("DEC-1"),
+            &DecisionId::from_string("DEC-2"),
+        )
+        .await
+        .expect("DEC-1 reversed");
+    assert!(!reversed.status.stands());
+    assert_eq!(
+        reversed.superseded_by,
+        Some(DecisionId::from_string("DEC-2"))
+    );
+    assert_eq!(reversed.state_version, 2, "supersession is a write");
+
+    // The row is still there and still readable — reversal marks, it does not
+    // delete.
+    let still = store
+        .decisions()
+        .get_decision(&DecisionId::from_string("DEC-1"))
+        .await
+        .expect("reversed but present");
+    assert_eq!(still.status, DecisionStatus::Superseded);
+    assert_eq!(still.superseded_by, Some(DecisionId::from_string("DEC-2")));
+}
+
+#[tokio::test]
+async fn superseding_an_already_reversed_decision_is_refused() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+
+    store
+        .decisions()
+        .create_decision(&decision("DEC-1", "use JWTs"))
+        .await
+        .expect("DEC-1");
+    store
+        .decisions()
+        .create_decision(&decision("DEC-2", "use server sessions"))
+        .await
+        .expect("DEC-2");
+    store
+        .decisions()
+        .create_decision(&decision("DEC-3", "rotate keys monthly"))
+        .await
+        .expect("DEC-3");
+
+    store
+        .decisions()
+        .supersede_decision(
+            &DecisionId::from_string("DEC-1"),
+            &DecisionId::from_string("DEC-2"),
+        )
+        .await
+        .expect("DEC-1 reversed by DEC-2");
+
+    // Reversing it again must fail: two successors would lose the first
+    // reversal and leave the record claiming two things at once.
+    let err = store
+        .decisions()
+        .supersede_decision(
+            &DecisionId::from_string("DEC-1"),
+            &DecisionId::from_string("DEC-3"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintViolation(_)),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn decisions_for_a_task_are_newest_first_and_taskless_stay_out() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    let mut earlier = decision("DEC-1", "use JWTs");
+    earlier.made_at = chrono::Utc::now() - chrono::Duration::days(2);
+    earlier.updated_at = earlier.made_at;
+    store
+        .decisions()
+        .create_decision(&earlier)
+        .await
+        .expect("DEC-1");
+    store
+        .decisions()
+        .create_decision(&decision("DEC-2", "rotate keys monthly"))
+        .await
+        .expect("DEC-2");
+
+    // A decision with no task is provenance-free and belongs to no task's list.
+    store
+        .decisions()
+        .create_decision(&Decision::new(
+            DecisionId::from_string("DEC-9"),
+            "use Alpine base images",
+            "image size matters",
+        ))
+        .await
+        .expect("DEC-9");
+
+    let for_task = store
+        .decisions()
+        .decisions_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("decisions for the task");
+    assert_eq!(for_task.len(), 2, "the taskless decision is excluded");
+    assert_eq!(
+        for_task[0].id,
+        DecisionId::from_string("DEC-2"),
+        "newest first"
+    );
+    assert_eq!(for_task[1].id, DecisionId::from_string("DEC-1"));
 }
 
 // ---------------------------------------------------------------------------

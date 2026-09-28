@@ -62,8 +62,10 @@ mod agents;
 mod assignments;
 mod checkpoints;
 mod connection;
+mod decisions;
 mod json;
 mod migrations;
+mod plans;
 mod projects;
 mod sessions;
 mod state_sync;
@@ -86,6 +88,8 @@ pub use state_sync::{SqliteProjectStateRepository, SqliteProviderSyncRepository}
 pub use agents::SqliteAgentRepository;
 pub use assignments::SqliteAssignmentRepository;
 pub use checkpoints::SqliteCheckpointRepository;
+pub use decisions::SqliteDecisionRepository;
+pub use plans::SqlitePlanRepository;
 pub use projects::SqliteProjectRepository;
 pub use sessions::SqliteSessionRepository;
 pub use tasks::SqliteTaskRepository;
@@ -171,6 +175,18 @@ impl Store {
     /// retained.
     pub fn checkpoints(&self) -> SqliteCheckpointRepository {
         SqliteCheckpointRepository::new(self.pool.clone())
+    }
+
+    /// Plans: the authoritative decomposition a project is executing against.
+    /// Old plans supersede rather than disappear.
+    pub fn plans(&self) -> SqlitePlanRepository {
+        SqlitePlanRepository::new(self.pool.clone())
+    }
+
+    /// Decisions: the choices a project is committed to. Reversed ones are
+    /// retained, linked to the decision that reversed them.
+    pub fn decisions(&self) -> SqliteDecisionRepository {
+        SqliteDecisionRepository::new(self.pool.clone())
     }
 
     /// Normalized project state — what Orqyn currently believes about a

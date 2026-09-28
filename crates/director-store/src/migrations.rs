@@ -70,6 +70,14 @@ pub fn migrations() -> BTreeMap<u32, Migration> {
             sql: include_str!("../migrations/0001_initial.sql"),
         },
     );
+    all.insert(
+        2,
+        Migration {
+            version: 2,
+            name: "plans_decisions",
+            sql: include_str!("../migrations/0002_plans_decisions.sql"),
+        },
+    );
     all
 }
 
@@ -203,12 +211,19 @@ mod tests {
     }
 
     #[test]
-    fn the_initial_migration_is_present_and_ordered() {
+    fn the_migrations_are_registered_contiguously_from_one() {
         let all = migrations();
-        assert!(all.contains_key(&1));
-        // Versions are unique and the map keeps them ordered.
+        assert!(all.contains_key(&1), "migration 1 is the base schema");
+        // Versions are unique and the map keeps them ordered. The runner
+        // applies by version number with no gaps, so every migration from 1 to
+        // the newest must be registered here: a gap would mean a migration file
+        // that no build knows about, and an upgrade that silently stops halfway.
         let versions: Vec<u32> = all.keys().copied().collect();
-        assert_eq!(versions, vec![1]);
+        assert_eq!(
+            versions,
+            (1..=latest_version()).collect::<Vec<u32>>(),
+            "migrations must be contiguous from 1 to the newest"
+        );
     }
 
     #[test]
@@ -218,16 +233,18 @@ mod tests {
     }
 
     #[test]
-    fn running_migrations_on_a_fresh_database_brings_it_to_one() {
+    fn running_migrations_on_a_fresh_database_reaches_the_newest_version() {
+        let newest = latest_version();
         let mut conn = memory();
         let applied = run_migrations(&mut conn).expect("migrations apply");
-        assert_eq!(applied, 1);
-        assert_eq!(current_version(&conn).unwrap(), Some(1));
-        // The tracking table records it.
+        assert_eq!(applied, newest as usize, "every migration is applied");
+        assert_eq!(current_version(&conn).unwrap(), Some(newest));
+        // The tracking table records one row per migration, so a re-open reads
+        // the same count back.
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, migrations().len() as i64);
     }
 
     #[test]
@@ -237,7 +254,7 @@ mod tests {
         run_migrations(&mut conn).unwrap();
         let second = run_migrations(&mut conn).expect("re-run is a no-op");
         assert_eq!(second, 0);
-        assert_eq!(current_version(&conn).unwrap(), Some(1));
+        assert_eq!(current_version(&conn).unwrap(), Some(latest_version()));
     }
 
     #[test]
@@ -254,6 +271,8 @@ mod tests {
             "agent_sessions",
             "agent_assignments",
             "checkpoints",
+            "plans",
+            "decisions",
             "project_states",
             "provider_sync",
         ] {

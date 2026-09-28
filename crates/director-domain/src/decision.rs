@@ -1,4 +1,4 @@
-//! [Decision] — a choice the project is now committed to (Phase 7).
+//! [Decision] — a choice the project is now committed to (Phase 5).
 //!
 //! Decisions are recorded separately from progress narrative because they have
 //! a different half-life. "I wrote the login handler" is soon irrelevant; "we
@@ -55,6 +55,14 @@ pub struct Decision {
     pub superseded_by: Option<DecisionId>,
     /// The agent that made it, if known.
     pub made_by: Option<AgentId>,
+    /// Optimistic-concurrency version. The store bumps this on every write and
+    /// refuses a stale write rather than silently overwriting a newer decision.
+    /// New records start at 1.
+    ///
+    /// This is the same mechanism as [`crate::project::Project::state_version`]:
+    /// one version per mutable object, no competing counters.
+    #[serde(default = "default_state_version")]
+    pub state_version: u64,
     /// When it was made.
     pub made_at: chrono::DateTime<chrono::Utc>,
     /// When it last changed.
@@ -74,6 +82,7 @@ impl Decision {
             status: DecisionStatus::Active,
             superseded_by: None,
             made_by: None,
+            state_version: default_state_version(),
             made_at: now,
             updated_at: now,
         }
@@ -109,6 +118,20 @@ impl Decision {
         self.status = DecisionStatus::Withdrawn;
         self.updated_at = chrono::Utc::now();
     }
+
+    /// Bump the optimistic-concurrency version, stamping `updated_at`. The
+    /// store does its own bump on write; this is for in-memory bookkeeping that
+    /// has to stay numerically in step with what the next load will return.
+    pub fn bump_state_version(&mut self) {
+        self.state_version += 1;
+        self.updated_at = chrono::Utc::now();
+    }
+}
+
+/// New records start at version 1, so a store write can always compare against
+/// the version the caller read.
+fn default_state_version() -> u64 {
+    1
 }
 
 #[cfg(test)]

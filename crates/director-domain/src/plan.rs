@@ -1,4 +1,4 @@
-//! [Plan] — a deliberate, superseding artifact (Phase 7).
+//! [Plan] — a deliberate, superseding artifact (Phase 5).
 //!
 //! A plan is never edited in place. When reality diverges from a plan — a
 //! dependency failed, an estimate was wrong, a task proved unnecessary — the
@@ -62,6 +62,14 @@ pub struct Plan {
     pub superseded_by: Option<PlanId>,
     /// The agent that authorized the plan, if known.
     pub created_by: Option<AgentId>,
+    /// Optimistic-concurrency version. The store bumps this on every write and
+    /// refuses a stale write rather than silently overwriting a newer plan. New
+    /// records start at 1.
+    ///
+    /// This is the same mechanism as [`crate::project::Project::state_version`]:
+    /// one version per mutable object, no competing counters.
+    #[serde(default = "default_state_version")]
+    pub state_version: u64,
     /// When the plan was first written.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// When it last changed.
@@ -87,6 +95,7 @@ impl Plan {
             supersedes: None,
             superseded_by: None,
             created_by: None,
+            state_version: default_state_version(),
             created_at: now,
             updated_at: now,
         }
@@ -119,6 +128,20 @@ impl Plan {
     pub fn touch(&mut self) {
         self.updated_at = chrono::Utc::now();
     }
+
+    /// Bump the optimistic-concurrency version, stamping `updated_at`. The
+    /// store does its own bump on write; this is for in-memory bookkeeping that
+    /// has to stay numerically in step with what the next load will return.
+    pub fn bump_state_version(&mut self) {
+        self.state_version += 1;
+        self.touch();
+    }
+}
+
+/// New records start at version 1, so a store write can always compare against
+/// the version the caller read.
+fn default_state_version() -> u64 {
+    1
 }
 
 #[cfg(test)]
