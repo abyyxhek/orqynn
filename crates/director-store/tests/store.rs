@@ -731,6 +731,280 @@ async fn two_active_assignments_for_one_task_are_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// The atomic assignment operation: the thing the loop's ASSIGN step will call.
+// ---------------------------------------------------------------------------
+
+/// The prerequisites every `assign_task` test needs: a project, two agents, and
+/// a task. Returns the ids the test hands to the operation.
+async fn assignment_prereqs(store: &Store) {
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("first agent");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-2"))
+        .await
+        .expect("second agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+}
+
+#[tokio::test]
+async fn assign_task_hands_the_task_to_the_agent_atomically() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+
+    // Nothing is assigned yet.
+    assert!(
+        store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("the query")
+            .is_none(),
+        "a fresh task has no active assignment"
+    );
+
+    let assigned = store
+        .assign_task(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the assignment");
+
+    assert_eq!(assigned.id, AssignmentId::from_string("ASG-1"));
+    assert_eq!(assigned.agent_id, AgentId::from_string("AGENT-1"));
+    assert_eq!(assigned.status, AssignmentStatus::Active);
+
+    // The store reflects it: the task has an active assignment, and the agent's
+    // denormalized view points at it.
+    let active = store
+        .assignments()
+        .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the query")
+        .expect("there is one now");
+    assert_eq!(active.id, AssignmentId::from_string("ASG-1"));
+
+    let agent = store
+        .agents()
+        .get_agent(&AgentId::from_string("AGENT-1"))
+        .await
+        .expect("agent");
+    assert_eq!(
+        agent.current_task,
+        Some(TaskId::from_string("TASK-1")),
+        "the denormalized view moved with the assignment"
+    );
+}
+
+#[tokio::test]
+async fn assign_task_releases_the_sitting_agent_and_keeps_the_history() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_task(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("first assignment");
+
+    // Hand the same task to a second agent. All three effects of the
+    // transaction are visible afterwards; if any one were missing the invariant
+    // would be broken in a different way.
+    store
+        .assign_task(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-2"),
+            &AssignmentId::from_string("ASG-2"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("reassignment");
+
+    // The new agent holds the task.
+    let active = store
+        .assignments()
+        .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the query")
+        .expect("there is one");
+    assert_eq!(active.id, AssignmentId::from_string("ASG-2"));
+    assert_eq!(
+        store
+            .agents()
+            .get_agent(&AgentId::from_string("AGENT-2"))
+            .await
+            .expect("second agent")
+            .current_task,
+        Some(TaskId::from_string("TASK-1")),
+    );
+
+    // The sitting agent was released, not deleted, and cleared of the task.
+    let first = store
+        .assignments()
+        .get_assignment(&AssignmentId::from_string("ASG-1"))
+        .await
+        .expect("the first tenure is retained");
+    assert_eq!(first.status, AssignmentStatus::Released);
+    assert_eq!(first.release_reason, Some(ReleaseReason::Reassigned));
+    assert_eq!(
+        store
+            .agents()
+            .get_agent(&AgentId::from_string("AGENT-1"))
+            .await
+            .expect("first agent")
+            .current_task,
+        None,
+        "the released agent no longer holds the task"
+    );
+
+    // Both tenures are in the history, oldest first.
+    let history = store
+        .assignments()
+        .assignment_history(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("history");
+    assert_eq!(
+        history.len(),
+        2,
+        "the first tenure was retained, not deleted"
+    );
+    assert_eq!(history[0].agent_id, AgentId::from_string("AGENT-1"));
+    assert_eq!(history[1].agent_id, AgentId::from_string("AGENT-2"));
+}
+
+#[tokio::test]
+async fn assign_task_to_an_unknown_agent_leaves_the_sitting_agent_holding_it() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_task(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("first assignment");
+
+    // Reassigning to an agent that was never registered must fail on the
+    // foreign key rather than storing an assignment with no agent.
+    let err = store
+        .assign_task(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-nope"),
+            &AssignmentId::from_string("ASG-2"),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintViolation(_)),
+        "got {err:?}"
+    );
+
+    // The failed transaction changed nothing: the sitting agent keeps the task,
+    // and no second assignment row was stored.
+    assert_eq!(
+        store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("the query")
+            .expect("there is one")
+            .id,
+        AssignmentId::from_string("ASG-1")
+    );
+    assert!(store
+        .assignments()
+        .get_assignment(&AssignmentId::from_string("ASG-2"))
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .agents()
+            .get_agent(&AgentId::from_string("AGENT-1"))
+            .await
+            .expect("first agent")
+            .current_task,
+        Some(TaskId::from_string("TASK-1")),
+        "the failed write did not take the task away from the sitting agent"
+    );
+}
+
+#[tokio::test]
+async fn assign_task_to_the_same_agent_keeps_the_view_pointing_at_the_task() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_task(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("first assignment");
+
+    // Reassigning to the agent that already holds the task must end with the
+    // view intact: the clear of the departing agent and the set of the incoming
+    // one touch the same row, and in the wrong order the clear would win.
+    store
+        .assign_task(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-2"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("reassignment to the same agent");
+
+    assert_eq!(
+        store
+            .agents()
+            .get_agent(&AgentId::from_string("AGENT-1"))
+            .await
+            .expect("agent")
+            .current_task,
+        Some(TaskId::from_string("TASK-1")),
+        "the view still points at the task the agent holds"
+    );
+    let history = store
+        .assignments()
+        .assignment_history(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("history");
+    assert_eq!(history.len(), 2, "both assignments are retained");
+    assert_eq!(
+        store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("the query")
+            .expect("there is one")
+            .id,
+        AssignmentId::from_string("ASG-2")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Checkpoints: superseded, never deleted.
 // ---------------------------------------------------------------------------
 

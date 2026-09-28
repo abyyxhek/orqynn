@@ -13,12 +13,17 @@
 //!
 //! 1. any currently-active assignment for the task is released with the reason
 //!    `Reassigned`;
-//! 2. the new assignment row is inserted as `active`;
-//! 3. the agent's denormalized `current_task` view moves to this task.
+//! 2. the departing agent's denormalized `current_task` view is cleared;
+//! 3. the new assignment row is inserted as `active`;
+//! 4. the incoming agent's `current_task` view moves to this task.
 //!
-//! All three are one transaction. If the agent does not exist, the transaction
+//! All four are one transaction. If the agent does not exist, the transaction
 //! fails on the foreign key and nothing is written — the sitting agent keeps
 //! the task, rather than the task being left with no one.
+//!
+//! Step 2 runs before step 4 deliberately. Reassigning a task to the agent that
+//! already holds it clears and then re-sets the same `current_task`, and in the
+//! other order the clear would win and the view would end up stale.
 //!
 //! The "at most one active assignment per task" rule is a partial unique index
 //! in the schema, so a concurrent double-assign is rejected by the database
@@ -198,9 +203,25 @@ pub async fn assign_task(
     let mut conn = pool.get();
     let tx = conn.transaction().map_err(translate_error)?;
 
-    // 1. Release the sitting tenant, if there is one. Its tenure is retained —
+    // 1. Who is being displaced, if anyone? This has to be learned *before* the
+    //    release in step 2, because afterwards the row no longer carries the
+    //    `active` status that identifies it as the sitting tenant.
+    let sitting: Option<AgentId> = tx
+        .query_row(
+            "SELECT agent_id FROM agent_assignments
+              WHERE task_id = ?1 AND status = ?2",
+            rusqlite::params![task_id.as_str(), json::to_json(&AssignmentStatus::Active)?],
+            |row| row.get::<_, String>(0).map(AgentId::from_string),
+        )
+        .optional()
+        .map_err(translate_error)?;
+
+    // 2. Release the sitting tenant, if there is one. Its tenure is retained —
     //    the row is marked, never deleted — so the history stays complete.
     //    Status is matched and written as JSON, the way every other write does.
+    //    This must precede the insert in step 3: the partial unique index allows
+    //    one active assignment per task, and releasing first is what keeps it
+    //    from firing on the handoff.
     tx.execute(
         "UPDATE agent_assignments
             SET status = ?4, released_at = ?2,
@@ -216,7 +237,15 @@ pub async fn assign_task(
     )
     .map_err(translate_error)?;
 
-    // 2. The new assignment. Status is `active`: this operation is the handoff.
+    // 3. The departing agent's denormalized view is cleared *before* the new
+    //    agent's is set. The order matters for the same-agent case: clear, then
+    //    point at the task. Clearing only if the view still names this task
+    //    keeps a late release of an older assignment from undoing a newer move.
+    if let Some(departing) = &sitting {
+        clear_current_task_if_still(&tx, departing, task_id)?;
+    }
+
+    // 4. The new assignment. Status is `active`: this operation is the handoff.
     //    A `Proposed` assignment is a separate, non-displacing insert.
     tx.execute(
         "INSERT INTO agent_assignments (id, task_id, agent_id, status, assigned_at,
@@ -232,9 +261,10 @@ pub async fn assign_task(
     )
     .map_err(translate_error)?;
 
-    // 3. The agent's denormalized view. If the agent row does not exist the
-    //    foreign key fails here and the whole transaction rolls back — leaving
-    //    the sitting agent with the task, which is the safe failure mode.
+    // 5. The incoming agent's denormalized view. If the agent row does not
+    //    exist the foreign key on the insert in step 4 fails and the whole
+    //    transaction rolls back — leaving the sitting agent with the task,
+    //    which is the safe failure mode.
     tx.execute(
         "UPDATE agents SET current_task = ?2, updated_at = ?3, state_version = state_version + 1
           WHERE id = ?1",
@@ -307,8 +337,12 @@ pub(crate) fn load_assignment(
 /// Clear an agent's `current_task` view, but only if it still points at this
 /// task. A reassignment that already moved the agent on must not be undone by a
 /// late release of an older assignment.
+///
+/// Takes anything that derefs to a [`rusqlite::Connection`] so it can run
+/// either standalone (a release) or inside the transaction that a reassignment
+/// commits atomically with the rest of the handoff.
 fn clear_current_task_if_still(
-    conn: &PooledConn,
+    conn: &impl std::ops::Deref<Target = rusqlite::Connection>,
     agent_id: &AgentId,
     task_id: &TaskId,
 ) -> Result<(), StoreError> {

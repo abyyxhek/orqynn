@@ -45,13 +45,17 @@
 //! rather than silently downgraded.
 
 // Phase 5 is building this crate's operations ahead of the callers that use
-// them. A handful of helpers — `assign_task`, `set_current_task`,
-// `find_session`, `register_repository`/`list_repositories`, `current_version`,
-// and the `EMPTY_ARRAY` collection encoding — are written and tested but not
-// yet reached through the [`Store`] aggregate or the repository traits, so
+// them. A handful of helpers — `set_current_task`, `find_session`,
+// `register_repository`/`list_repositories`, `current_version`, and the
+// `EMPTY_ARRAY` collection encoding — are written and tested but not yet
+// reached through the [`Store`] aggregate or the repository traits, so
 // dead_code fires on them. Allow it crate-wide until the wiring catches up
 // rather than deleting code that the phase needs; when [`Store`] exposes the
 // last of these, drop this allow and let the lint police the rest.
+//
+// `assign_task` used to be on that list. It is reached through
+// [`Store::assign_task`] and covered by the integration suite, so the lint
+// already holds it — that is the shape the remaining helpers should take.
 #![allow(dead_code)]
 
 mod agents;
@@ -67,6 +71,8 @@ mod tasks;
 
 use std::path::Path;
 
+use director_domain::assignment::AgentAssignment;
+use director_domain::ids::{AgentId, AssignmentId, TaskId};
 use director_domain::StoreError;
 
 pub use migrations::{latest_version, migrations, Migration};
@@ -140,6 +146,25 @@ impl Store {
     /// period. Releasing marks, never deletes.
     pub fn assignments(&self) -> SqliteAssignmentRepository {
         SqliteAssignmentRepository::new(self.pool.clone())
+    }
+
+    /// Hand a task to an agent atomically: any currently-active assignment for
+    /// the task is released as `Reassigned`, the new assignment is inserted as
+    /// `active`, and the agent's denormalized `current_task` view moves to this
+    /// task — one transaction, all or nothing.
+    ///
+    /// This is the operation a caller uses to *assign* a task. The repository's
+    /// `create_assignment` inserts a row in any status (a `Proposed` assignment
+    /// that is not yet acknowledged); this is the operation that actually hands
+    /// the task to an agent.
+    pub async fn assign_task(
+        &self,
+        task_id: &TaskId,
+        agent_id: &AgentId,
+        assignment_id: &AssignmentId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<AgentAssignment, StoreError> {
+        assignments::assign_task(&self.pool, task_id, agent_id, assignment_id, now).await
     }
 
     /// Checkpoints: Director's own resumption documents. Superseded ones are

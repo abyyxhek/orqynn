@@ -73,9 +73,9 @@ the only place a rule like this can survive a race.
 
 The store was written in bulk before it was ever compiled — the mistake this
 project keeps making — and arrived carrying a whole phase's worth of errors.
-The gates found them; one of them was worth more than all the others.
+The gates found them; two of them were worth more than all the others.
 
-**The partial unique indexes were inert.**
+### The partial unique indexes were inert
 
 The rule "one active assignment per task" is a partial index:
 
@@ -112,6 +112,31 @@ you what you *intended*; only running the tool tells you what you *have*. An
 invariant expressed in a comment and a schema file is a claim. A failing test
 is a fact.
 
+### `assign_task` left the departing agent holding the task
+
+`assign_task` is the atomic handoff — release the sitting tenant, insert the new
+assignment, move the agent's `current_task` — and the operation the loop's
+ASSIGN step will call. It was written ahead of any caller, and because it lived
+in a private module taking a crate-private pool, no test could reach it. `lib.rs`
+described these helpers as "written and tested"; for this one, it was written.
+
+Exposing it through `Store::assign_task` let the integration suite reach it, and
+the first test that exercised a reassignment failed: after handing a task from
+AGENT-1 to AGENT-2, `AGENT-1.current_task` still named the task. The transaction
+moved the *incoming* agent's view but never cleared the *departing* one's, so the
+denormalized view contradicted the authoritative assignment record — two agents
+both appearing to hold a task that only one could.
+
+`release_assignment` cleared the view; `assign_task`'s own release path did not,
+because it released by a bulk `UPDATE` that never learned which agent it
+displaced. The fix learns the sitting agent first, and clears before it sets —
+that order is what keeps reassigning a task to the agent that already holds it
+from ending with a stale view.
+
+The same write-through-the-store discipline caught both defects: code that no
+test can reach is code whose invariants are unverified, whatever its comments
+say.
+
 ## Evidence
 
 ### Gates
@@ -121,7 +146,7 @@ All four are clean:
 ```sh
 cargo fmt --all -- --check                         # clean
 cargo clippy --workspace --all-targets -- -D warnings   # clean
-cargo test --workspace                             # 268 tests, 0 failures
+cargo test --workspace                             # 272 tests, 0 failures
 cargo build --workspace                            # clean
 ```
 
@@ -131,7 +156,7 @@ cargo build --workspace                            # clean
 |---|---|
 | 145 `director-domain` unit | Entity invariants from Phase 1, plus the `store.rs` trait layer this phase added. |
 | 77 `director-adapters` unit | Unchanged from Phase 3; the adapters are untouched by this phase. |
-| 22 `tests/store.rs` | Round trips for every entity through the repositories, plus the invariants: stale-version conflicts, FK refusal, duplicate rejection, the two partial-index rules. |
+| 26 `tests/store.rs` | Round trips for every entity through the repositories, plus the invariants: stale-version conflicts, FK refusal, duplicate rejection, the two partial-index rules, and four tests of `assign_task` — the handoff, the reassignment that retains history, the unknown-agent rollback, and the same-agent view ordering. |
 | 19 `director-store` unit | The connection pool, the PRAGMAs, the migration runner, and the two uniqueness rules at the schema level. |
 | 3 `tests/boundary.rs` | The substrate-coupling rule: nothing outside `director-adapters` may name a substrate. `director-store` depends only on `director-domain` and passes. |
 | 8 + 5 live, `#[ignore]` | The two substrate suites, re-run and still green after this phase touched nothing they depend on. |
@@ -155,16 +180,23 @@ HANDOFF_BINARY=/c/Users/ASUS/.handoff-target/release/handoff-mcp.exe \
       runner, eight `Sqlite*Repository` implementations.
 - [x] The three storage invariants are enforced by the schema and asserted by
       tests, not by convention.
+- [x] `assign_task` is reached through the `Store` aggregate and its atomicity
+      is asserted: the handoff, the retained history, the unknown-agent
+      rollback, and the same-agent view ordering.
 - [x] Migration bootstrap is re-runnable on every connection without error.
 - [x] All four gates clean; boundary test passes with the new crate.
 
 ## What Phase 5 deliberately does not do
 
-- **No callers yet.** The store's operations are built ahead of the loop that
-  will use them. A few helpers — `assign_task`, `set_current_task`,
-  `find_session`, the repository helpers — are written and tested but not
-  reached through the `Store` aggregate, so `dead_code` is allowed crate-wide
-  until the wiring catches up. That allow is the next thing to delete.
+- **Some helpers still await their callers.** `assign_task` is now reached
+  through `Store::assign_task` and covered by the integration suite. Five
+  helpers remain written-but-unreached — `set_current_task`, `find_session`,
+  `register_repository`/`list_repositories`, `current_version`, and the
+  `EMPTY_ARRAY` encoding — so `#![allow(dead_code)]` stays in `lib.rs`. The
+  comment there tracks which remain; when the last one is wired, delete the
+  allow and let the lint police the rest.
+- **No callers of the store at all.** Nothing in the workspace opens a `Store`
+  yet. The loop that will is a later phase.
 - **No Phase 4.** The roadmap jumps 3 → 5; there is no `PHASE4` document and no
   Phase 4 work in this tree.
 - **No MCP server of Director's own**, and no loop. Persistence exists; the
