@@ -1,4 +1,4 @@
-//! [`HandoffAdapter`] — Director's provider traits over a live handoff-mcp.
+//! [`HandoffAdapter`] — Orqyn's provider traits over a live handoff-mcp.
 //!
 //! This is the last piece of Phase 2's handoff half: the struct that makes
 //! [`TaskProvider`], [`AgentProvider`], and [`SessionProvider`] real by
@@ -8,17 +8,17 @@
 //! ## What the adapter adds on top of the two layers
 //!
 //! The mapping is stateless and the transport is a pipe; neither can carry
-//! Director's own knowledge across calls. Three things live here for that
+//! Orqyn's own knowledge across calls. Three things live here for that
 //! reason:
 //!
-//! 1. **The trusted-done set.** Director's verification rule needs to know
-//!    which `done` states Director itself produced. The substrate cannot tell
+//! 1. **The trusted-done set.** Orqyn's verification rule needs to know
+//!    which `done` states Orqyn itself produced. The substrate cannot tell
 //!    us (see [`mapping`]'s note on the closed `extra` channel), so the adapter
 //!    keeps the set itself and hands it to [`mapping::task_from_wire`] on every
-//!    read. It is populated only by Director's own writes, so an agent cannot
+//!    read. It is populated only by Orqyn's own writes, so an agent cannot
 //!    put an id into it.
 //! 2. **Write-path repairs.** Two substrate rules would otherwise reject
-//!    Director's writes: a `done` transition requires every criterion checked,
+//!    Orqyn's writes: a `done` transition requires every criterion checked,
 //!    and any `in_progress`/`done` write requires an estimate. The adapter
 //!    ticks criteria it has verified and disables the estimate requirement at
 //!    project setup, rather than fabricating hours.
@@ -38,7 +38,7 @@
 //!
 //! [`HandoffProvider`], [`MemoryProvider`], [`ProjectStateProvider`], and
 //! [`ExecutionProvider`] are not implemented here. handoff-mcp's handoff notion
-//! is session-scoped notes, not Director's claim-once transfer; its memory
+//! is session-scoped notes, not Orqyn's claim-once transfer; its memory
 //! tools belong to the ai-memory adapter (Phase 3); and observing git is the
 //! git module's job, not a substrate's. Where a trait method has no honest
 //! substrate equivalent at all, the adapter returns
@@ -89,7 +89,7 @@ pub enum HandoffAdapterError {
         /// The message the substrate returned.
         message: String,
     },
-    /// A reply from the substrate could not be parsed into the shape Director
+    /// A reply from the substrate could not be parsed into the shape Orqyn
     /// expects — a sign the wire mirror in [`crate::handoff::wire`] has drifted
     /// from the live server.
     #[error("could not parse handoff-mcp's reply to '{tool}': {message}")]
@@ -103,7 +103,7 @@ pub enum HandoffAdapterError {
     /// status directly). Returned rather than approximating the call.
     #[error("the handoff-mcp substrate cannot do this: {0}")]
     Unsupported(String),
-    /// A task Director asked for is not in the substrate.
+    /// A task Orqyn asked for is not in the substrate.
     #[error("no such task in handoff-mcp: {0}")]
     NotFound(String),
 }
@@ -146,7 +146,7 @@ impl HandoffWire for McpTransport {
     }
 }
 
-/// Director's adapter for the handoff-mcp substrate.
+/// Orqyn's adapter for the handoff-mcp substrate.
 ///
 /// Generic over the wire connection so tests can drive it with a fake; the
 /// default is the real stdio transport.
@@ -159,7 +159,7 @@ pub struct HandoffAdapter<T = McpTransport> {
     project_dir: PathBuf,
     /// Project name, used only at initialization.
     project_name: String,
-    /// Task ids Director itself moved to `Done`. The one place the verification
+    /// Task ids Orqyn itself moved to `Done`. The one place the verification
     /// rule can be decided, because the substrate will not say. A standard
     /// mutex: it is only ever held across plain memory access, never an await.
     trusted_done_ids: std::sync::Mutex<HashSet<String>>,
@@ -196,10 +196,10 @@ impl<T: HandoffWire> HandoffAdapter<T> {
     /// Call a handoff-mcp tool directly, bypassing the mapping.
     ///
     /// This is not part of any provider trait and never will be: it exists so
-    /// a live integration test can reproduce substrate-level writes Director
+    /// a live integration test can reproduce substrate-level writes Orqyn
     /// itself would never make — an agent ticking its own `done`, or a config
     /// change made out of band — and then observe how the adapter responds.
-    /// Director's own code goes through the trait methods.
+    /// Orqyn's own code goes through the trait methods.
     pub async fn raw_call(
         &self,
         name: &str,
@@ -210,7 +210,7 @@ impl<T: HandoffWire> HandoffAdapter<T> {
     }
 
     /// Initialize the substrate project and relax the settings that would
-    /// otherwise reject Director's writes.
+    /// otherwise reject Orqyn's writes.
     ///
     /// Safe to call on every connection: `handoff_init` is only invoked for a
     /// project that has no `.handoff/` yet, and the config write is idempotent.
@@ -234,12 +234,12 @@ impl<T: HandoffWire> HandoffAdapter<T> {
             Err(error) => return Err(error),
         }
 
-        // Director deliberately never writes estimate_hours (it is a human
-        // scheduling estimate Director has no basis to invent), but the
+        // Orqyn deliberately never writes estimate_hours (it is a human
+        // scheduling estimate Orqyn has no basis to invent), but the
         // substrate rejects any in_progress/review/done write without one.
-        // Since Director maps VerificationPending to in_progress and Done to
+        // Since Orqyn maps VerificationPending to in_progress and Done to
         // done, that rule would block almost every status write. Disabling it
-        // in Director's own integration project is the honest fix; the
+        // in Orqyn's own integration project is the honest fix; the
         // alternative — a fabricated hour count — would corrupt the
         // substrate's metrics.
         self.call(
@@ -334,7 +334,7 @@ impl<T: HandoffWire> HandoffAdapter<T> {
         task_from_wire(&data, &trusted)
     }
 
-    /// Record that Director itself completed this task.
+    /// Record that Orqyn itself completed this task.
     fn trust_done(&self, id: &str) {
         let mut trusted = self
             .trusted_done_ids
@@ -347,7 +347,7 @@ impl<T: HandoffWire> HandoffAdapter<T> {
     async fn write_task(&self, task: &Task) -> Result<Task, HandoffAdapterError> {
         let mut wire = task_to_wire(task);
         // The substrate rejects a done transition unless every criterion is
-        // checked. Director reaches Done only through its own verification, so
+        // checked. Orqyn reaches Done only through its own verification, so
         // ticking the criteria here records that verdict — it is not
         // rubber-stamping an agent's claim, which never reaches this method.
         if task.status == TaskStatus::Done {
@@ -374,12 +374,12 @@ impl<T: HandoffWire> HandoffAdapter<T> {
         Ok(self.to_task(stored))
     }
 
-    /// Read a task as Director's, applying the trusted-done set.
+    /// Read a task as Orqyn's, applying the trusted-done set.
     async fn read_task(&self, id: &TaskId) -> Result<Option<Task>, HandoffAdapterError> {
         Ok(self.fetch_task(id.as_str()).await?.map(|d| self.to_task(d)))
     }
 
-    /// The agent record for `id` as Director sees it, or `None`.
+    /// The agent record for `id` as Orqyn sees it, or `None`.
     ///
     /// `include_tasks` is what makes an `Active` agent resolvable to `Busy`:
     /// the substrate's status spans both and only the claimed-task list
@@ -445,7 +445,7 @@ impl<T: HandoffWire> Provider for HandoffAdapter<T> {
 #[async_trait]
 impl<T: HandoffWire> TaskProvider for HandoffAdapter<T> {
     async fn create_task(&self, task: Task) -> Result<Task, Self::Error> {
-        // Director controls the id (the substrate's update tool is an upsert),
+        // Orqyn controls the id (the substrate's update tool is an upsert),
         // so the id round-trips rather than being renamed by the substrate.
         self.write_task(&task).await
     }
@@ -559,7 +559,7 @@ impl<T: HandoffWire> AgentProvider for HandoffAdapter<T> {
     ) -> Result<(), Self::Error> {
         // The substrate's agent statuses are derived from heartbeat age on
         // every read, so there is nothing to write. An operator taking an agent
-        // offline is a Director-owned fact for Director's own store (Phase 5),
+        // offline is a Orqyn-owned fact for Orqyn's own store (Phase 5),
         // not something to approximate into a heartbeat-derived field.
         Err(HandoffAdapterError::Unsupported(
             "handoff-mcp derives agent status from heartbeat age and cannot be set directly".into(),
@@ -625,9 +625,9 @@ impl<T: HandoffWire> SessionProvider for HandoffAdapter<T> {
     }
 
     async fn close_session(&self, id: &SessionId, end: SessionEnd) -> Result<(), Self::Error> {
-        // The substrate distinguishes only closed vs paused. Director's richer
+        // The substrate distinguishes only closed vs paused. Orqyn's richer
         // reasons map to the nearest terminal state; the real reason is
-        // Director's to keep (Phase 5), because the substrate has no field
+        // Orqyn's to keep (Phase 5), because the substrate has no field
         // for it.
         let pause = matches!(end, SessionEnd::ContextExhausted);
         let mut arguments = serde_json::Map::new();
@@ -673,8 +673,8 @@ impl<T: HandoffWire> SessionProvider for HandoffAdapter<T> {
         new_id: SessionId,
     ) -> Result<AgentSession, Self::Error> {
         // The substrate assigns the forked id; the lineage it reports back is
-        // what Director keeps. `new_id` is accepted for the trait's signature
-        // and recorded in Director's own store (Phase 5), where ids Director
+        // what Orqyn keeps. `new_id` is accepted for the trait's signature
+        // and recorded in Orqyn's own store (Phase 5), where ids Orqyn
         // issued are meaningful.
         let result: Value = self
             .call_json(
@@ -723,7 +723,7 @@ impl<T: HandoffWire> HandoffAdapter<T> {
 }
 
 /// A one-line summary of a session for the substrate's `summary` field,
-/// derived from what Director actually knows about it.
+/// derived from what Orqyn actually knows about it.
 fn session_summary_for(session: &AgentSession) -> String {
     match session.task_id.as_ref() {
         Some(task) => format!("Working on {}", task),
@@ -1058,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn an_agent_reported_done_does_not_complete_the_task() {
         // The acceptance criterion at the adapter boundary: the substrate says
-        // `done`, but nothing verified it, so Director must not see Done.
+        // `done`, but nothing verified it, so Orqyn must not see Done.
         let adapter = adapter("AGENT-1");
         adapter
             .create_task(task("AUTH-2", TaskStatus::Todo))
@@ -1066,7 +1066,7 @@ mod tests {
             .expect("create");
 
         // Simulate the agent ticking its own checkbox: write `done` straight
-        // through the fake, bypassing Director's write path.
+        // through the fake, bypassing Orqyn's write path.
         {
             let transport = adapter.transport.lock().await;
             let mut fake = transport.lock().unwrap();
@@ -1083,15 +1083,15 @@ mod tests {
         assert_eq!(
             observed.status,
             TaskStatus::VerificationPending,
-            "an agent's done must not become Director's Done"
+            "an agent's done must not become Orqyn's Done"
         );
     }
 
     #[tokio::test]
     async fn a_director_completion_comes_back_as_done() {
-        // When Director itself moves the task to Done, the trusted-done set
+        // When Orqyn itself moves the task to Done, the trusted-done set
         // makes the read agree — without any help from the substrate, which
-        // cannot tell Director's done from an agent's.
+        // cannot tell Orqyn's done from an agent's.
         let adapter = adapter("AGENT-1");
         adapter
             .create_task(task("AUTH-3", TaskStatus::Todo))
@@ -1114,7 +1114,7 @@ mod tests {
     #[tokio::test]
     async fn completing_a_task_ticks_its_criteria_on_the_wire() {
         // The substrate rejects a done transition with an unchecked criterion,
-        // so Director's completion must check them. Asserting on the request
+        // so Orqyn's completion must check them. Asserting on the request
         // shows the repair happened on the wire, where the rule is enforced.
         let adapter = adapter("AGENT-1");
         let mut task = task("AUTH-4", TaskStatus::Todo);
@@ -1247,7 +1247,7 @@ mod tests {
             vec![],
         );
 
-        // The fake reports an active agent holding a task, which is Director's
+        // The fake reports an active agent holding a task, which is Orqyn's
         // Busy — the ambiguity the claimed-task list exists to resolve.
         let registered = adapter.register_agent(agent).await.expect("register");
         assert_eq!(registered.id, AgentId::from_string("AGENT-1".to_string()));
@@ -1355,7 +1355,7 @@ mod tests {
         assert_eq!(
             forked.parent_session_id,
             Some(parent_id),
-            "the substrate's lineage is what Director keeps"
+            "the substrate's lineage is what Orqyn keeps"
         );
         assert_ne!(forked.id, parent.id);
     }

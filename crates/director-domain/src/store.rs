@@ -1,4 +1,4 @@
-//! Director's own persistent store — the domain-facing half of the boundary.
+//! Orqyn's own persistent store — the domain-facing half of the boundary.
 //!
 //! ## What this module is, and what it is deliberately not
 //!
@@ -8,12 +8,12 @@
 //! other boundary, and it is not that one.
 //!
 //! [`crate::providers`] asks: *"what does the substrate say?"*
-//! These traits ask: *"what does Director itself know?"*
+//! These traits ask: *"what does Orqyn itself know?"*
 //!
 //! The difference is load-bearing. A task in handoff-mcp is a row the substrate
-//! owns; a task in Director's store is a record Director owns, with a version,
+//! owns; a task in Orqyn's store is a record Orqyn owns, with a version,
 //! a project, and an assignment history that survives the substrate being
-//! unreachable. Director must be able to load every entity below with both
+//! unreachable. Orqyn must be able to load every entity below with both
 //! substrates down — that is the acceptance property in the Phase 4
 //! specification, and it is why these traits are not provider traits.
 //!
@@ -26,7 +26,7 @@
 //! director-store
 //!     │  SQLite, migrations, transactions
 //!     ▼
-//! a .db file Director owns
+//! a .db file Orqyn owns
 //! ```
 //!
 //! Nothing in this module knows about SQLite. [`StoreError`] is a domain
@@ -64,7 +64,7 @@ use crate::project::Project;
 use crate::session::AgentSession;
 use crate::task::{Task, TaskStatus};
 
-/// The error vocabulary for Director's own store.
+/// The error vocabulary for Orqyn's own store.
 ///
 /// Deliberately not `ProviderError` and deliberately not SQLite's error type.
 /// Not `ProviderError`, because a store failure means something different from
@@ -135,23 +135,23 @@ pub struct TaskStatusTransition {
     pub at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Metadata about one Director entity's synchronization with one external
+/// Metadata about one Orqyn entity's synchronization with one external
 /// provider.
 ///
-/// Director persists only what is needed to understand the state of a
+/// Orqyn persists only what is needed to understand the state of a
 /// synchronization: who the provider is, which external resource corresponds to
-/// the Director id, when it last synced, and what it said last. The provider's
+/// the Orqyn id, when it last synced, and what it said last. The provider's
 /// own internal schema is not copied — this is a pointer and a status, not a
 /// replica.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderSync {
-    /// The Director id of the entity this record describes.
+    /// The Orqyn id of the entity this record describes.
     pub entity_id: String,
     /// Which provider the external resource belongs to, e.g. `"handoff-mcp"`.
     pub provider: String,
     /// The provider's own id for the same resource, when known.
     pub external_id: Option<String>,
-    /// When Director last attempted a synchronization.
+    /// When Orqyn last attempted a synchronization.
     pub last_sync_at: chrono::DateTime<chrono::Utc>,
     /// When a synchronization last succeeded.
     pub last_success_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -161,12 +161,12 @@ pub struct ProviderSync {
     pub external_version: Option<String>,
 }
 
-/// The normalized project state Director currently knows about.
+/// The normalized project state Orqyn currently knows about.
 ///
 /// This is **not** a git observation. The git observer answers *"what did git
-/// say just now?"*; this answers *"what does Director currently believe the
+/// say just now?"*; this answers *"what does Orqyn currently believe the
 /// project state to be?"*. The two are kept separate on purpose: the observer
-/// is re-read from git every time, while this record is what Director holds
+/// is re-read from git every time, while this record is what Orqyn holds
 /// between observations, what a checkpoint is compared against, and what
 /// survives a restart. See [`crate::repository`] for the observer's own types.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -177,13 +177,13 @@ pub struct StoredProjectState {
     pub repository_id: Option<RepositoryId>,
     /// The checked-out branch, or `None` under a detached HEAD.
     pub branch: Option<String>,
-    /// The commit `HEAD` pointed at when Director last observed this project.
+    /// The commit `HEAD` pointed at when Orqyn last observed this project.
     pub head_commit: String,
     /// Whether the working tree was clean at the last observation.
     pub working_tree_clean: bool,
-    /// How many observations Director has made. Monotonic.
+    /// How many observations Orqyn has made. Monotonic.
     pub observation_version: u64,
-    /// When Director last observed the project.
+    /// When Orqyn last observed the project.
     pub last_observed_at: chrono::DateTime<chrono::Utc>,
     /// The project's state version. Bumped once per observation that records a
     /// meaningful change — the same counter a checkpoint records in
@@ -220,7 +220,7 @@ pub trait ProjectRepository: Store {
     /// precondition; a stale version is a [`StoreError::StateVersionConflict`].
     async fn update_project(&self, project: &Project) -> Result<Project, Self::Error>;
 
-    /// Every project Director knows, ordered by name.
+    /// Every project Orqyn knows, ordered by name.
     async fn list_projects(&self) -> Result<Vec<Project>, Self::Error>;
 }
 
@@ -262,7 +262,7 @@ pub trait AgentRepository: Store {
     /// Persist an updated agent, optimistic version check included.
     async fn update_agent(&self, agent: &Agent) -> Result<Agent, Self::Error>;
 
-    /// Every agent Director knows.
+    /// Every agent Orqyn knows.
     async fn list_agents(&self) -> Result<Vec<Agent>, Self::Error>;
 }
 
@@ -339,7 +339,7 @@ pub trait AssignmentRepository: Store {
     async fn assignment_history(&self, task: &TaskId) -> Result<Vec<AgentAssignment>, Self::Error>;
 }
 
-/// Persistence for checkpoints — Director's own resumption documents.
+/// Persistence for checkpoints — Orqyn's own resumption documents.
 ///
 /// Phase 4 stores the durable foundation: the record, the latest-for-task
 /// marking, and the versions it must be compared against. The automatic
@@ -363,20 +363,20 @@ pub trait CheckpointRepository: Store {
     async fn checkpoints_for_task(&self, task: &TaskId) -> Result<Vec<Checkpoint>, Self::Error>;
 }
 
-/// Persistence for normalized project state — what Director currently knows.
+/// Persistence for normalized project state — what Orqyn currently knows.
 ///
 /// Not the git observation itself; see [`StoredProjectState`] for the
 /// separation.
 #[async_trait]
 pub trait ProjectStateRepository: Store {
-    /// Record or replace the state Director holds for a project, bumping the
+    /// Record or replace the state Orqyn holds for a project, bumping the
     /// state version when the observation reports a meaningful change.
     async fn update_project_state(
         &self,
         state: &StoredProjectState,
     ) -> Result<StoredProjectState, Self::Error>;
 
-    /// The state Director currently holds for a project, or `None` before the
+    /// The state Orqyn currently holds for a project, or `None` before the
     /// first observation.
     async fn get_project_state(
         &self,
@@ -388,7 +388,7 @@ pub trait ProjectStateRepository: Store {
 #[async_trait]
 pub trait ProviderSyncRepository: Store {
     /// Record the outcome of a synchronization attempt for one entity, by
-    /// Director id and provider.
+    /// Orqyn id and provider.
     async fn record_sync(&self, sync: &ProviderSync) -> Result<ProviderSync, Self::Error>;
 
     /// The last recorded synchronization for an entity and provider, if any.

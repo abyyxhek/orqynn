@@ -113,7 +113,7 @@ impl GitService {
         );
 
         // The baseline commit window is recorded as *observed*, not as newly
-        // created: Director did not watch these commits happen, it arrived and
+        // created: Orqyn did not watch these commits happen, it arrived and
         // found them. Only commits after this point become COMMIT_CREATED.
         let baseline_commits = if status == RepositoryStatus::Empty {
             vec![]

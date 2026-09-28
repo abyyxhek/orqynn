@@ -1,4 +1,4 @@
-//! Bidirectional mapping between handoff-mcp's wire types and Director's domain.
+//! Bidirectional mapping between handoff-mcp's wire types and Orqyn's domain.
 //!
 //! ## Why this file exists and why it is not trivial
 //!
@@ -7,26 +7,26 @@
 //! handled explicitly:
 //!
 //! 1. **Task status.** The substrate has 6 states (`todo`, `in_progress`,
-//!    `review`, `done`, `blocked`, `skipped`). Director has 8
+//!    `review`, `done`, `blocked`, `skipped`). Orqyn has 8
 //!    (`Backlog`, `Todo`, `InProgress`, `Blocked`, `VerificationPending`,
-//!    `Done`, `Failed`, `Cancelled`). Director-only states ride in
+//!    `Done`, `Failed`, `Cancelled`). Orqyn-only states ride in
 //!    `TaskData.extra` and fall back to the nearest honest substrate state.
 //!
 //! 2. **The important one.** handoff-mcp's `done` is an agent self-report
 //!    (Phase 0 finding R6: `handoff_check_criterion` is a checkbox an agent
-//!    ticks). So a substrate `done` does **not** become Director `Done` — it
+//!    ticks). So a substrate `done` does **not** become Orqyn `Done` — it
 //!    becomes `VerificationPending`, because nothing has been verified.
-//!    Only Director-initiated transitions, marked with an extra flag, map back
+//!    Only Orqyn-initiated transitions, marked with an extra flag, map back
 //!    to `Done`. This is the acceptance criterion "agent claims done, tests
 //!    fail → must not become COMPLETED", enforced at the boundary.
 //!
-//! 3. **Priority.** The substrate has `low`/`medium`/`high`. Director adds
+//! 3. **Priority.** The substrate has `low`/`medium`/`high`. Orqyn adds
 //!    `Critical`, which maps down to `high` and is recovered from `extra`.
 //!
 //! ## The `extra` channel, and what it can and cannot carry
 //!
 //! `TaskData.extra` is a real `#[serde(flatten)]` map *inside* the substrate's
-//! storage layer, and this mapping writes Director-only state into it. But
+//! storage layer, and this mapping writes Orqyn-only state into it. But
 //! against the live v0.35.1 server that channel is closed at the MCP boundary
 //! in both directions:
 //!
@@ -34,15 +34,15 @@
 //!   `extra` is never serialized onto the wire.
 //! - **Writes.** `handoff_update_task` reconstructs the record from named
 //!   fields. A *create* starts from `extra: HashMap::new()`, and an *update*
-//!   copies only known fields out of the request — so values Director sends
+//!   copies only known fields out of the request — so values Orqyn sends
 //!   in `extra` never reach the file.
 //!
 //! The consequence is stated plainly because it is easy to get wrong: **a
-//! Director-only status or a `Critical` priority does not survive a substrate
+//! Orqyn-only status or a `Critical` priority does not survive a substrate
 //! round trip.** The write path still populates `extra` — it is the correct
 //! shape if the substrate ever exposes the field, and it costs nothing — but
 //! nothing here depends on it. What the boundary *can* rely on is the set of
-//! ids Director itself completed, passed as `trusted_done_ids`; that is how
+//! ids Orqyn itself completed, passed as `trusted_done_ids`; that is how
 //! the verification rule holds, and that set lives in the adapter's own state
 //! ([`crate::handoff::adapter`]), not in the substrate.
 
@@ -55,27 +55,27 @@ use director_domain::task::{Complexity, ExpectedOutput, Priority, Task, TaskStat
 
 use crate::handoff::wire::{AgentRecord, Schedule, TaskData};
 
-/// Key under which Director's own task status is stashed in `TaskData.extra`
+/// Key under which Orqyn's own task status is stashed in `TaskData.extra`
 /// when it has no substrate equivalent.
 pub const DIRECTOR_STATUS_KEY: &str = "director_status";
 
-/// Key marking that a transition to `done` was Director's own decision (i.e.
+/// Key marking that a transition to `done` was Orqyn's own decision (i.e.
 /// verification passed), as opposed to an agent's self-report. Its presence is
-/// the *only* thing that lets a substrate `done` become Director `Done`.
+/// the *only* thing that lets a substrate `done` become Orqyn `Done`.
 pub const DIRECTOR_VERIFIED_KEY: &str = "director_verified";
 
-/// Key for Director's `Priority::Critical`, which the substrate cannot express.
+/// Key for Orqyn's `Priority::Critical`, which the substrate cannot express.
 pub const DIRECTOR_PRIORITY_KEY: &str = "director_priority";
 
 /// Key for the capability list the substrate has no field for.
 pub const DIRECTOR_CAPABILITIES_KEY: &str = "director_capabilities";
 
-/// Key for Director's `Complexity`, which the substrate does not model.
+/// Key for Orqyn's `Complexity`, which the substrate does not model.
 pub const DIRECTOR_COMPLEXITY_KEY: &str = "director_complexity";
 
-/// Convert a substrate task into Director's task.
+/// Convert a substrate task into Orqyn's task.
 ///
-/// `trusted_done_ids` is the set of task ids whose `done` state Director itself
+/// `trusted_done_ids` is the set of task ids whose `done` state Orqyn itself
 /// produced. Everything else reported `done` by the substrate is an agent
 /// self-report and becomes `VerificationPending`.
 pub fn task_from_wire(
@@ -146,9 +146,9 @@ fn objective_of(data: &TaskData) -> String {
     data.title.clone()
 }
 
-/// Convert Director's task into the substrate's wire shape.
+/// Convert Orqyn's task into the substrate's wire shape.
 ///
-/// Director-only states are preserved in `extra` so the round trip is lossless,
+/// Orqyn-only states are preserved in `extra` so the round trip is lossless,
 /// while the substrate's own `status` is set to the nearest state it can
 /// actually express.
 pub fn task_to_wire(task: &Task) -> TaskData {
@@ -179,7 +179,7 @@ pub fn task_to_wire(task: &Task) -> TaskData {
             ),
         );
     }
-    // A Director-confirmed completion carries the marker that lets a later read
+    // A Orqyn-confirmed completion carries the marker that lets a later read
     // trust the substrate's `done`. Its absence is what makes an agent's
     // self-reported `done` come back as `VerificationPending`.
     if task.status == TaskStatus::Done {
@@ -211,8 +211,8 @@ pub fn task_to_wire(task: &Task) -> TaskData {
             .iter()
             .map(|o| crate::handoff::wire::DoneCriterion {
                 item: o.criterion.clone(),
-                // Never checked by Director: ticking this is an agent
-                // self-report, and Director does not treat it as evidence.
+                // Never checked by Orqyn: ticking this is an agent
+                // self-report, and Orqyn does not treat it as evidence.
                 checked: false,
             })
             .collect(),
@@ -227,14 +227,14 @@ pub fn task_to_wire(task: &Task) -> TaskData {
     }
 }
 
-/// Read a substrate status as Director's, applying the verification rule.
+/// Read a substrate status as Orqyn's, applying the verification rule.
 pub fn status_from_wire(
     substrate: &str,
     extra: &std::collections::HashMap<String, Value>,
     task_id: &str,
     trusted_done_ids: &std::collections::HashSet<String>,
 ) -> TaskStatus {
-    // A Director-only status always wins over the substrate fallback.
+    // A Orqyn-only status always wins over the substrate fallback.
     if let Some(director_status) = extra.get(DIRECTOR_STATUS_KEY).and_then(Value::as_str) {
         return status_from_director_string(director_status);
     }
@@ -243,11 +243,11 @@ pub fn status_from_wire(
         "todo" => TaskStatus::Todo,
         "in_progress" => TaskStatus::InProgress,
         "blocked" => TaskStatus::Blocked,
-        // The substrate's notion of review has no Director equivalent; treat
+        // The substrate's notion of review has no Orqyn equivalent; treat
         // it as work awaiting a verdict rather than completed.
         "review" => TaskStatus::VerificationPending,
         "done" => {
-            // Only Director's own completions are Done. Any other `done` is an
+            // Only Orqyn's own completions are Done. Any other `done` is an
             // agent self-report and must wait for verification.
             let verified = extra
                 .get(DIRECTOR_VERIFIED_KEY)
@@ -266,15 +266,15 @@ pub fn status_from_wire(
     }
 }
 
-/// Map Director's status to the substrate's closest state, reporting which
-/// Director value had to be stashed in `extra` because the substrate cannot
+/// Map Orqyn's status to the substrate's closest state, reporting which
+/// Orqyn value had to be stashed in `extra` because the substrate cannot
 /// express it.
 pub fn status_to_wire(status: TaskStatus) -> (String, Option<String>) {
     match status {
         TaskStatus::Todo => ("todo".to_string(), None),
         TaskStatus::InProgress => ("in_progress".to_string(), None),
         TaskStatus::Blocked => ("blocked".to_string(), None),
-        // Director's Done is written together with the verified marker.
+        // Orqyn's Done is written together with the verified marker.
         TaskStatus::Done => ("done".to_string(), None),
         TaskStatus::Backlog => ("todo".to_string(), Some("backlog".to_string())),
         TaskStatus::VerificationPending => (
@@ -306,7 +306,7 @@ fn priority_from_wire(
     substrate: &Option<String>,
     extra: &std::collections::HashMap<String, Value>,
 ) -> Option<Priority> {
-    // Director's Critical is recovered before the substrate value is consulted.
+    // Orqyn's Critical is recovered before the substrate value is consulted.
     if let Some(p) = extra.get(DIRECTOR_PRIORITY_KEY).and_then(Value::as_str) {
         if p == "critical" {
             return Some(Priority::Critical);
@@ -389,10 +389,10 @@ fn capability_to_wire(c: &director_domain::capability::Capability) -> String {
     .to_string()
 }
 
-/// Map the substrate's agent record to Director's.
+/// Map the substrate's agent record to Orqyn's.
 ///
 /// The substrate's statuses are derived from heartbeat age: `Active` covers both
-/// of Director's `Available` and `Busy`. Director resolves the ambiguity from
+/// of Orqyn's `Available` and `Busy`. Orqyn resolves the ambiguity from
 /// whether the agent holds claimed tasks, which the substrate reports only when
 /// asked — so the caller passes it in.
 pub fn agent_from_wire(record: &AgentRecord) -> Agent {
@@ -437,7 +437,7 @@ fn machine_id_for(worktree: &str) -> String {
 
 fn agent_status_from_wire(substrate: &str, holds_tasks: bool) -> AgentStatus {
     match substrate {
-        // The substrate's Active spans Director's Available and Busy.
+        // The substrate's Active spans Orqyn's Available and Busy.
         "active" => {
             if holds_tasks {
                 AgentStatus::Busy
@@ -451,19 +451,19 @@ fn agent_status_from_wire(substrate: &str, holds_tasks: bool) -> AgentStatus {
     }
 }
 
-/// Map a substrate session summary to Director's session.
+/// Map a substrate session summary to Orqyn's session.
 ///
 /// Ownership, lineage, and working directory all come from the summary itself
 /// — the substrate's `handoff_list_sessions` carries them whenever the
 /// underlying session record has them. When it does not, the caller falls back
-/// to [`unknown_agent_id`] rather than inventing an owner: Director would
+/// to [`unknown_agent_id`] rather than inventing an owner: Orqyn would
 /// rather show an unattributed session than attribute it to the wrong agent.
 pub fn session_from_wire(summary: &crate::handoff::wire::SessionSummary) -> AgentSession {
     let agent_id = summary
         .agent_id
         .clone()
         .unwrap_or_else(|| unknown_agent_id().to_string());
-    // The substrate's session records carry no Director project. Rather than
+    // The substrate's session records carry no Orqyn project. Rather than
     // invent one, the session is mapped unscoped; whoever persists it supplies
     // the project — or the store rejects it.
     let mut session = AgentSession::start(
@@ -506,7 +506,7 @@ pub fn unknown_agent_id() -> &'static str {
 fn session_end_from_wire(substrate_status: &str) -> SessionEnd {
     match substrate_status {
         // The substrate distinguishes closed sessions only by the fact of
-        // closing; Director's richer reasons are resolved later from whether
+        // closing; Orqyn's richer reasons are resolved later from whether
         // the close was expected.
         "closed" => SessionEnd::Clean,
         "paused" => SessionEnd::ContextExhausted,
@@ -534,7 +534,7 @@ pub fn parse_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 // `Schedule` is read but never written; reference it so the import stays honest
-// about which parts of the wire model Director uses.
+// about which parts of the wire model Orqyn uses.
 #[allow(unused_imports)]
 use Schedule as _ReadSchedule;
 
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn a_substrate_done_without_verification_is_not_done() {
         // The acceptance criterion, at the boundary: an agent reporting done
-        // must not complete the task in Director's model.
+        // must not complete the task in Orqyn's model.
         let data = wire_with_status("done");
         let trusted = std::collections::HashSet::new();
         let task = task_from_wire(&data, &trusted);
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn a_director_marked_done_round_trips_as_done() {
-        // When Director itself completed the task, the marker is on the record
+        // When Orqyn itself completed the task, the marker is on the record
         // and the status comes back as Done.
         let mut task = Task::new(TaskId::from_string("AUTH-42"), "Auth", "objective");
         task.status = TaskStatus::Done;
@@ -703,7 +703,7 @@ mod tests {
         let wire = task_to_wire(&task);
         assert_eq!(wire.done_criteria.len(), 1);
         // Never ticked: a checked criterion is an agent self-report, not
-        // evidence Director would act on.
+        // evidence Orqyn would act on.
         assert!(!wire.done_criteria[0].checked);
     }
 

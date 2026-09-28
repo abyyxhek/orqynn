@@ -2,7 +2,7 @@
 //!
 //! Everything here is designed around one fact: **agents disappear**. A
 //! session ends, a cloud token expires, a laptop closes, a harness is
-//! uninstalled. Director models agents as ephemeral and heartbeated, never as
+//! uninstalled. Orqyn models agents as ephemeral and heartbeated, never as
 //! owners of work.
 
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::capability::Capability;
 use crate::ids::{AgentId, MachineId, TaskId};
 
-/// Which harness an agent runs in. Director is vendor-independent: this enum
+/// Which harness an agent runs in. Orqyn is vendor-independent: this enum
 /// carries no behavior, it is metadata for logging, capability defaults, and
 /// human-facing display.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,8 +38,8 @@ pub enum Harness {
     KimiCode,
     /// A human working directly in the repository.
     Human,
-    /// Any MCP/ACP-capable agent Director has not been taught about. Kept so
-    /// that adding a harness never requires changing Director's model.
+    /// Any MCP/ACP-capable agent Orqyn has not been taught about. Kept so
+    /// that adding a harness never requires changing Orqyn's model.
     Other(String),
 }
 
@@ -82,7 +82,7 @@ impl AgentStatus {
         matches!(self, AgentStatus::Available)
     }
 
-    /// True if Director should treat the agent as possibly still alive.
+    /// True if Orqyn should treat the agent as possibly still alive.
     pub fn is_live(self) -> bool {
         matches!(
             self,
@@ -109,7 +109,7 @@ pub struct Agent {
     pub name: String,
     /// Which harness this agent runs in.
     pub harness: Harness,
-    /// Model or tier, free-form, e.g. "opus" or "deepseek-v3". Director never
+    /// Model or tier, free-form, e.g. "opus" or "deepseek-v3". Orqyn never
     /// branches on this; it is recorded for attribution.
     pub model: Option<String>,
     /// What this agent declares it can do.
@@ -123,7 +123,7 @@ pub struct Agent {
     /// reconciled by the assignment service.
     pub current_task: Option<TaskId>,
     /// The substrate that hosts this agent's registry, when known — e.g.
-    /// `handoff-mcp`. Recorded so Director can tell which provider a record
+    /// `handoff-mcp`. Recorded so Orqyn can tell which provider a record
     /// came from; the provider's own internals are never stored here.
     #[serde(default)]
     pub provider: Option<String>,
@@ -135,9 +135,9 @@ pub struct Agent {
     /// [`crate::project::Project::state_version`].
     #[serde(default = "default_state_version")]
     pub state_version: u64,
-    /// When Director first registered the agent.
+    /// When Orqyn first registered the agent.
     pub registered_at: chrono::DateTime<chrono::Utc>,
-    /// When Director last heard from the agent.
+    /// When Orqyn last heard from the agent.
     pub last_seen: chrono::DateTime<chrono::Utc>,
     /// When this record last changed. Separate from `last_seen`: a heartbeat
     /// moves `last_seen`, while `updated_at` moves on any write.
@@ -206,7 +206,7 @@ impl Agent {
     /// Derive status from heartbeat age.
     ///
     /// Mirrors handoff-mcp's `AgentRecord` TTL design (30 min to `Stale`,
-    /// twice that to `Disconnected`) so Director's notion of liveness agrees
+    /// twice that to `Disconnected`) so Orqyn's notion of liveness agrees
     /// with the substrate's when both are running.
     pub fn status_from_heartbeat(age: chrono::Duration) -> AgentStatus {
         let mins = age.num_minutes();
@@ -223,7 +223,7 @@ impl Agent {
 /// A physical or virtual machine an agent runs on.
 ///
 /// Machines exist because the original problem is often *the machine* going
-/// away, not the agent: the laptop closes, the cloud session expires. Director
+/// away, not the agent: the laptop closes, the cloud session expires. Orqyn
 /// must be able to say "the work was on MACHINE-A; resume it on MACHINE-B".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Machine {

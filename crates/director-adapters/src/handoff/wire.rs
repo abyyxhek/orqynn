@@ -2,7 +2,7 @@
 //!
 //! These are deliberately **not** the domain types and can never become them.
 //! They describe what the substrate puts on the wire, warts and all, so that
-//! every schema difference between it and Director's model is visible in one
+//! every schema difference between it and Orqyn's model is visible in one
 //! place — [`crate::handoff::mapping`] — instead of scattered through call
 //! sites.
 //!
@@ -29,7 +29,7 @@ pub struct TaskData {
     /// Free-form notes attached to the task. Absent until someone writes them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
-    /// `low` / `medium` / `high`. Director's `Critical` has no wire equivalent
+    /// `low` / `medium` / `high`. Orqyn's `Critical` has no wire equivalent
     /// and rides in [`TaskData::extra`] instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
@@ -52,7 +52,7 @@ pub struct TaskData {
     /// Acceptance criteria — self-reportable checkboxes on the substrate side.
     #[serde(default)]
     pub done_criteria: Vec<DoneCriterion>,
-    /// Scheduling block. Read back; Director never writes the estimate.
+    /// Scheduling block. Read back; Orqyn never writes the estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<Schedule>,
     /// Ids this task waits on before it becomes ready.
@@ -65,7 +65,7 @@ pub struct TaskData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<u32>,
     /// The agent currently holding the task, when assigned. Assignment is
-    /// authoritative in Director's own layer, not here.
+    /// authoritative in Orqyn's own layer, not here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
     /// Cross-process claim lease. Present only while the task is claimed.
@@ -74,7 +74,7 @@ pub struct TaskData {
     /// Scope paths the task is allowed to touch, for overlap detection.
     #[serde(default)]
     pub scope_paths: Vec<String>,
-    /// `#[serde(flatten)]` on the server side, so Director-only state rides
+    /// `#[serde(flatten)]` on the server side, so Orqyn-only state rides
     /// here. This is how non-isomorphic statuses survive a round trip.
     #[serde(default, flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -97,19 +97,19 @@ pub struct TaskLink {
 }
 
 /// One acceptance criterion. On the substrate side this is a self-reportable
-/// checkbox — the reason Director's verification engine (Phase 10) never trusts
+/// checkbox — the reason Orqyn's verification engine (Phase 10) never trusts
 /// it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoneCriterion {
     /// The criterion's wording.
     pub item: String,
     /// Whether some agent reported the criterion met. **Never** treated as
-    /// verification by Director — see Phase 0 finding R6.
+    /// verification by Orqyn — see Phase 0 finding R6.
     #[serde(default)]
     pub checked: bool,
 }
 
-/// Scheduling/estimate block. Director deliberately never writes
+/// Scheduling/estimate block. Orqyn deliberately never writes
 /// `estimate_hours` — see [`crate::handoff`] docs — but must read it back.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Schedule {

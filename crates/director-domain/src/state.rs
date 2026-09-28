@@ -1,6 +1,6 @@
 //! Observed state of the project on disk and in git (Phase 6).
 //!
-//! Everything here is **observed, never remembered**. Director does not trust
+//! Everything here is **observed, never remembered**. Orqyn does not trust
 //! memory for this: [`ProjectState`] is rebuilt from git and the filesystem
 //! every time it needs to know "what is actually true now". Comparing a
 //! checkpoint's recorded state against a fresh observation is what produces
@@ -41,7 +41,7 @@ pub struct CommitInfo {
     pub committer: String,
     /// The full commit message, including body. The summary is its first line.
     ///
-    /// A commit message is **evidence, not verified truth**: Director records it,
+    /// A commit message is **evidence, not verified truth**: Orqyn records it,
     /// but no task is ever completed because a message says "done".
     #[serde(default)]
     pub message: String,
@@ -90,7 +90,7 @@ impl FileChange {
     }
 }
 
-/// Outcome of a test run Director observed (not an agent's claim).
+/// Outcome of a test run Orqyn observed (not an agent's claim).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestResults {
     /// Tests that succeeded.
@@ -117,7 +117,7 @@ pub struct ProjectState {
     pub working_tree: Vec<ChangedFile>,
     /// Most recent commits, newest first, bounded.
     pub recent_commits: Vec<CommitInfo>,
-    /// Last test results Director observed itself, if any.
+    /// Last test results Orqyn observed itself, if any.
     pub test_results: Option<TestResults>,
     /// Machine the observation was made on.
     pub observed_on: MachineId,
@@ -141,7 +141,7 @@ impl ProjectState {
 ///
 /// Produced by [`crate::checkpoint::Checkpoint::compare_with`]. This is the
 /// decision that protects resume: if the world moved on, the checkpoint is
-/// stale and Director must say so rather than hand a new agent outdated facts.
+/// stale and Orqyn must say so rather than hand a new agent outdated facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StateComparison {
@@ -166,7 +166,7 @@ impl StateComparison {
         matches!(self, StateComparison::Unchanged)
     }
 
-    /// True if Director must re-derive task state before resuming.
+    /// True if Orqyn must re-derive task state before resuming.
     pub fn requires_reconciliation(self) -> bool {
         !self.checkpoint_is_current()
     }

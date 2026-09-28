@@ -2,7 +2,7 @@
 //!
 //! This is a separate entity rather than a field on [crate::task::Task] for
 //! the reason stated throughout the model: the task outlives the agent. Every
-//! reassignment is a new row with its own history, so Director can always say
+//! reassignment is a new row with its own history, so Orqyn can always say
 //! who worked on `AUTH-42`, when, and why they stopped.
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use crate::ids::{AgentId, AssignmentId, SessionId, TaskId};
 pub enum ReleaseReason {
     /// Agent reported completion and the task went to verification.
     WorkComplete,
-    /// Director reassigned the task, e.g. after a replan.
+    /// Orqyn reassigned the task, e.g. after a replan.
     Reassigned,
     /// The agent's session vanished and recovery moved the work elsewhere.
     AgentCrashed,
@@ -32,7 +32,7 @@ pub enum ReleaseReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssignmentStatus {
-    /// Director chose the agent; the agent has not acknowledged.
+    /// Orqyn chose the agent; the agent has not acknowledged.
     Proposed,
     /// The agent accepted and holds the task.
     Active,

@@ -1,14 +1,14 @@
-//! [`AiMemoryAdapter`] — Director's long-term memory over a live ai-memory.
+//! [`AiMemoryAdapter`] — Orqyn's long-term memory over a live ai-memory.
 //!
 //! Three layers, mirroring the handoff adapter's shape so the two substrates
 //! read as one pattern:
 //!
-//! - [`wire`] — hand-written mirrors of the JSON replies Director parses,
+//! - [`wire`] — hand-written mirrors of the JSON replies Orqyn parses,
 //!   verified against a running server.
 //! - [`transport`] — a thin wrapper over the shared stdio transport, owning the
 //!   spawn shape and the data directory.
 //! - [`adapter`] — the [`MemoryProvider`] implementation, and the mapping
-//!   between ai-memory's page model and Director's [`Memory`].
+//!   between ai-memory's page model and Orqyn's [`Memory`].
 //!
 //! See [`adapter`]'s docs for the four substrate-specific decisions that live
 //! there, and `docs/PHASE3-MEMORY.md` for how they were verified.

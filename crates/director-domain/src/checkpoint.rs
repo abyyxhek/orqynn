@@ -8,7 +8,7 @@
 //!
 //! Neither substrate has anything like this. ai-memory's `Handoff` row is a
 //! session-scoped summary produced on `SessionEnd`; handoff-mcp has no
-//! checkpoint concept at all. This is Director's own.
+//! checkpoint concept at all. This is Orqyn's own.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +17,7 @@ use crate::state::{StateComparison, TestResults};
 
 /// Bumped whenever the checkpoint shape changes in a way a reader must handle.
 ///
-/// A checkpoint written by an older Director is not necessarily wrong, but a
+/// A checkpoint written by an older Orqyn is not necessarily wrong, but a
 /// reader that disagrees on the version must treat the checkpoint as
 /// *advisory* rather than authoritative — it cannot assume fields it does not
 /// know about are absent for a good reason.
@@ -239,11 +239,11 @@ pub struct ContinuationPackage {
     pub blockers: Vec<crate::ids::BlockerId>,
     /// The concrete first step for the receiving agent.
     pub next_action: String,
-    /// Director's verdict on whether resumption can proceed.
+    /// Orqyn's verdict on whether resumption can proceed.
     pub resume_status: ResumeStatus,
 }
 
-/// Director's verdict on whether a task can be resumed as-is (Phase 12).
+/// Orqyn's verdict on whether a task can be resumed as-is (Phase 12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResumeStatus {
@@ -256,7 +256,7 @@ pub enum ResumeStatus {
     Conflicted,
     /// A blocker stands in the way.
     Blocked,
-    /// Director does not have enough information to resume safely — no
+    /// Orqyn does not have enough information to resume safely — no
     /// checkpoint, no agent, or missing project state.
     Insufficient,
 }

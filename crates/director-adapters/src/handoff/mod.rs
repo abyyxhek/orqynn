@@ -5,29 +5,29 @@
 //!
 //! - [`wire`] — serde mirrors of handoff-mcp's JSON shapes. Deliberately *not*
 //!   the domain types and unable to become them, so every schema difference
-//!   between the substrate and Director's model is visible in one place.
-//! - [`transport`] — a stdio JSON-RPC client. Director talks to handoff-mcp
+//!   between the substrate and Orqyn's model is visible in one place.
+//! - [`transport`] — a stdio JSON-RPC client. Orqyn talks to handoff-mcp
 //!   exactly the way a harness would: it spawns the server as a child process
-//!   and speaks line-delimited JSON-RPC 2.0 over stdin/stdout. Director never
+//!   and speaks line-delimited JSON-RPC 2.0 over stdin/stdout. Orqyn never
 //!   links the substrate's code; it crosses a process boundary.
 //! - [`mapping`] — the bidirectional translation between the two models.
 //! - [`adapter`] — the struct that makes the provider traits real by composing
 //!   the three above, and holds the state none of them can: which tasks
-//!   Director itself completed.
+//!   Orqyn itself completed.
 //!
 //! ## The mapping is not boilerplate
 //!
 //! The two models are **not isomorphic**, and pretending otherwise would
 //! silently corrupt state. Three vocabularies do not line up:
 //!
-//! 1. **Task status.** The substrate has 6 states; Director has 8. Director-only
+//! 1. **Task status.** The substrate has 6 states; Orqyn has 8. Orqyn-only
 //!    states ride in `TaskData.extra` (a `#[serde(flatten)]` map the substrate
 //!    preserves) and fall back to the nearest honest substrate state on write.
-//! 2. **Priority.** The substrate has `low`/`medium`/`high`; Director adds
+//! 2. **Priority.** The substrate has `low`/`medium`/`high`; Orqyn adds
 //!    `Critical`, which maps down to `high` and is recovered from `extra`.
 //! 3. **The important one.** handoff-mcp's `done` is an agent self-report —
 //!    Phase 0 finding R6: `handoff_check_criterion` is a checkbox an agent
-//!    ticks. So a substrate `done` does **not** become Director `Done`. It
+//!    ticks. So a substrate `done` does **not** become Orqyn `Done`. It
 //!    becomes [`VerificationPending`](director_domain::task::TaskStatus::VerificationPending),
 //!    because nothing has been verified.
 //!
@@ -46,14 +46,14 @@
 //! the child's environment at spawn time* rather than passing it per call.
 //!
 //! The consequence is a real constraint, not a limitation of this code: **one
-//! adapter instance speaks as one agent**. A Director process multiplexing
+//! adapter instance speaks as one agent**. A Orqyn process multiplexing
 //! several agents needs one child process per agent identity. The pool that
 //! manages that is Phase 8.
 //!
 //! ## What is not here
 //!
 //! The `HandoffAdapter` implements `TaskProvider`, `AgentProvider`, and
-//! `SessionProvider` only. `HandoffProvider` (Director's claim-once transfer is
+//! `SessionProvider` only. `HandoffProvider` (Orqyn's claim-once transfer is
 //! not the substrate's session-scoped handoff notes), `MemoryProvider` (that is
 //! the ai-memory adapter, Phase 3), `ProjectStateProvider` (git observation,
 //! the [`crate::git`] module), and `ExecutionProvider` are all deliberately

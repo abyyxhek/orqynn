@@ -1,9 +1,9 @@
 # Phase 3 — The ai-memory Adapter: Long-Term Memory Made Real
 
-> Director Brain · Phase 3 deliverable
+> Orqyn · Phase 3 deliverable
 > Date: 2026-09-27
 > Scope: `director-adapters` only. One new substrate adapter, plus one change to
-> a `director-domain` type. No loop, no persistence of Director-owned entities.
+> a `director-domain` type. No loop, no persistence of Orqyn-owned entities.
 
 ## Goal
 
@@ -14,7 +14,7 @@ handoff-mcp. The memory half was still the in-memory fake: `MemoryProvider` had
 one implementor, which proved the trait was usable and nothing else. Phase 3
 wires it to the substrate that actually owns the problem — ai-memory, whose
 FTS5 + entity + graph retrieval with decay is already solved well, and which
-the Phase 1 trait doc identifies as the one place Director deliberately
+the Phase 1 trait doc identifies as the one place Orqyn deliberately
 *reuses* a substrate rather than reimplements one.
 
 Three modules in `crates/director-adapters/src/aimemory/`, mirroring the
@@ -30,17 +30,17 @@ handoff adapter's shape so the two substrates read as one pattern:
 
 ## Four places the models do not line up
 
-ai-memory's model is a wiki of markdown pages; Director's is a flat record with
+ai-memory's model is a wiki of markdown pages; Orqyn's is a flat record with
 an id, a title, a body, a kind, tags, a score, and a change time. Four
 differences are load-bearing, and each is handled explicitly rather than
 coerced.
 
-### 1. Scoping: Director is a static MCP client
+### 1. Scoping: Orqyn is a static MCP client
 
 ai-memory routes project scope from explicit `workspace` + `project` arguments,
 a `.ai-memory.toml` marker in the caller's working directory, or an
 active-project pointer keyed by *session* identity. The third is unavailable to
-Director: it spawns a child and speaks JSON-RPC, and no lifecycle-hook session
+Orqyn: it spawns a child and speaks JSON-RPC, and no lifecycle-hook session
 id is bridged onto those requests.
 
 So the adapter sends `workspace` and `project` on **every** call. This is not
@@ -81,7 +81,7 @@ stamp is present it is genuinely absent rather than imputable.
 ### 3. Bodies are fetched, not snippeted
 
 Search hits carry only an FTS5 snippet: a fragment around the matched terms,
-marked up with `<mark>` tags. Director's `Memory::body` is documented as
+marked up with `<mark>` tags. Orqyn's `Memory::body` is documented as
 markdown, and a `<mark>`-tagged fragment is not markdown — it is not even the
 page.
 
@@ -126,21 +126,21 @@ behavior explicitly.
 **`MemoryQuery::tags` is ignored, not honored.** ai-memory's query has no tag
 filter argument — only `workspace`/`project`/`scopes`. The trait documents tags
 as a best-effort restriction, so silence is the sanctioned behavior; erroring
-would make a query Director can otherwise serve unusable.
+would make a query Orqyn can otherwise serve unusable.
 
-**`kind` round-trips only when it names a tier.** Director's `kind` is coarse;
+**`kind` round-trips only when it names a tier.** Orqyn's `kind` is coarse;
 ai-memory's `tier` is a retention class. The substrate stamps the tier into a
 page's frontmatter on write, so a `kind` that is one of
-`working`/`episodic`/`semantic`/`procedural` is the `kind` Director reads back.
+`working`/`episodic`/`semantic`/`procedural` is the `kind` Orqyn reads back.
 
 A kind that is *not* a tier — `decision`, say — cannot be stored: the substrate
 rejects an unknown tier, and inventing a retention class for a kind that is not
 one would misfile the page. So such a kind is dropped on write, and the tier
 reported on read is then the substrate's default. The read-back returns what
 the substrate actually stored, so the loss is visible to the caller rather than
-hidden by echoing back what Director was asked to save. A rewrite that omits a
+hidden by echoing back what Orqyn was asked to save. A rewrite that omits a
 tier resets it to the default — live-verified — which is a further reason
-`save_memory` forwards the tier whenever Director has one rather than relying
+`save_memory` forwards the tier whenever Orqyn has one rather than relying
 on a previous write's.
 
 ## One change outside the adapter
@@ -254,16 +254,16 @@ fail-closed read of a project that was never written.
 ## What Phase 3 deliberately does not do
 
 - **No other provider trait.** `AiMemoryAdapter` implements `MemoryProvider`
-  only. ai-memory's handoff rows are session-scoped notes, not Director's
+  only. ai-memory's handoff rows are session-scoped notes, not Orqyn's
   claim-once transfer; its session records are the handoff adapter's half of the
   boundary; observing git is the `git` module; running commands is
   `LocalExecutor`.
 - **No project registry wiring.** The workspace and project names are
-  configuration. Which ai-memory workspace and project correspond to a Director
-  `Project` is a mapping Phase 5 owns, when Director persists its own entities.
+  configuration. Which ai-memory workspace and project correspond to a Orqyn
+  `Project` is a mapping Phase 5 owns, when Orqyn persists its own entities.
 - **No consolidation or decay tuning.** The substrate's compaction, lint, and
-  auto-improvement loops are its to run. Director reads and writes pages; it
+  auto-improvement loops are its to run. Orqyn reads and writes pages; it
   does not manage the wiki.
 - **No multi-project search.** `scopes` and `global=true` are deliberately not
-  used. Director's reads are pinned to one project by design (see §1), and a
+  used. Orqyn's reads are pinned to one project by design (see §1), and a
   cross-project query is a different feature with different failure modes.

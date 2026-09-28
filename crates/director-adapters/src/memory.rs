@@ -146,7 +146,7 @@ impl TaskProvider for InMemoryProvider {
 
     async fn ready_tasks(&self) -> Result<Vec<Task>, Self::Error> {
         // Pure function over current statuses, mirroring Task::is_ready_given:
-        // Director never trusts a stored "ready" flag.
+        // Orqyn never trusts a stored "ready" flag.
         let guard = self.state.lock().expect("state poisoned");
         let statuses: HashMap<TaskId, TaskStatus> = guard
             .tasks
@@ -370,7 +370,7 @@ impl MemoryProvider for InMemoryProvider {
             .filter(|m| {
                 // Deliberately naive lexical match: this stands in for
                 // ai-memory's FTS5+vector RRF. Real retrieval is a substrate
-                // responsibility, not Director's.
+                // responsibility, not Orqyn's.
                 let body = m.body.to_lowercase();
                 let title = m.title.to_lowercase();
                 needle

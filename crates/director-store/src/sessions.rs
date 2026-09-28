@@ -143,7 +143,7 @@ pub(crate) fn insert_session(conn: &PooledConn, session: &AgentSession) -> Resul
                 .as_ref()
                 .map(ProjectId::as_str)
                 .ok_or_else(|| StoreError::ConstraintViolation(format!(
-                    "session {} has no project; Director's store requires one",
+                    "session {} has no project; Orqyn's store requires one",
                     session.id
                 )))?,
             session.agent_id.as_str(),

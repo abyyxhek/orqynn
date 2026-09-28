@@ -3,13 +3,13 @@
 //! ## Why each reliability setting exists
 //!
 //! SQLite's defaults are chosen for a single-process, single-connection,
-//! serverless embedded case. Director is a long-running multi-task process with
+//! serverless embedded case. Orqyn is a long-running multi-task process with
 //! several repositories hitting one database, so three defaults are wrong and
 //! each setting below corrects one specific thing rather than being cargo-culted:
 //!
 //! - **`journal_mode = WAL`.** In the default rollback-journal mode a writer
 //!   takes an exclusive lock that blocks every reader for the whole write. WAL
-//!   lets readers proceed while a write commits, which matters because Director
+//!   lets readers proceed while a write commits, which matters because Orqyn
 //!   observes, plans, and assigns concurrently rather than serializing the
 //!   whole loop per write. WAL is a persistent property of the *file*, not the
 //!   connection, so setting it once is enough — but setting it again is free.
@@ -21,7 +21,7 @@
 //!   here rather than in a migration.
 //! - **`synchronous = NORMAL`.** With WAL, `NORMAL` does not fsync on every
 //!   commit — only on checkpoint. That is a real durability trade, made
-//!   deliberately: Director's acceptance property is surviving a *process*
+//!   deliberately: Orqyn's acceptance property is surviving a *process*
 //!   restart, not a power pull that takes the whole machine with unflushed
 //!   kernel buffers. The throughput win on every write is worth that line, and
 //!   it is the setting SQLite's own documentation recommends alongside WAL.
@@ -36,7 +36,7 @@
 //! cannot sit behind a plain `&self` while several tasks call in; the pool
 //! hands out a connection for the duration of one operation and takes it back.
 //! A connection is held across one repository call and never across an await
-//! point, so the pool is sized for the concurrency Director actually does.
+//! point, so the pool is sized for the concurrency Orqyn actually does.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -195,7 +195,7 @@ pub(crate) fn set_pragmas(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Translate a rusqlite error into Director's vocabulary, so no caller ever has
+/// Translate a rusqlite error into Orqyn's vocabulary, so no caller ever has
 /// to know it is talking to SQLite.
 pub(crate) fn translate_error(err: rusqlite::Error) -> StoreError {
     use rusqlite::Error as E;

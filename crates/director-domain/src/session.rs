@@ -2,7 +2,7 @@
 //!
 //! A session is the *evidence trail*, not the work. When a session dies, its
 //! observations and the checkpoint it produced are what let the next session
-//! continue. Director keeps sessions clearly distinct from tasks: a task may
+//! continue. Orqyn keeps sessions clearly distinct from tasks: a task may
 //! accumulate many sessions as it passes between agents.
 
 use serde::{Deserialize, Serialize};
@@ -18,12 +18,12 @@ pub enum SessionEnd {
     /// with `session_status: "closed"`; for ai-memory, a true `SessionEnd`
     /// lifecycle hook.
     Clean,
-    /// Director noticed the heartbeat stop before a clean close.
+    /// Orqyn noticed the heartbeat stop before a clean close.
     Vanished,
-    /// Director or an operator terminated it.
+    /// Orqyn or an operator terminated it.
     Terminated,
     /// The context window filled and the session compacted or was rotated
-    /// (Phase 17). Not a failure: Director checkpoints through this.
+    /// (Phase 17). Not a failure: Orqyn checkpoints through this.
     ContextExhausted,
     /// The session forked from another; both continue.
     Forked,
@@ -58,9 +58,9 @@ impl SessionStatus {
 pub struct AgentSession {
     /// This session's identifier.
     pub id: SessionId,
-    /// The project this session worked in, once Director has scoped it. `None`
-    /// for a session imported from a substrate that carries no Director
-    /// project; Director's own store requires one at write time and rejects the
+    /// The project this session worked in, once Orqyn has scoped it. `None`
+    /// for a session imported from a substrate that carries no Orqyn
+    /// project; Orqyn's own store requires one at write time and rejects the
     /// alternative rather than inventing a project.
     #[serde(default)]
     pub project_id: Option<ProjectId>,
@@ -77,10 +77,10 @@ pub struct AgentSession {
     /// If this session was forked from another, its parent. Mirrors
     /// handoff-mcp's `parent_session_id` lineage.
     pub parent_session_id: Option<SessionId>,
-    /// The branch the session had checked out, when Director knew it.
+    /// The branch the session had checked out, when Orqyn knew it.
     #[serde(default)]
     pub branch: Option<String>,
-    /// The commit `HEAD` pointed at during the session, when Director knew it.
+    /// The commit `HEAD` pointed at during the session, when Orqyn knew it.
     #[serde(default)]
     pub commit_sha: Option<String>,
     /// When the session began.
@@ -89,10 +89,10 @@ pub struct AgentSession {
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// How it ended, if it has.
     pub end: Option<SessionEnd>,
-    /// Working directory the session ran in, so Director can tell a primary
+    /// Working directory the session ran in, so Orqyn can tell a primary
     /// checkout from a worktree.
     pub workdir: Option<String>,
-    /// When Director last heard from the session.
+    /// When Orqyn last heard from the session.
     #[serde(default)]
     pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
     /// Monotonic version for optimistic concurrency — see
@@ -111,7 +111,7 @@ impl AgentSession {
     /// Start a new live session.
     ///
     /// `project_id` is optional at this layer because a session mapped out of a
-    /// substrate carries no Director project; Director's own store requires one
+    /// substrate carries no Orqyn project; Orqyn's own store requires one
     /// at write time. Callers that know the project pass `Some`.
     pub fn start(
         id: SessionId,

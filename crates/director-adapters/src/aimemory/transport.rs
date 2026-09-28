@@ -10,7 +10,7 @@
 //!
 //! The one thing this module owns is therefore the **spawn shape**: which
 //! subcommand runs the MCP server, and which data directory it keeps its wiki
-//! and index in. The data dir matters more than it looks — Director points it
+//! and index in. The data dir matters more than it looks — Orqyn points it
 //! at a scratch directory in tests and a dedicated one in production, so the
 //! adapter's pages never collide with the operator's real memory.
 //!
@@ -18,7 +18,7 @@
 //!
 //! ai-memory routes project scope from, in order: explicit `workspace` +
 //! `project` arguments, the caller's working directory marker file, or an
-//! active-project pointer keyed by *session* identity. Director is a static
+//! active-project pointer keyed by *session* identity. Orqyn is a static
 //! MCP client — it spawns a child and speaks JSON-RPC, and there is no
 //! lifecycle-hook session id bridged onto those requests — so only the first
 //! of those is available to it. The adapter therefore sends `workspace` and
@@ -80,7 +80,7 @@ impl MemoryTransport {
     ///
     /// Returns the tool's textual content on success. When the tool reports
     /// `isError`, this is [`Err(TransportError::ToolFailed)`] — the one place a
-    /// substrate failure becomes a Director error.
+    /// substrate failure becomes a Orqyn error.
     pub async fn call_tool(
         &mut self,
         name: &str,

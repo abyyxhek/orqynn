@@ -1,4 +1,4 @@
-//! The [Task] — Director's central unit of work.
+//! The [Task] — Orqyn's central unit of work.
 //!
 //! ## The fundamental invariant
 //!
@@ -14,7 +14,7 @@
 //!
 //! Compare this with handoff-mcp's `TaskData`, which carries `assignee` and a
 //! `lock` on the record itself — fine for a single-project substrate, wrong
-//! for Director, where the assignment *history* is part of the value.
+//! for Orqyn, where the assignment *history* is part of the value.
 
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +62,7 @@ impl std::fmt::Display for Priority {
 
 /// Rough complexity, used for load balancing and estimate-based scheduling.
 ///
-/// Director deliberately does not emit hour estimates at plan time: plans are
+/// Orqyn deliberately does not emit hour estimates at plan time: plans are
 /// grounded in observed state, and an invented "this will take 4 hours" is a
 /// fact the planner cannot actually check. `Complexity` is a coarse ordinal
 /// that a planner can justify from the task's surface area.
@@ -97,14 +97,14 @@ impl Complexity {
 
 /// Lifecycle state of a task.
 ///
-/// Transitions are driven by Director, not by the agent working on it. In
+/// Transitions are driven by Orqyn, not by the agent working on it. In
 /// particular, an agent reporting "done" moves a task to
 /// [`TaskStatus::VerificationPending`], **never** to [`TaskStatus::Done`] —
 /// only the verification engine (Phase 10) can do that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
-    /// Known to Director, not yet planned into an active plan.
+    /// Known to Orqyn, not yet planned into an active plan.
     Backlog,
     /// In an active plan, waiting for a dependency or an agent.
     Todo,
@@ -175,8 +175,8 @@ pub struct ExpectedOutput {
 pub struct Task {
     /// Stable, agent-independent identifier.
     pub id: TaskId,
-    /// The project this task belongs to. `None` for a task Director has seen in
-    /// a substrate but not yet claimed for a project; Director's own store
+    /// The project this task belongs to. `None` for a task Orqyn has seen in
+    /// a substrate but not yet claimed for a project; Orqyn's own store
     /// requires one at write time and rejects the alternative rather than
     /// inventing a project.
     #[serde(default)]
@@ -201,7 +201,7 @@ pub struct Task {
     /// Tasks that must reach a terminal state before this one starts.
     pub dependencies: Vec<TaskId>,
     /// What this task may touch, used for deterministic conflict detection
-    /// (Phase 13). Advisory for the agent, authoritative for Director.
+    /// (Phase 13). Advisory for the agent, authoritative for Orqyn.
     pub scope_paths: Vec<String>,
     /// Capabilities an agent must declare to be assigned this task.
     pub required_capabilities: Vec<Capability>,
@@ -213,7 +213,7 @@ pub struct Task {
     /// write *n+1*.
     #[serde(default = "default_state_version")]
     pub state_version: u64,
-    /// When Director first recorded the task.
+    /// When Orqyn first recorded the task.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// When the task last changed.
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -268,7 +268,7 @@ impl Task {
     /// Whether every dependency has completed successfully.
     ///
     /// Used by the scheduler. This is deliberately a pure function over the
-    /// statuses passed in: Director never trusts a stored "ready" flag.
+    /// statuses passed in: Orqyn never trusts a stored "ready" flag.
     ///
     /// A dependency only satisfies this when it is [`TaskStatus::Done`] — a
     /// `Failed` or `Cancelled` dependency does **not** unblock the task. That
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn an_unknown_dependency_blocks_readiness() {
-        // A dependency Director has no status for is treated as unresolved:
+        // A dependency Orqyn has no status for is treated as unresolved:
         // better to wait than to start work on an unverified premise.
         let mut t = Task::new(TaskId::from_string("AUTH-42"), "Auth", "Build login");
         t.dependencies = vec![TaskId::from_string("MISSING-1")];

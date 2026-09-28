@@ -1,4 +1,4 @@
-//! [`AiMemoryAdapter`] — Director's [`MemoryProvider`] over a live ai-memory.
+//! [`AiMemoryAdapter`] — Orqyn's [`MemoryProvider`] over a live ai-memory.
 //!
 //! This is Phase 3: the struct that makes long-term memory real by composing
 //! the two layers underneath it — [`transport`] to reach the substrate, and
@@ -7,10 +7,10 @@
 //! ## What the adapter adds on top of the two layers
 //!
 //! The wire mirror is stateless and the transport is a pipe; the mapping
-//! between ai-memory's model and Director's is what lives here. Four things,
+//! between ai-memory's model and Orqyn's is what lives here. Four things,
 //! each a consequence of a real difference between the two models:
 //!
-//! 1. **Scoping.** Director is a static MCP client — no lifecycle-hook session
+//! 1. **Scoping.** Orqyn is a static MCP client — no lifecycle-hook session
 //!    id is bridged onto its requests — so the substrate's session-based scope
 //!    routing is unavailable. The adapter sends `workspace` and `project` on
 //!    every call, which pins each read to exactly one project and never falls
@@ -103,7 +103,7 @@ pub enum AiMemoryAdapterError {
         /// The message the substrate returned.
         message: String,
     },
-    /// A reply could not be parsed into the shape Director expects — a sign a
+    /// A reply could not be parsed into the shape Orqyn expects — a sign a
     /// mirror in [`wire`] has drifted from the live server.
     #[error("could not parse ai-memory's reply to '{tool}': {message}")]
     Malformed {
@@ -141,7 +141,7 @@ impl AiMemoryWire for MemoryTransport {
     }
 }
 
-/// Director's adapter for the ai-memory substrate.
+/// Orqyn's adapter for the ai-memory substrate.
 ///
 /// Generic over the wire connection so tests can drive it with a fake; the
 /// default is the real stdio transport.
@@ -173,9 +173,9 @@ impl<T: AiMemoryWire> AiMemoryAdapter<T> {
     /// Call an ai-memory tool directly, bypassing the mapping.
     ///
     /// Not part of any provider trait and never will be: it exists so a live
-    /// integration test can reproduce substrate-level state Director itself
+    /// integration test can reproduce substrate-level state Orqyn itself
     /// would never make — a page written out of band, or a scope mismatch —
-    /// and then observe how the adapter responds. Director's own code goes
+    /// and then observe how the adapter responds. Orqyn's own code goes
     /// through the trait methods.
     pub async fn raw_call(
         &self,
@@ -190,7 +190,7 @@ impl<T: AiMemoryWire> AiMemoryAdapter<T> {
     ///
     /// Every project-scoped tool takes `workspace` and `project` *together*;
     /// sending one without the other is a scope error on this substrate, and
-    /// sending neither falls back to session routing Director cannot use.
+    /// sending neither falls back to session routing Orqyn cannot use.
     /// Injecting both uniformly is simpler than a per-tool rule and is the only
     /// scoping that is correct for a static client.
     async fn call(
@@ -260,7 +260,7 @@ impl<T: AiMemoryWire> AiMemoryAdapter<T> {
         }
     }
 
-    /// Turn a search hit into a Director memory, fetching its full page.
+    /// Turn a search hit into a Orqyn memory, fetching its full page.
     ///
     /// Hits carry only a snippet; the body and the tags are not on the wire
     /// until the page is read. A hit whose page vanished between the search and
@@ -277,25 +277,25 @@ impl<T: AiMemoryWire> AiMemoryAdapter<T> {
         Ok(Some(self.page_to_memory(page, rank)))
     }
 
-    /// Assemble a Director memory from a fully-read page plus the meaning of
+    /// Assemble a Orqyn memory from a fully-read page plus the meaning of
     /// the `rank` the hit that led to it carried.
     fn page_to_memory(&self, page: ReadPageReply, rank: RankMeaning) -> Memory {
         Memory {
             // The path is the page's only stable identity: the version id the
             // substrate reports changes on every edit, so it cannot be the id
-            // Director keeps.
+            // Orqyn keeps.
             id: page.path,
             title: page.title,
             body: page.body,
             // The substrate stamps the retention tier into frontmatter, so a
-            // kind that names a tier is the kind Director reads back. A kind
+            // kind that names a tier is the kind Orqyn reads back. A kind
             // that does not is dropped on write, and the tier reported here is
-            // then the substrate's default — not the kind Director was asked to
+            // then the substrate's default — not the kind Orqyn was asked to
             // store.
             kind: frontmatter_tier(&page.frontmatter),
             tags: frontmatter_tags(&page.frontmatter),
             score: match rank {
-                // Director's score is higher = more relevant; the substrate's
+                // Orqyn's score is higher = more relevant; the substrate's
                 // rank is lower = better. Negating preserves both the order and
                 // the relative distances, which a reciprocal would not.
                 RankMeaning::Relevance(rank) => Some(-rank),
@@ -360,7 +360,7 @@ impl AiMemoryAdapter<MemoryTransport> {
     /// Spawn the server and connect.
     ///
     /// Roots the substrate's wiki and index at `data_dir`, which keeps
-    /// Director's pages out of the operator's real memory. Performs no other
+    /// Orqyn's pages out of the operator's real memory. Performs no other
     /// I/O: the project is created by the first write, and reads of a project
     /// that does not exist fail closed (see [`Self::new`]).
     pub async fn connect(
@@ -394,13 +394,13 @@ impl<T: AiMemoryWire> MemoryProvider for AiMemoryAdapter<T> {
             "body": body,
             "tags": memory.tags,
         });
-        // Director's `kind` is coarse; the substrate's tier is a retention
+        // Orqyn's `kind` is coarse; the substrate's tier is a retention
         // class. Only a kind that names a real tier is forwarded: the substrate
         // rejects an unknown tier, and inventing a retention class for a kind
         // that is not one would misfile the page. A kind that is not a tier is
         // therefore dropped, and the page's tier is then whatever the substrate
         // defaulted to — which the read-back below reports honestly rather than
-        // echoing back what Director was asked to store.
+        // echoing back what Orqyn was asked to store.
         if let Some(tier) = memory
             .kind
             .as_deref()
@@ -426,7 +426,7 @@ impl<T: AiMemoryWire> MemoryProvider for AiMemoryAdapter<T> {
                 })?;
 
         // The write path reports no rank meaning of its own, so the record
-        // Director hands back claims neither a relevance score nor a change
+        // Orqyn hands back claims neither a relevance score nor a change
         // time.
         Ok(self.page_to_memory(page, RankMeaning::None))
     }
@@ -758,10 +758,10 @@ mod tests {
         unknown.kind = Some("decision".into());
         adapter.save_memory(unknown).await.expect("save");
 
-        // The read-back: a kind that named a tier is the kind Director sees
+        // The read-back: a kind that named a tier is the kind Orqyn sees
         // again, because the substrate stamps the tier into frontmatter. A kind
         // that did not is gone, and the tier reported is the substrate's
-        // default — not the kind Director was asked to store. Fetched before
+        // default — not the kind Orqyn was asked to store. Fetched before
         // the lock below so no await is held across it.
         let back = adapter.recent_memories(10).await.expect("recent");
         let a = back

@@ -58,7 +58,7 @@ impl director_domain::TaskRepository for SqliteTaskRepository {
         // rather than inventing a project to hang it on.
         let project_id = task.project_id.as_ref().ok_or_else(|| {
             StoreError::ConstraintViolation(format!(
-                "task {} has no project; Director's store requires one",
+                "task {} has no project; Orqyn's store requires one",
                 task.id
             ))
         })?;

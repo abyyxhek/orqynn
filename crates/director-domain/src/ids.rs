@@ -1,4 +1,4 @@
-//! Canonical identity types for Director Brain.
+//! Canonical identity types for Orqyn Brain.
 //!
 //! The single most important property of this module: **every identity is a
 //! distinct newtype**. A [`TaskId`] and an [`AgentId`] are never
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 /// Marker trait implemented by every identity newtype.
 ///
-/// Exists so that generic helpers can accept "any Director id" while still
+/// Exists so that generic helpers can accept "any Orqyn id" while still
 /// refusing a bare `String`.
 pub trait Id: Sealed {
     /// The human-readable prefix convention for this id kind (`TASK`, `AGENT`).
@@ -62,7 +62,7 @@ macro_rules! define_id {
 
         impl $name {
             /// Create a new id from any string. The caller is responsible for
-            /// the format; Director generates ids with the `new` function on
+            /// the format; Orqyn generates ids with the `new` function on
             /// [`IdGenerator`].
             pub fn from_string(value: impl Into<String>) -> Self {
                 Self(value.into())
@@ -195,7 +195,7 @@ define_id!(
 
 define_id!(
     /// Unique identifier for a [Repository](crate::repository::Repository) that
-    /// Director observes.
+    /// Orqyn observes.
     ///
     /// Example: `REPO-checkout`
     RepositoryId,
@@ -204,7 +204,7 @@ define_id!(
 
 define_id!(
     /// Unique identifier for an [ObservationEvent](crate::repository::ObservationEvent)
-    /// — one fact that Director learned by looking at git.
+    /// — one fact that Orqyn learned by looking at git.
     ///
     /// Example: `EVT-a1b2c3`
     EventId,
@@ -213,9 +213,9 @@ define_id!(
 
 /// Generates ids with a monotonic per-generator counter.
 ///
-/// Director never relies on an external id service: a new machine with no
+/// Orqyn never relies on an external id service: a new machine with no
 /// network must still be able to create tasks. The generated form is
-/// `<PREFIX>-<human-key>-<n>`, e.g. `TASK-auth-1`. Within a single Director
+/// `<PREFIX>-<human-key>-<n>`, e.g. `TASK-auth-1`. Within a single Orqyn
 /// process the counter is monotonic; across processes or machines the
 /// `<human-key>` disambiguates, and full global uniqueness is established by
 /// the store on persistence.

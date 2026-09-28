@@ -1,6 +1,6 @@
 [package]
 name = "director-domain"
-description = "Canonical domain model and provider trait boundary for Director Brain"
+description = "Canonical domain model and provider trait boundary for Orqyn"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "director-adapters"
-description = "Provider adapters for Director Brain: an in-memory substrate for tests and local execution"
+description = "Provider adapters for Orqyn: an in-memory substrate for tests and local execution"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,12 +1,12 @@
-//! Director Brain's own persistent store — the SQLite half of the boundary.
+//! Orqyn Brain's own persistent store — the SQLite half of the boundary.
 //!
 //! ## The two boundaries, and why this crate is neither of the others
 //!
-//! Director has two boundaries outwards and they are not similar:
+//! Orqyn has two boundaries outwards and they are not similar:
 //!
 //! - `director-adapters` talks to handoff-mcp and ai-memory **over MCP**. Those
-//!   servers own their schemas; Director asks and receives.
-//! - This crate talks to a `.db` file Director **owns**. Nobody else writes it,
+//!   servers own their schemas; Orqyn asks and receives.
+//! - This crate talks to a `.db` file Orqyn **owns**. Nobody else writes it,
 //!   nobody else's schema constrains it, and it is still readable when both
 //!   substrates are down.
 //!
@@ -20,7 +20,7 @@
 //!
 //! The migration files are the only place tables are created; the application
 //! never issues DDL at runtime (see [`migrations`]). The schema deliberately
-//! holds Director's own entities — checkpoints, assignments, normalized project
+//! holds Orqyn's own entities — checkpoints, assignments, normalized project
 //! state — and pointedly *not* a copy of either substrate's tables. Copying a
 //! provider's schema here is how a store starts being coupled to a substrate;
 //! [`director_domain::ProviderSync`] is a pointer and a status, never a replica.
@@ -41,7 +41,7 @@
 //! ```
 //!
 //! Opening brings the schema up to date on every connection: an old database is
-//! migrated forward, and a database written by a *newer* Director is refused
+//! migrated forward, and a database written by a *newer* Orqyn is refused
 //! rather than silently downgraded.
 
 // Phase 5 is building this crate's operations ahead of the callers that use
@@ -115,7 +115,7 @@ impl Store {
     }
 
     /// The schema version this build can bring a database to. Diagnostic — for
-    /// "is this Director older or newer than the database it is looking at".
+    /// "is this Orqyn older or newer than the database it is looking at".
     pub fn schema_version(&self) -> u32 {
         latest_version()
     }
@@ -167,13 +167,13 @@ impl Store {
         assignments::assign_task(&self.pool, task_id, agent_id, assignment_id, now).await
     }
 
-    /// Checkpoints: Director's own resumption documents. Superseded ones are
+    /// Checkpoints: Orqyn's own resumption documents. Superseded ones are
     /// retained.
     pub fn checkpoints(&self) -> SqliteCheckpointRepository {
         SqliteCheckpointRepository::new(self.pool.clone())
     }
 
-    /// Normalized project state — what Director currently believes about a
+    /// Normalized project state — what Orqyn currently believes about a
     /// project, as distinct from what git said just now.
     pub fn project_state(&self) -> SqliteProjectStateRepository {
         SqliteProjectStateRepository::new(self.pool.clone())

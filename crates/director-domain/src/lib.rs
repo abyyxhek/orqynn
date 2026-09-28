@@ -1,8 +1,8 @@
-//! Canonical domain model for Director Brain.
+//! Canonical domain model for Orqyn Brain.
 //!
 //! ## What this crate is
 //!
-//! The *vocabulary* of Director: every entity, identity, status enum, and
+//! The *vocabulary* of Orqyn: every entity, identity, status enum, and
 //! provider trait the rest of the system speaks. It has **no knowledge of any
 //! substrate**. It does not know about handoff-mcp's `TaskData`, ai-memory's
 //! wiki `Page`, SQLite, JSON files, MCP, or any harness. Adapters translate
@@ -34,13 +34,13 @@
 //!
 //! - [`ids`] — identity newtypes, one per entity kind.
 //! - [`project`] / [`task`] / [`agent`] / [`session`] — the nouns.
-//! - [`repository`] — a git working tree Director observes, and the
+//! - [`repository`] — a git working tree Orqyn observes, and the
 //!   deterministic change detection over its state.
 //! - [`assignment`] / [`capability`] — who does what, and on what basis.
 //! - [`plan`] / [`decision`] / [`blocker`] — planning artifacts.
 //! - [`checkpoint`] / [`context`] / [`action`] — continuity and evidence.
 //! - [`state`] — observed project state, never remembered.
-//! - [`handoff`] — Director's own claim-once task transfer.
+//! - [`handoff`] — Orqyn's own claim-once task transfer.
 //! - [`providers`] — the trait boundary every substrate adapter must implement.
 
 #![warn(missing_docs)]
@@ -97,7 +97,7 @@ pub use state::{
 };
 pub use task::{Complexity, ExpectedOutput, Priority, Subtask, Task, TaskStatus};
 
-// Director's own store boundary: the repository traits and their vocabulary.
+// Orqyn's own store boundary: the repository traits and their vocabulary.
 // Flat for the same reason as everything else — callers say `TaskRepository`,
 // not `store::TaskRepository`.
 pub use store::{
@@ -225,7 +225,7 @@ mod boundary_tests {
     }
 
     /// Every public entity round-trips through serde, because everything
-    /// Director persists crosses a serialization boundary sooner or later.
+    /// Orqyn persists crosses a serialization boundary sooner or later.
     #[test]
     fn every_entity_round_trips_through_serde() {
         let task = Task::new(TaskId::from_string("AUTH-42"), "Auth", "Build login");

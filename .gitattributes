@@ -1,0 +1,9 @@
+# Line endings are LF, everywhere. Without this, `core.autocrlf=true` rewrites
+# every file on commit, which makes diffs noisy and manufactures conflicts.
+* text=auto eol=lf
+
+# Binary by extension, so git never tries to merge them as text.
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary

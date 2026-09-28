@@ -170,7 +170,7 @@ fn sqlite_conv_failure(
     }
 }
 
-/// Register a repository record — the *link* Director keeps, distinct from the
+/// Register a repository record — the *link* Orqyn keeps, distinct from the
 /// git observer's own detailed record of the same repository.
 pub async fn register_repository(
     pool: &crate::connection::ConnectionPool,
@@ -196,7 +196,7 @@ pub async fn register_repository(
     Ok(())
 }
 
-/// Every repository Director knows about, as the lightweight link records the
+/// Every repository Orqyn knows about, as the lightweight link records the
 /// store keeps.
 pub async fn list_repositories(
     pool: &crate::connection::ConnectionPool,

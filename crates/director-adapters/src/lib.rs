@@ -1,9 +1,9 @@
-//! Adapters that turn Director's provider traits into something concrete.
+//! Adapters that turn Orqyn's provider traits into something concrete.
 //!
 //! ## What lives here
 //!
 //! - [`InMemoryProvider`] — a single struct implementing **every** provider
-//!   trait against in-process `HashMap`s. It is the reason Director's loop can
+//!   trait against in-process `HashMap`s. It is the reason Orqyn's loop can
 //!   be developed and tested with zero external processes.
 //! - [`LocalExecutor`] — a real [`ExecutionProvider`](director_domain::providers::ExecutionProvider)
 //!   that runs commands via `std::process`, used as the reference local
@@ -12,7 +12,7 @@
 //! ## What does *not* live here
 //!
 //! Nothing, any more. `HandoffAdapter` (Phase 2) and `AiMemoryAdapter` (Phase
-//! 3) are both here, and that is the point: Director's core was kept
+//! 3) are both here, and that is the point: Orqyn's core was kept
 //! independent of the substrates until both adapters existed, and this crate
 //! is the proof. Every other crate in the workspace still cannot name a
 //! substrate.
@@ -22,8 +22,8 @@
 //! The [`git`] module is the Phase 2 observation layer: a git2-backed
 //! observer, a file-backed store, and the service that composes them into
 //! project state. Like [`LocalExecutor`], it is concrete tool integration
-//! rather than substrate coupling — git is a tool Director reads, not a
-//! substrate Director talks to over MCP.
+//! rather than substrate coupling — git is a tool Orqyn reads, not a
+//! substrate Orqyn talks to over MCP.
 //!
 //! ## The coupling rule
 //!

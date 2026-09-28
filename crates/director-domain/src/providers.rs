@@ -2,12 +2,12 @@
 //!
 //! ## Why these traits exist
 //!
-//! Director's core depends **only** on these traits. Every substrate —
+//! Orqyn's core depends **only** on these traits. Every substrate —
 //! handoff-mcp over MCP, ai-memory over MCP, an in-memory fake for tests — is
 //! a struct that implements them. The consequence is the single most important
 //! structural property of the system:
 //!
-//! > Director's loop can be developed and tested with zero external processes,
+//! > Orqyn's loop can be developed and tested with zero external processes,
 //! > and a substrate can be swapped or upgraded without touching the loop.
 //!
 //! ## Rules every trait follows
@@ -15,24 +15,24 @@
 //! 1. **Methods are `async`**, because every real substrate is an I/O boundary
 //!    (an MCP round-trip, a file, a database). A synchronous trait would make
 //!    the loop lie about what it is doing.
-//! 2. **Inputs and outputs are Director's own types**, defined in this crate.
+//! 2. **Inputs and outputs are Orqyn's own types**, defined in this crate.
 //!    A trait that returned a substrate's struct would make the boundary
 //!    fictional. Adapters do the translation; the trait never leaks it.
 //! 3. **Each trait has an associated [`Error`](Provider::Error)**, so a
-//!    substrate's failure vocabulary cannot become Director's.
-//! 4. **Identity arguments are always Director ids**, never substrate ids.
+//!    substrate's failure vocabulary cannot become Orqyn's.
+//! 4. **Identity arguments are always Orqyn ids**, never substrate ids.
 //!    Adapters hold the identity translation.
 //! 5. **Nothing here completes a task.** No trait has a "mark done" method that
-//!    an agent's report can reach. Verification is a Director-owned engine
+//!    an agent's report can reach. Verification is a Orqyn-owned engine
 //!    (Phase 10), not a provider capability.
 //!
 //! ## What is *not* here
 //!
 //! Deliberately absent: checkpoint, plan, decision, blocker, verification, and
-//! assignment storage. Those are Director-owned entities that live in
-//! Director's own store (Phase 5). No substrate has them, and exposing them as
+//! assignment storage. Those are Orqyn-owned entities that live in
+//! Orqyn's own store (Phase 5). No substrate has them, and exposing them as
 //! provider traits would invite a substrate to become authoritative over
-//! Director's own state.
+//! Orqyn's own state.
 
 use std::path::Path;
 
@@ -53,10 +53,10 @@ pub trait Provider: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 }
 
-/// A durable piece of project knowledge, as Director sees it.
+/// A durable piece of project knowledge, as Orqyn sees it.
 ///
 /// This is the boundary view of a memory record — in ai-memory terms, a wiki
-/// page; in handoff-mcp terms, a `MemoryEntry`. Director never sees either
+/// page; in handoff-mcp terms, a `MemoryEntry`. Orqyn never sees either
 /// struct; it sees this. Kept in this module because it exists to be returned
 /// by [`MemoryProvider`].
 ///
@@ -64,7 +64,7 @@ pub trait Provider: Send + Sync {
 /// well defined. Comparisons are for test assertions only.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Memory {
-    /// Stable id in the substrate's own namespace, opaque to Director.
+    /// Stable id in the substrate's own namespace, opaque to Orqyn.
     pub id: String,
     /// Short human-facing label.
     pub title: String,
@@ -142,7 +142,7 @@ impl CommandOutcome {
 /// Task storage and dependency handling.
 ///
 /// Maps onto handoff-mcp's task CRUD + `dependencies` + `bulk_update_tasks`.
-/// Director is the only writer through this trait in normal operation, which
+/// Orqyn is the only writer through this trait in normal operation, which
 /// keeps the substrate's file-lock model coherent.
 #[async_trait]
 pub trait TaskProvider: Provider {
@@ -150,7 +150,7 @@ pub trait TaskProvider: Provider {
     /// callers see any normalization the substrate applied.
     async fn create_task(&self, task: Task) -> Result<Task, Self::Error>;
 
-    /// Fetch a task by Director id. `None` means the substrate has no such task.
+    /// Fetch a task by Orqyn id. `None` means the substrate has no such task.
     async fn get_task(&self, id: &TaskId) -> Result<Option<Task>, Self::Error>;
 
     /// Every task the substrate knows about.
@@ -159,7 +159,7 @@ pub trait TaskProvider: Provider {
     /// Persist an updated task.
     async fn update_task(&self, task: Task) -> Result<Task, Self::Error>;
 
-    /// Set a task's status. Note that this is a Director-side *recording* of a
+    /// Set a task's status. Note that this is a Orqyn-side *recording* of a
     /// decision already made — it is not reachable from an agent's report.
     async fn set_task_status(&self, id: &TaskId, status: TaskStatus) -> Result<(), Self::Error>;
 
@@ -221,11 +221,11 @@ pub trait SessionProvider: Provider {
     ) -> Result<AgentSession, Self::Error>;
 }
 
-/// Director's own claim-once task transfer.
+/// Orqyn's own claim-once task transfer.
 ///
 /// Not to be confused with ai-memory's `Handoff` row or handoff-mcp's
 /// `handoff_notes` — see [`crate::handoff`]. The adapter may store this in
-/// Director's own store or model it on a substrate feature; the trait is what
+/// Orqyn's own store or model it on a substrate feature; the trait is what
 /// the core sees either way.
 #[async_trait]
 pub trait HandoffProvider: Provider {
@@ -251,7 +251,7 @@ pub trait HandoffProvider: Provider {
 /// Long-term project knowledge and retrieval.
 ///
 /// Maps onto ai-memory's `memory_query` / `memory_recent` / wiki pages. This is
-/// the one place Director deliberately *reuses* a substrate rather than
+/// the one place Orqyn deliberately *reuses* a substrate rather than
 /// reimplements: retrieval with FTS5, vectors, and decay is already solved
 /// well, and rewriting it would be pure loss.
 #[async_trait]
@@ -286,11 +286,11 @@ pub trait ProjectStateProvider: Provider {
 
 /// Running real commands against the project.
 ///
-/// This is what makes Director's verification independent of agent
+/// This is what makes Orqyn's verification independent of agent
 /// self-report: the verification engine runs `cargo test` through this trait
 /// and reads the exit code itself. A substrate that cannot execute commands
 /// returns [`UnsupportedCommand`](ProviderError::UnsupportedCommand) and
-/// Director falls back to a local executor — but it never falls back to
+/// Orqyn falls back to a local executor — but it never falls back to
 /// trusting the agent.
 #[async_trait]
 pub trait ExecutionProvider: Provider {

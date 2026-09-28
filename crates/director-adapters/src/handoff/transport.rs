@@ -12,7 +12,7 @@
 //! set, `load_context` reports that exact string back as `agent_id`.
 //!
 //! The consequence is a real constraint, not a limitation of this code: **one
-//! adapter instance speaks as one agent**. A Director process multiplexing
+//! adapter instance speaks as one agent**. A Orqyn process multiplexing
 //! several agents needs one child process per agent identity. The pool that
 //! manages that is Phase 8.
 //!
@@ -94,7 +94,7 @@ impl McpTransport {
     ///
     /// Returns the tool's textual content on success. When the tool reports
     /// `isError`, this is [`Err(crate::stdio_mcp::TransportError::ToolFailed)`] — the one place a
-    /// substrate failure becomes a Director error.
+    /// substrate failure becomes a Orqyn error.
     pub async fn call_tool(
         &mut self,
         name: &str,

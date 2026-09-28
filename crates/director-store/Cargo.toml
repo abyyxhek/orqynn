@@ -1,6 +1,6 @@
 [package]
 name = "director-store"
-description = "Director Brain's own persistent store: SQLite-backed repositories for Director-owned state"
+description = "Orqyn's own persistent store: SQLite-backed repositories for Orqyn-owned state"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,8 +1,8 @@
-//! Boundary test: Director's core must not know its substrates exist.
+//! Boundary test: Orqyn's core must not know its substrates exist.
 //!
 //! This is the enforcement of the integration rule from Phase 0:
 //!
-//! > Director talks to both substrates exclusively over MCP, never by importing
+//! > Orqyn talks to both substrates exclusively over MCP, never by importing
 //! > their internal storage structs.
 //!
 //! A developer can intend that and still break it — one `use handoff_mcp::...`

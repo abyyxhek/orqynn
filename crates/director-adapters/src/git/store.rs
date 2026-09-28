@@ -7,7 +7,7 @@
 //!
 //! ## Durability shape
 //!
-//! One file holds everything Director knows about one repository: the
+//! One file holds everything Orqyn knows about one repository: the
 //! repository record, the latest snapshot, and the append-only histories of
 //! commits, file changes, and events. Writes are atomic — serialize fully,
 //! write to a sibling temporary file, rename — so a crash leaves either the
@@ -52,7 +52,7 @@ const MAX_FILE_CHANGES: usize = 5000;
 /// Cap on retained commit records.
 const MAX_COMMITS: usize = 2000;
 
-/// Everything Director knows about one repository, in one file.
+/// Everything Orqyn knows about one repository, in one file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredRepository {
     /// The stored format version.
@@ -63,9 +63,9 @@ pub struct StoredRepository {
     pub snapshot: ProjectStateSnapshot,
     /// Events, oldest first.
     pub events: Vec<ObservationEvent>,
-    /// Commits Director has observed.
+    /// Commits Orqyn has observed.
     pub commits: Vec<CommitInfo>,
-    /// File-change records Director has observed.
+    /// File-change records Orqyn has observed.
     pub file_changes: Vec<director_domain::repository::FileChangeRecord>,
 }
 
@@ -100,7 +100,7 @@ impl RepositoryStore {
 
     /// The file backing one repository.
     fn file_for(&self, id: &RepositoryId) -> Result<PathBuf, RepositoryError> {
-        // Ids are Director-generated, but this is the boundary where an id
+        // Ids are Orqyn-generated, but this is the boundary where an id
         // becomes a filename, so the shape is enforced here rather than trusted.
         let name = id.as_str();
         if name.is_empty()

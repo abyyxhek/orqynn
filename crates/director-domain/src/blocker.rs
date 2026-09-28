@@ -1,7 +1,7 @@
 //! [Blocker] — something standing between a task and its next step (Phase 7/11).
 //!
 //! A blocker is a first-class entity rather than a string on a task for one
-//! reason: **a blocked task must not silently stay blocked**. Director's loop
+//! reason: **a blocked task must not silently stay blocked**. Orqyn's loop
 //! revisits open blockers; the entity carries the state (`Open` → `Resolved` →
 //! possibly `Obsolete`) that makes "still blocked after three replans" an
 //! observable, reportable condition rather than a task that just sits there.
@@ -16,11 +16,11 @@ use crate::ids::{AgentId, BlockerId, TaskId};
 pub enum BlockerKind {
     /// Needs a person: an approval, a credential, a product decision.
     External,
-    /// Waiting on another Director task.
+    /// Waiting on another Orqyn task.
     Dependency,
     /// The path forward is unknown; needs investigation or a decision.
     Unknown,
-    /// Two sources disagree and Director will not guess.
+    /// Two sources disagree and Orqyn will not guess.
     Conflict,
 }
 

@@ -1,7 +1,7 @@
 //! [Action] — one entry in recent context.
 //!
 //! Actions are the *evidence* side of the system. Where a task says what
-//! should happen, an action records what actually did. Director collects these
+//! should happen, an action records what actually did. Orqyn collects these
 //! from observations (Phase 6) rather than from agent self-report, which is
 //! what makes [crate::context::RecentContext] a record of work rather than a
 //! record of claims.

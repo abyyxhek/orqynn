@@ -212,7 +212,7 @@ async fn tags_round_trip_through_frontmatter() {
 #[ignore = "spawns the ai-memory server binary"]
 async fn a_kind_that_names_a_tier_round_trips() {
     // The substrate stamps the retention tier into frontmatter, so a kind that
-    // names one is the kind Director reads back. Live-verified because the
+    // names one is the kind Orqyn reads back. Live-verified because the
     // frontmatter stamp is not visible from the substrate's source alone.
     let adapter = adapter("tier").await;
     let mut memory = memory("notes/tiered.md", "Tiered", "a retained page");

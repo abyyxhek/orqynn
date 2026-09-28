@@ -2,17 +2,17 @@
 //!
 //! ## Project state, and what it is not
 //!
-//! `project_states` holds the *normalized state Director currently believes a
+//! `project_states` holds the *normalized state Orqyn currently believes a
 //! project is in* — one row per project, replaced on each observation. It is
 //! deliberately not the git observation itself: the git observer reads `git`
-//! fresh and owns the detail of what it saw, while this record is what Director
+//! fresh and owns the detail of what it saw, while this record is what Orqyn
 //! holds between observations, compares a checkpoint against, and survives a
 //! restart. The two are separate responsibilities, kept in separate crates.
 //!
 //! ## Provider sync
 //!
 //! `provider_sync` is a pointer and a status, never a replica: which provider a
-//! Director id corresponds to, when it last synced, and what the last attempt
+//! Orqyn id corresponds to, when it last synced, and what the last attempt
 //! said. The provider's internal schema is not copied, by design — copying it
 //! is how a store starts being coupled to a substrate.
 
@@ -95,7 +95,7 @@ impl director_domain::ProjectStateRepository for SqliteProjectStateRepository {
     }
 }
 
-/// Load the state Director holds for a project, or `None` before the first
+/// Load the state Orqyn holds for a project, or `None` before the first
 /// observation.
 pub(crate) fn load_project_state(
     conn: &PooledConn,

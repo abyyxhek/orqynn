@@ -62,7 +62,7 @@ async fn opening_creates_the_schema_and_is_idempotent() {
 async fn a_newer_database_is_refused_rather_than_downgraded() {
     let (_store, dir) = store().await;
     let path = dir.path().join("director.db");
-    // Pretend a future Director wrote migration 999.
+    // Pretend a future Orqyn wrote migration 999.
     let conn = rusqlite::Connection::open(&path).expect("open for tampering");
     conn.execute(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (999, '2026-01-01')",

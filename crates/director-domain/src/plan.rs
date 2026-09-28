@@ -26,7 +26,7 @@ pub enum PlanStatus {
 }
 
 impl PlanStatus {
-    /// True if this plan is the one Director should be executing against.
+    /// True if this plan is the one Orqyn should be executing against.
     pub fn is_authoritative(self) -> bool {
         matches!(self, PlanStatus::Active)
     }

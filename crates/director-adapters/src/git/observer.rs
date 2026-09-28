@@ -11,7 +11,7 @@
 //!
 //! > Git observer: "what happened in git?"
 //! > Project state: "what does this mean for the project?"
-//! > Director: "what should happen next?"
+//! > Orqyn: "what should happen next?"
 //!
 //! Nothing here answers the third question, and very little here answers the
 //! second.
@@ -26,7 +26,7 @@
 //!
 //! Paths are validated before opening ([`Repository::validate_path`]) and the
 //! opened repository's working directory is checked back against the requested
-//! path, so a caller cannot point Director at a subdirectory and have it
+//! path, so a caller cannot point Orqyn at a subdirectory and have it
 //! silently observe a repository rooted elsewhere.
 
 use std::path::Path;
@@ -101,7 +101,7 @@ impl GitObserver {
             })?;
 
         // `Repository::open` searches upward. If it found a repository rooted
-        // above the requested path, refuse it: Director must observe exactly
+        // above the requested path, refuse it: Orqyn must observe exactly
         // the working tree it was pointed at, never a parent it did not
         // authorize.
         let workdir = repo
@@ -595,7 +595,7 @@ fn detect_renames(diff: &mut Diff) -> Result<(), RepositoryError> {
         .map_err(|err| RepositoryError::ObservationFailed(format!("find similar: {err}")))
 }
 
-/// Map a git2 delta status onto Director's change vocabulary.
+/// Map a git2 delta status onto Orqyn's change vocabulary.
 fn map_delta_type(status: Delta) -> FileChange {
     match status {
         Delta::Added => FileChange::Added,
@@ -658,7 +658,7 @@ fn signature_display(signature: Signature) -> String {
 
 /// Convert a git2 time to a UTC timestamp.
 ///
-/// The offset is dropped deliberately: Director records one canonical instant,
+/// The offset is dropped deliberately: Orqyn records one canonical instant,
 /// and comparing timestamps across machines with different local offsets is
 /// only safe if they are all UTC.
 fn commit_time(signature: &Signature) -> chrono::DateTime<chrono::Utc> {

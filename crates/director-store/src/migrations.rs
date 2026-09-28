@@ -1,4 +1,4 @@
-//! The migration system: how a Director database is brought up to date.
+//! The migration system: how a Orqyn database is brought up to date.
 //!
 //! ## The rule it enforces
 //!
@@ -14,9 +14,9 @@
 //! ## Why ordered migrations and not a schema dump
 //!
 //! A dump tells you what the schema *is*; it does not tell you how to get there
-//! from the version a running Director already has. Migrations are the
+//! from the version a running Orqyn already has. Migrations are the
 //! difference between "upgrade works" and "upgrade requires a fresh database".
-//! A Director process may open a database written by an older release, and the
+//! A Orqyn process may open a database written by an older release, and the
 //! schema version it finds there is a fact it must honor, not an inconvenience.
 //!
 //! ## How developers initialize a fresh database
@@ -74,14 +74,14 @@ pub fn migrations() -> BTreeMap<u32, Migration> {
 }
 
 /// The highest migration this build can apply. A database past this point was
-/// written by a newer Director and is refused rather than silently downgraded.
+/// written by a newer Orqyn and is refused rather than silently downgraded.
 pub fn latest_version() -> u32 {
     *migrations().keys().max().unwrap_or(&0)
 }
 
 /// Create the tracking table if it does not exist. Idempotent — running it on
 /// an up-to-date database is a no-op, which is what makes `open` safe to call
-/// every time Director starts.
+/// every time Orqyn starts.
 pub(crate) fn ensure_schema_table(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -120,13 +120,13 @@ pub(crate) fn run_migrations(conn: &mut Connection) -> Result<usize, StoreError>
     let known = migrations();
 
     // A database that is newer than this build. Refuse: applying nothing would
-    // leave Director running against a schema it does not understand, and
+    // leave Orqyn running against a schema it does not understand, and
     // "downgrade" is not a supported operation.
     if let Some(&newest) = applied.iter().max() {
         if newest > latest_version() {
             return Err(StoreError::Migration(format!(
                 "database is at migration {newest}, but this build only knows up to {}. \
-                 A newer Director wrote this database; refusing to run against an unknown schema.",
+                 A newer Orqyn wrote this database; refusing to run against an unknown schema.",
                 latest_version()
             )));
         }
@@ -164,7 +164,7 @@ fn apply_one(conn: &mut Connection, migration: &Migration) -> Result<(), StoreEr
 }
 
 /// The version a database is at, or `None` if it has no schema at all — the
-/// signal that `open` is looking at a path that is not a Director database.
+/// signal that `open` is looking at a path that is not a Orqyn database.
 pub(crate) fn current_version(conn: &Connection) -> Result<Option<u32>, StoreError> {
     let table_exists: Option<i64> = conn
         .query_row(

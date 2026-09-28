@@ -1,13 +1,13 @@
-//! [Handoff] — Director's own transfer of a task between agents (Phase 8/12).
+//! [Handoff] — Orqyn's own transfer of a task between agents (Phase 8/12).
 //!
 //! This is deliberately **not** a reimplementation of either substrate's
 //! handoff. ai-memory's `Handoff` is a session-scoped summary produced on
 //! `SessionEnd`; handoff-mcp's is `handoff_notes` in a session document.
-//! Director's handoff is task-scoped and **claim-once**: it is addressed to a
+//! Orqyn's handoff is task-scoped and **claim-once**: it is addressed to a
 //! specific next agent, and accepting it consumes it, so two agents can never
 //! both pick up the same task from the same transfer.
 //!
-//! The difference that matters: a Director handoff is always about *a task
+//! The difference that matters: a Orqyn handoff is always about *a task
 //! continuing*, never about *a session ending*. A session ending without a
 //! handoff is a crash, and recovery (Phase 11) builds the handoff retroactively
 //! from the last checkpoint.

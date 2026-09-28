@@ -15,7 +15,7 @@ crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
 > **Status: Phases 1–3 and 5 complete.** The canonical domain model, the
-> provider trait boundary, both substrate adapters, and Director's own
+> provider trait boundary, both substrate adapters, and Orqyn's own
 > persistent store are in place, with zero substrate coupling and a passing
 > test suite (268 tests).
 >

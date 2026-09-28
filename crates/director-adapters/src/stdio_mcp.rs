@@ -1,6 +1,6 @@
 //! A generic stdio JSON-RPC client for MCP tool servers.
 //!
-//! Both substrates Director talks to — handoff-mcp and ai-memory — are MCP
+//! Both substrates Orqyn talks to — handoff-mcp and ai-memory — are MCP
 //! servers reached the same way: spawn the binary, speak line-delimited
 //! JSON-RPC 2.0 over its stdin/stdout. That protocol is substrate-independent,
 //! so it lives here once rather than being duplicated per adapter.

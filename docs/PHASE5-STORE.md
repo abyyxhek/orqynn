@@ -1,22 +1,22 @@
-# Phase 5 — The Store: Director's Own Persistence
+# Phase 5 — The Store: Orqyn's Own Persistence
 
 > **Status: complete.** The `director-store` crate and the domain's `Store` trait
 > layer are built, and all four gates are green.
 
 ## Goal
 
-Phases 1–3 gave Director a vocabulary and a live read on both substrates.
-Nothing Director *owned* was persisted: a checkpoint, a plan, a decision, an
+Phases 1–3 gave Orqyn a vocabulary and a live read on both substrates.
+Nothing Orqyn *owned* was persisted: a checkpoint, a plan, a decision, an
 assignment, a verification result existed for as long as the process did, and
 not one second longer. Phase 5 fixes that.
 
-The goal is a store for Director's own entities — the ones no substrate has,
+The goal is a store for Orqyn's own entities — the ones no substrate has,
 and the ones that must never be delegated to a provider trait. Two boundaries
 meet here, and they are opposite in kind:
 
 - `director-adapters` talks to handoff-mcp and ai-memory **over MCP**. Those
-  servers own their schemas; Director asks and receives.
-- `director-store` talks to a `.db` file Director **owns**. Nobody else writes
+  servers own their schemas; Orqyn asks and receives.
+- `director-store` talks to a `.db` file Orqyn **owns**. Nobody else writes
   it, nobody else's schema constrains it, and it is still readable when both
   substrates are down.
 
@@ -32,17 +32,17 @@ type.
 The migration files are the only place tables are created; the application
 never issues DDL at runtime. The schema holds:
 
-- **Director-owned entities** — checkpoints, assignments, normalized project
+- **Orqyn-owned entities** — checkpoints, assignments, normalized project
   state, provider sync metadata, append-only status history.
-- **The substrate-facing entities Director needs as anchors** — projects,
-  tasks, agents, sessions — stored because Director must reason about them when
+- **The substrate-facing entities Orqyn needs as anchors** — projects,
+  tasks, agents, sessions — stored because Orqyn must reason about them when
   the substrate is unreachable, and because their relationships (a task's
-  assignment history, a session's lineage) are Director's own conclusions.
+  assignment history, a session's lineage) are Orqyn's own conclusions.
 
 What it pointedly does *not* hold: a copy of either substrate's tables. Copying
 a provider's schema here is how a store starts being coupled to a substrate.
 `ProviderSync` is a pointer and a status per entity per provider — never a
-replica. If handoff-mcp changes its schema tomorrow, Director's store does not
+replica. If handoff-mcp changes its schema tomorrow, Orqyn's store does not
 need a migration.
 
 ## The three invariants held in storage, not in convention
@@ -199,5 +199,5 @@ HANDOFF_BINARY=/c/Users/ASUS/.handoff-target/release/handoff-mcp.exe \
   yet. The loop that will is a later phase.
 - **No Phase 4.** The roadmap jumps 3 → 5; there is no `PHASE4` document and no
   Phase 4 work in this tree.
-- **No MCP server of Director's own**, and no loop. Persistence exists; the
+- **No MCP server of Orqyn's own**, and no loop. Persistence exists; the
   thing that persists does not yet exist.

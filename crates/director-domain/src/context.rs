@@ -1,8 +1,8 @@
 //! [RecentContext] — a bounded, compacted window of recent activity (Phase 9).
 //!
-//! This is Director's answer to the problem every long session hits: the
+//! This is Orqyn's answer to the problem every long session hits: the
 //! context window fills. Rather than dumping a raw transcript on the next
-//! agent, Director keeps a bounded window of [crate::action::Action] entries
+//! agent, Orqyn keeps a bounded window of [crate::action::Action] entries
 //! plus an optional compacted summary of everything that fell out of the
 //! window.
 //!

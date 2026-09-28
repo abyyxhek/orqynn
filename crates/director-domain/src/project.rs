@@ -1,6 +1,6 @@
 //! [Project] — the thing all the work belongs to.
 //!
-//! A Project is deliberately thin: it is a *root*, not a container. Director
+//! A Project is deliberately thin: it is a *root*, not a container. Orqyn
 //! does not store tasks inside a project object — tasks live in the substrate
 //! and are referenced by id. The project exists to anchor ids, scopes, and
 //! per-project defaults, and to answer the one question that matters when
@@ -42,16 +42,16 @@ pub struct Project {
     pub id: ProjectId,
     /// Human-facing name, e.g. "checkout-service".
     pub name: String,
-    /// Absolute path to the working tree Director observes. This is what makes
+    /// Absolute path to the working tree Orqyn observes. This is what makes
     /// project state observable rather than remembered.
     pub root: String,
-    /// Branch Director compares checkpoints against when nothing more specific
+    /// Branch Orqyn compares checkpoints against when nothing more specific
     /// is known.
     pub default_branch: DefaultBranch,
-    /// The repository Director observes for this project, once one has been
+    /// The repository Orqyn observes for this project, once one has been
     /// registered. A reference, not an embedded copy: the [`crate::repository::Repository`]
     /// record itself belongs to the git observation layer, which owns the git
-    /// detail. Director's store keeps only the link.
+    /// detail. Orqyn's store keeps only the link.
     pub repository_id: Option<RepositoryId>,
     /// Monotonic version for optimistic concurrency. Bumped exactly once per
     /// change that matters — see [`Project::bump_state_version`]. New records
@@ -61,7 +61,7 @@ pub struct Project {
     /// one version per mutable object, no competing counters.
     #[serde(default = "default_state_version")]
     pub state_version: u64,
-    /// When Director first registered it.
+    /// When Orqyn first registered it.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// When it last changed.
     pub updated_at: chrono::DateTime<chrono::Utc>,

@@ -1,4 +1,4 @@
-//! [Repository] — a git working tree Director observes (Phase 2).
+//! [Repository] — a git working tree Orqyn observes (Phase 2).
 //!
 //! Phase 1 established that project state is **observed, never remembered**;
 //! [`crate::state::ProjectState`] is the shape of one observation. Phase 2
@@ -36,7 +36,7 @@ pub const SHORT_SHA_LEN: usize = 7;
 /// phase; later phases may add filesystem or verification sources.
 pub const EVENT_SOURCE_GIT: &str = "git";
 
-/// A git working tree that Director observes.
+/// A git working tree that Orqyn observes.
 ///
 /// Deliberately a *record of what was seen*, not a live handle to git: the
 /// adapter owns the git2 handle, the domain owns the shape of the answer.
@@ -63,16 +63,16 @@ pub struct Repository {
     pub current_commit: String,
     /// Coarse state of the repository itself. See [`RepositoryStatus`].
     pub status: RepositoryStatus,
-    /// When Director last successfully read this repository.
+    /// When Orqyn last successfully read this repository.
     pub last_observed_at: chrono::DateTime<chrono::Utc>,
-    /// The last commit Director finished processing into events. During
+    /// The last commit Orqyn finished processing into events. During
     /// incremental sync this is the anchor for the next range walk; it lags
     /// `current_commit` only if a walk was bounded or interrupted.
     pub last_observed_commit: Option<String>,
-    /// How many times Director has observed this repository. Monotonic; see
+    /// How many times Orqyn has observed this repository. Monotonic; see
     /// [`Repository::bump_observation_version`].
     pub observation_version: u64,
-    /// When Director registered the repository.
+    /// When Orqyn registered the repository.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// When this record last changed.
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -98,7 +98,7 @@ pub enum RepositoryStatus {
 /// The normalized working-tree state at one moment.
 ///
 /// Git's own status report is a flat list of `(xy-code, path)` pairs; this
-/// structure is the same information bucketed by the categories Director
+/// structure is the same information bucketed by the categories Orqyn
 /// reasons about. Nothing is lost in normalization: every entry retains the
 /// [`FileChange`] kind git reported, and renames keep both paths.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,10 +234,10 @@ pub struct FileChangeRecord {
     pub old_path: Option<String>,
     /// What kind of change git reported.
     pub change_type: FileChange,
-    /// Lines added, when Director counted them. `None` means line statistics
+    /// Lines added, when Orqyn counted them. `None` means line statistics
     /// were not requested — for untracked files, or a plain status read.
     pub insertions: Option<u32>,
-    /// Lines removed, when Director counted them. See [`insertions`](Self::insertions).
+    /// Lines removed, when Orqyn counted them. See [`insertions`](Self::insertions).
     pub deletions: Option<u32>,
     /// A content fingerprint used only for idempotency: the git blob oid when
     /// one is known, a filesystem proxy when one is not, or `"deleted"` for a
@@ -254,7 +254,7 @@ pub struct FileChangeRecord {
     /// it is the `HEAD` the change is measured from. This is what makes an
     /// uncommitted edit observed three times collapse to one record.
     pub commit_sha: String,
-    /// When Director observed the change.
+    /// When Orqyn observed the change.
     pub observed_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -333,7 +333,7 @@ pub struct DiffInfo {
 /// A photograph of repository state at one observation, comparable against
 /// another photograph.
 ///
-/// This is the type the Director compares when it asks "has the project moved
+/// This is the type the Orqyn compares when it asks "has the project moved
 /// on since I last looked?" — the same question [`crate::checkpoint::Checkpoint`]
 /// asks, answered at the repository level instead of the task level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,7 +350,7 @@ pub struct ProjectStateSnapshot {
     pub working_tree: WorktreeState,
     /// True when the working tree has no uncommitted change of any kind.
     pub working_tree_clean: bool,
-    /// The commit Director had finished processing when this snapshot was
+    /// The commit Orqyn had finished processing when this snapshot was
     /// taken. The anchor for the next incremental walk.
     pub last_observed_commit: String,
     /// When the observation was made.
@@ -417,7 +417,7 @@ impl ProjectStateSnapshot {
     }
 
     /// Whether this snapshot records any important change relative to
-    /// `previous`. A change is *important* if it is one a Director would act
+    /// `previous`. A change is *important* if it is one a Orqyn would act
     /// on: a branch move, a new commit, or a different working tree.
     pub fn has_important_change(&self, previous: &ProjectStateSnapshot) -> bool {
         !self.state_changes(previous).is_empty()
@@ -457,12 +457,12 @@ pub enum StateChangeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
-    /// Director synchronized a repository against git. Emitted at most once
+    /// Orqyn synchronized a repository against git. Emitted at most once
     /// per distinct observed state, so a no-op re-sync produces nothing new.
     RepositorySynced,
     /// The checked-out branch changed.
     BranchChanged,
-    /// A commit Director had not seen before.
+    /// A commit Orqyn had not seen before.
     CommitCreated,
     /// A file entered the tracked tree.
     FileAdded,
@@ -536,7 +536,7 @@ pub enum EventData {
     File(FileChangeRecord),
 }
 
-/// One fact Director learned by observing git.
+/// One fact Orqyn learned by observing git.
 ///
 /// Every event has a **stable identity**: [`ObservationEvent::key_for`] turns
 /// what the event describes into an [`EventId`], so the same commit or the same
@@ -552,7 +552,7 @@ pub struct ObservationEvent {
     pub repository_id: RepositoryId,
     /// What kind of fact this is.
     pub kind: EventKind,
-    /// When Director recorded it.
+    /// When Orqyn recorded it.
     pub timestamp: chrono::DateTime<chrono::Utc>,
     /// Where the fact came from. Always [`EVENT_SOURCE_GIT`] in this phase.
     pub source: String,
@@ -723,7 +723,7 @@ pub struct SyncResult {
     /// How many events this sync added that were not already known. Zero for a
     /// no-op re-sync — this is the idempotency guarantee, observable.
     pub events_created: usize,
-    /// The commit the sync started from, if Director had seen this repository
+    /// The commit the sync started from, if Orqyn had seen this repository
     /// before.
     pub previous_commit: Option<String>,
     /// The commit the sync landed on.
@@ -854,7 +854,7 @@ impl Repository {
         self.observation_version += 1;
     }
 
-    /// Record the last commit Director finished processing.
+    /// Record the last commit Orqyn finished processing.
     pub fn set_last_observed_commit(&mut self, sha: String) {
         self.last_observed_commit = Some(sha);
         self.updated_at = chrono::Utc::now();
@@ -886,7 +886,7 @@ impl Repository {
             });
         }
         // Windows roots (`C:\`, `D:/`) are absolute; a bare `/` or `\` is not
-        // something Director should ever observe.
+        // something Orqyn should ever observe.
         let looks_absolute = path.starts_with('/') || path.starts_with('\\') || {
             let bytes = path.as_bytes();
             bytes.len() >= 3

@@ -111,14 +111,14 @@ async fn a_task_round_trips_through_the_live_server() {
 #[ignore]
 async fn an_agent_done_does_not_complete_but_a_director_done_does() {
     // The acceptance criterion, live: an agent reporting done must not
-    // complete the task, while Director's own completion must.
+    // complete the task, while Orqyn's own completion must.
     let adapter = connect("done-rule", "AGENT-live-2").await;
     let id = TaskId::from_string("LIVE-2".to_string());
 
     adapter.create_task(task("LIVE-2")).await.expect("create");
 
     // The agent's self-report: done written straight through the substrate,
-    // bypassing Director's own write path the way an agent would.
+    // bypassing Orqyn's own write path the way an agent would.
     adapter
         .raw_call(
             "handoff_update_task",
@@ -131,10 +131,10 @@ async fn an_agent_done_does_not_complete_but_a_director_done_does() {
     assert_eq!(
         reported.status,
         TaskStatus::VerificationPending,
-        "an agent's done is not Director's Done"
+        "an agent's done is not Orqyn's Done"
     );
 
-    // Director's own completion, through the provider trait.
+    // Orqyn's own completion, through the provider trait.
     adapter
         .set_task_status(&id, TaskStatus::Done)
         .await

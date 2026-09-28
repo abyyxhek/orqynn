@@ -1,9 +1,9 @@
 //! [`LocalExecutor`] — run real commands on this machine.
 //!
 //! This is the fallback [`ExecutionProvider`](director_domain::providers::ExecutionProvider)
-//! and the reference implementation. It exists so that Director's verification
+//! and the reference implementation. It exists so that Orqyn's verification
 //! engine never has to trust an agent's say-so: when a substrate cannot execute
-//! commands, Director runs the test suite itself.
+//! commands, Orqyn runs the test suite itself.
 //!
 //! ## Honest limitations
 //!

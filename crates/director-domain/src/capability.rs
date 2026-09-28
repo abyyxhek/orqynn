@@ -1,7 +1,7 @@
 //! Capabilities an [Agent](crate::agent::Agent) can declare and a
 //! [Task](crate::task::Task) can require.
 //!
-//! Capabilities are the basis of assignment (Phase 8): Director matches a
+//! Capabilities are the basis of assignment (Phase 8): Orqyn matches a
 //! task's `required_capabilities` against the capabilities an agent declares.
 //! They are deliberately coarse. This is not a skills ontology; it is a filter
 //! that prevents assigning "write the Postgres migration" to an agent with no
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// The fixed variants cover the common coding-agent roles. [`Capability::Custom`]
 /// exists so a deployment can express domain-specific skills (e.g. an internal
-/// framework) without forcing a release of Director. Custom capabilities are
+/// framework) without forcing a release of Orqyn. Custom capabilities are
 /// matched case-insensitively by string, so `Custom("Payments".into())` and
 /// `Custom("payments".into())` should be normalized before comparison —
 /// [`Capability::matches`] does that normalization.
@@ -43,7 +43,7 @@ pub enum Capability {
     /// Security review and threat modelling.
     Security,
     /// A human contributor. Distinct from every machine agent: humans do not
-    /// heartbeat, and Director must never block on one.
+    /// heartbeat, and Orqyn must never block on one.
     Human,
     /// A deployment-specific capability, matched by name.
     Custom(String),
@@ -55,7 +55,7 @@ impl Capability {
     /// A concrete capability satisfies itself. `Coding` is treated as a
     /// generalist super-capability: an agent declaring `Coding` satisfies any
     /// non-human requirement, because a general coding agent can attempt any
-    /// coding task. This is intentional — Director's assignment is a *filter*,
+    /// coding task. This is intentional — Orqyn's assignment is a *filter*,
     /// not a guarantee of success; the verification engine (Phase 10) is what
     /// catches failure.
     ///

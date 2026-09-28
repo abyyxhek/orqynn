@@ -1,4 +1,4 @@
-//! Mirrors of the ai-memory wire shapes Director parses.
+//! Mirrors of the ai-memory wire shapes Orqyn parses.
 //!
 //! Every struct here is a hand-written mirror of a JSON reply the live
 //! `ai-memory serve` server actually emits, verified against a running binary
@@ -10,9 +10,9 @@
 //! caught.
 //!
 //! Deserialization is deliberately permissive about *extra* fields — serde
-//! ignores them by default — and strict about the ones Director reads. That is
-//! the right combination: an upstream field Director does not care about must
-//! not break the adapter, while a field Director does care about going missing
+//! ignores them by default — and strict about the ones Orqyn reads. That is
+//! the right combination: an upstream field Orqyn does not care about must
+//! not break the adapter, while a field Orqyn does care about going missing
 //! must surface as a [`crate::aimemory::adapter::AiMemoryAdapterError::Malformed`]
 //! rather than silently as `None`.
 //!
@@ -38,17 +38,17 @@
 /// One hit in a `memory_query` or `memory_recent` reply.
 ///
 /// Mirrors `ai_memory_store::PageHit` as serialized by the MCP server —
-/// specifically the fields Director reads. The store struct also carries an
+/// specifically the fields Orqyn reads. The store struct also carries an
 /// `id` (a per-version [`PageId`]), plus `superseded` and `pinned` flags that
 /// are omitted from JSON when false; none of them are stable or meaningful
-/// enough to become Director's identity, so they are not mirrored.
+/// enough to become Orqyn's identity, so they are not mirrored.
 ///
 /// [`PageId`]: ai_memory_store::PageId
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct PageHit {
     /// Relative wiki path, e.g. `notes/auth-design.md`. The only stable,
     /// caller-visible identity a page has — the version id changes on every
-    /// edit — so this is what the adapter uses as Director's `Memory::id`.
+    /// edit — so this is what the adapter uses as Orqyn's `Memory::id`.
     pub path: String,
     /// Page title.
     pub title: String,
@@ -67,9 +67,9 @@ pub struct PageHit {
 ///
 /// The server's response also carries `answer`, `raw_hits`, `global_hits`,
 /// `global_scope_hits`, and `streams_active` — none populated on the calls
-/// Director makes (no `answer=true`, no `global`, no `scopes`, no `explain`),
+/// Orqyn makes (no `answer=true`, no `global`, no `scopes`, no `explain`),
 /// and all omitted from JSON when empty. Mirroring only `hits` keeps the mirror
-/// honest about what Director actually reads.
+/// honest about what Orqyn actually reads.
 #[derive(Debug, serde::Deserialize)]
 pub struct MemoryQueryResponse {
     /// Ranked hits, best first.
@@ -79,7 +79,7 @@ pub struct MemoryQueryResponse {
 /// The `memory_recent` reply.
 ///
 /// `global_hits` is populated only when a repo opts into `[recall]
-/// default_global` *and* the call is unscoped. Director always sends an
+/// default_global` *and* the call is unscoped. Orqyn always sends an
 /// explicit `workspace` + `project`, which makes that branch unreachable, so
 /// the field is not mirrored: if it ever did fire, `hits` would be empty and
 /// the adapter would report no recent memory rather than silently reporting
@@ -109,15 +109,15 @@ pub struct ReadPageReply {
 
 /// The `memory_write_page` reply.
 ///
-/// `checkpoint` is a git-commit SHA when the wiki layer checkpoints; Director
+/// `checkpoint` is a git-commit SHA when the wiki layer checkpoints; Orqyn
 /// does not consume it, so it is not mirrored.
 #[derive(Debug, serde::Deserialize)]
 pub struct WritePageReply {
-    /// The substrate's own page id. Opaque to Director; the path is the
-    /// identity Director keeps.
+    /// The substrate's own page id. Opaque to Orqyn; the path is the
+    /// identity Orqyn keeps.
     #[allow(dead_code)]
     pub page_id: String,
-    /// The path the substrate stored the page at, which Director reads back
+    /// The path the substrate stored the page at, which Orqyn reads back
     /// rather than trusting the path it asked for.
     pub path: String,
 }
@@ -126,7 +126,7 @@ pub struct WritePageReply {
 /// `tier` argument.
 ///
 /// Kept as a list of `&'static str` rather than an enum because the substrate
-/// parses them from a string and may add a fifth; a value Director does not
+/// parses them from a string and may add a fifth; a value Orqyn does not
 /// know should be passed through or dropped, not rejected at compile time.
 pub(crate) const KNOWN_TIERS: [&str; 4] = ["working", "episodic", "semantic", "procedural"];
 
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn a_query_hit_parses() {
-        // Shaped like a real `memory_query` hit: the fields Director reads,
+        // Shaped like a real `memory_query` hit: the fields Orqyn reads,
         // plus one it does not (`score_details`) that must not break parsing.
         let json = r#"{
             "id": "01J6Z4KQ4N",
