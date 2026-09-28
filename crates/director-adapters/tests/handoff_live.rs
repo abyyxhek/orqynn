@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use director_adapters::HandoffAdapter;
 use director_domain::agent::{Agent, Harness};
-use director_domain::ids::{AgentId, MachineId, SessionId, TaskId};
+use director_domain::ids::{AgentId, MachineId, ProjectId, SessionId, TaskId};
 use director_domain::providers::{AgentProvider, SessionProvider, TaskProvider};
 use director_domain::session::{AgentSession, SessionEnd, SessionStatus};
 use director_domain::task::{Task, TaskStatus};
@@ -185,6 +185,7 @@ async fn the_live_agent_and_session_round_trip() {
     let started = adapter
         .start_session(AgentSession::start(
             SessionId::from_string("director-issued".to_string()),
+            Some(ProjectId::from_string("PROJ-live".to_string())),
             adapter.agent_identity(),
             MachineId::from_string("MACH-live".to_string()),
             None,

@@ -1,0 +1,987 @@
+//! Integration tests for [`director_store::Store`] against a real SQLite file.
+//!
+//! These are the tests that make the schema's promises real. The unit tests in
+//! each module cover the mapping; what this file covers is the *behavior the
+//! phase is built for*: an optimistic conflict is reported rather than silently
+//! overwritten, an assignment's release is recorded rather than deleted, a
+//! superseded checkpoint survives, and a task that names no project is refused.
+//!
+//! Each test opens its own temporary database, so they are independent and can
+//! run in parallel. The file is deleted when the handle drops.
+
+use std::matches;
+
+use director_domain::agent::{Agent, AgentStatus, Harness};
+use director_domain::assignment::{AgentAssignment, AssignmentStatus, ReleaseReason};
+use director_domain::capability::Capability;
+use director_domain::checkpoint::{Checkpoint, CheckpointStatus};
+use director_domain::ids::{
+    AgentId, AssignmentId, CheckpointId, MachineId, ProjectId, RepositoryId, SessionId, TaskId,
+};
+use director_domain::project::{DefaultBranch, Project};
+use director_domain::session::{AgentSession, SessionEnd, SessionStatus};
+use director_domain::state::TestResults;
+use director_domain::store::{ProviderSync, StoredProjectState};
+use director_domain::task::{Task, TaskStatus};
+use director_domain::{
+    AgentRepository, AssignmentRepository, CheckpointRepository, ProjectRepository,
+    ProjectStateRepository, ProviderSyncRepository, SessionRepository, StoreError, TaskRepository,
+};
+
+use director_store::Store;
+
+/// A fresh store backed by a temporary file, deleted when the test ends.
+async fn store() -> (Store, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().expect("a temp dir");
+    let path = dir.path().join("director.db");
+    let store = Store::open(&path).await.expect("store opens and migrates");
+    (store, dir)
+}
+
+// ---------------------------------------------------------------------------
+// Opening and migrating.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn opening_creates_the_schema_and_is_idempotent() {
+    let (store, dir) = store().await;
+    let path = dir.path().join("director.db");
+    assert_eq!(
+        store.schema_version(),
+        1,
+        "a fresh database reaches version 1"
+    );
+
+    // Reopening the same file must be a no-op, not an error: this is what makes
+    // `open` safe to call on every startup.
+    let again = Store::open(&path).await.expect("reopening is a no-op");
+    assert_eq!(again.schema_version(), 1);
+}
+
+#[tokio::test]
+async fn a_newer_database_is_refused_rather_than_downgraded() {
+    let (_store, dir) = store().await;
+    let path = dir.path().join("director.db");
+    // Pretend a future Director wrote migration 999.
+    let conn = rusqlite::Connection::open(&path).expect("open for tampering");
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (999, '2026-01-01')",
+        [],
+    )
+    .expect("record a future migration");
+    drop(conn);
+
+    // `Store` holds a connection pool and is not `Debug`, so this is matched by
+    // hand rather than with `unwrap_err`.
+    let err = match Store::open(&path).await {
+        Err(err) => err,
+        Ok(_) => panic!("a newer database must be refused, not opened"),
+    };
+    assert!(matches!(err, StoreError::Migration(_)), "got {err:?}");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("999"),
+        "the message should name the unknown version: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Projects.
+// ---------------------------------------------------------------------------
+
+fn project(id: &str) -> Project {
+    Project::new(
+        ProjectId::from_string(id),
+        "checkout-service",
+        "/repo/checkout-service",
+    )
+}
+
+#[tokio::test]
+async fn a_project_round_trips_through_the_store() {
+    let (store, _path) = store().await;
+    let created = store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project created");
+    assert_eq!(created.id, ProjectId::from_string("PROJ-1"));
+    assert_eq!(created.default_branch, DefaultBranch::Main);
+    assert_eq!(created.state_version, 1, "a new record starts at version 1");
+
+    let loaded = store
+        .projects()
+        .get_project(&ProjectId::from_string("PROJ-1"))
+        .await
+        .expect("project loaded");
+    assert_eq!(loaded, created);
+
+    let listed = store.projects().list_projects().await.expect("list");
+    assert_eq!(listed, vec![created]);
+}
+
+#[tokio::test]
+async fn a_duplicate_project_id_is_rejected() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("first project");
+    let err = store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintViolation(_)),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_project_update_is_a_conflict_not_an_overwrite() {
+    let (store, _path) = store().await;
+    let created = store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project created");
+
+    // The caller's stale copy, still at version 1.
+    let mut stale = created.clone();
+    stale.name = "stale-name".into();
+
+    // A first writer moves the version to 2.
+    let mut fresh = created;
+    fresh.name = "fresh-name".into();
+    let updated = store
+        .projects()
+        .update_project(&fresh)
+        .await
+        .expect("first update lands");
+    assert_eq!(updated.state_version, 2);
+
+    // The stale writer must not silently win.
+    let err = store.projects().update_project(&stale).await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::StateVersionConflict { .. }),
+        "got {err:?}"
+    );
+
+    // The winner's write is what the store holds.
+    let loaded = store
+        .projects()
+        .get_project(&ProjectId::from_string("PROJ-1"))
+        .await
+        .expect("project loaded");
+    assert_eq!(loaded.name, "fresh-name");
+    assert_eq!(loaded.state_version, 2);
+}
+
+#[tokio::test]
+async fn an_unknown_project_id_is_not_found() {
+    let (store, _path) = store().await;
+    let err = store
+        .projects()
+        .get_project(&ProjectId::from_string("PROJ-nope"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Tasks.
+// ---------------------------------------------------------------------------
+
+fn task(id: &str, project: &str) -> Task {
+    let mut task = Task::new(
+        TaskId::from_string(id),
+        "Wire the checkout retry policy",
+        "Retries are idempotent and capped at three attempts.",
+    );
+    task.project_id = Some(ProjectId::from_string(project));
+    task
+}
+
+#[tokio::test]
+async fn a_task_round_trips_and_carries_no_agent() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+
+    let created = store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task created");
+    assert_eq!(created.id, TaskId::from_string("TASK-1"));
+    assert_eq!(created.project_id, Some(ProjectId::from_string("PROJ-1")));
+
+    let loaded = store
+        .tasks()
+        .get_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("task loaded");
+    assert_eq!(loaded, created);
+}
+
+#[tokio::test]
+async fn the_tasks_table_names_no_agent() {
+    // Assignment is the agent_assignments table. The task row itself must carry
+    // no agent reference — asserted here, against the schema, so a future
+    // migration that adds one is noticed by this test rather than by a caller.
+    let (_store, dir) = store().await;
+    let path = dir.path().join("director.db");
+    let conn = rusqlite::Connection::open(&path).expect("open for inspection");
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(tasks)")
+        .expect("describe tasks");
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("column names")
+        .map(|r| r.expect("column name"))
+        .collect();
+    assert!(
+        !columns.iter().any(|c| c.contains("agent")),
+        "the tasks table must not name an agent; its columns are {columns:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_task_without_a_project_is_refused() {
+    let (store, _path) = store().await;
+    let unscoped = Task::new(
+        TaskId::from_string("TASK-1"),
+        "Unscoped work",
+        "Belongs to no project.",
+    );
+    let err = store.tasks().create_task(&unscoped).await.unwrap_err();
+    // The exact variant depends on which constraint fires first (NOT NULL vs the
+    // foreign key); either way an unscoped task is refused rather than stored.
+    assert!(
+        matches!(
+            err,
+            StoreError::ConstraintViolation(_) | StoreError::Storage(_)
+        ),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_status_change_appends_to_history_never_overwriting() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+
+    let created = store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task created");
+
+    let mut moved = created;
+    moved.status = TaskStatus::InProgress;
+    let after_first = store
+        .tasks()
+        .update_task(&moved)
+        .await
+        .expect("first update");
+    assert_eq!(after_first.status, TaskStatus::InProgress);
+
+    // The second move continues from the version the first write produced —
+    // reusing `moved` would be a stale write and a conflict, not a no-op.
+    let mut moved_again = after_first;
+    moved_again.status = TaskStatus::Blocked;
+    let after_second = store
+        .tasks()
+        .update_task(&moved_again)
+        .await
+        .expect("second update");
+    assert_eq!(after_second.state_version, 3);
+
+    let history = store
+        .tasks()
+        .task_history(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("history");
+    let transitions: Vec<_> = history.into_iter().map(|t| (t.from, t.to)).collect();
+    assert_eq!(
+        transitions,
+        vec![
+            (TaskStatus::Backlog, TaskStatus::InProgress),
+            (TaskStatus::InProgress, TaskStatus::Blocked),
+        ],
+        "history accumulates every transition in order"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Agents.
+// ---------------------------------------------------------------------------
+
+fn agent(id: &str) -> Agent {
+    Agent::register(
+        AgentId::from_string(id),
+        "claude-code",
+        Harness::ClaudeCode,
+        MachineId::from_string("MACH-a"),
+        vec![Capability::Coding, Capability::Testing],
+    )
+}
+
+#[tokio::test]
+async fn an_agent_round_trips_with_its_capabilities() {
+    let (store, _path) = store().await;
+    let created = store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent registered");
+    assert_eq!(created.status, AgentStatus::Available);
+    assert_eq!(
+        created.capabilities,
+        vec![Capability::Coding, Capability::Testing]
+    );
+
+    let loaded = store
+        .agents()
+        .get_agent(&AgentId::from_string("AGENT-1"))
+        .await
+        .expect("agent loaded");
+    assert_eq!(loaded, created);
+
+    assert_eq!(store.agents().list_agents().await.expect("list").len(), 1);
+}
+
+#[tokio::test]
+async fn an_agent_update_bumps_its_version() {
+    let (store, _path) = store().await;
+    let created = store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent registered");
+
+    let mut updated = created;
+    updated.status = AgentStatus::Busy;
+    let after = store
+        .agents()
+        .update_agent(&updated)
+        .await
+        .expect("agent updated");
+    assert_eq!(after.state_version, 2);
+    assert_eq!(after.status, AgentStatus::Busy);
+}
+
+// ---------------------------------------------------------------------------
+// Sessions: the lineage of who worked on what.
+// ---------------------------------------------------------------------------
+
+fn session(id: &str, agent: &str, task: &str) -> AgentSession {
+    AgentSession::start(
+        SessionId::from_string(id),
+        Some(ProjectId::from_string("PROJ-1")),
+        AgentId::from_string(agent),
+        MachineId::from_string("MACH-a"),
+        Some(TaskId::from_string(task)),
+    )
+}
+
+#[tokio::test]
+async fn a_session_round_trips_and_closes_with_its_end_reason() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    let started = store
+        .sessions()
+        .create_session(&session("SESS-1", "AGENT-1", "TASK-1"))
+        .await
+        .expect("session created");
+    assert_eq!(started.status, SessionStatus::Active);
+
+    let closed = store
+        .sessions()
+        .end_session(
+            &SessionId::from_string("SESS-1"),
+            SessionEnd::Clean,
+            started.state_version,
+        )
+        .await
+        .expect("session closed");
+    assert_eq!(closed.end, Some(SessionEnd::Clean));
+    assert_eq!(closed.status, SessionStatus::Closed);
+    assert_eq!(closed.state_version, 2);
+}
+
+#[tokio::test]
+async fn a_task_accumulates_sessions_in_start_order() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    store
+        .sessions()
+        .create_session(&session("SESS-1", "AGENT-1", "TASK-1"))
+        .await
+        .expect("first session");
+    // The second session is a continuation of the first, as a retry would be.
+    let mut second = session("SESS-2", "AGENT-1", "TASK-1");
+    second.parent_session_id = Some(SessionId::from_string("SESS-1"));
+    store
+        .sessions()
+        .create_session(&second)
+        .await
+        .expect("second session");
+
+    let lineage = store
+        .sessions()
+        .sessions_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("lineage");
+    assert_eq!(
+        lineage.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        vec!["SESS-1", "SESS-2"],
+        "sessions are returned oldest first"
+    );
+    assert_eq!(
+        lineage[1].parent_session_id,
+        Some(SessionId::from_string("SESS-1"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Assignments: release marks, never deletes.
+// ---------------------------------------------------------------------------
+
+fn assignment(id: &str, task: &str, agent: &str) -> AgentAssignment {
+    AgentAssignment::propose(
+        AssignmentId::from_string(id),
+        TaskId::from_string(task),
+        AgentId::from_string(agent),
+    )
+}
+
+#[tokio::test]
+async fn an_assignment_can_be_activated_and_released() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    let proposed = store
+        .assignments()
+        .create_assignment(&assignment("ASG-1", "TASK-1", "AGENT-1"))
+        .await
+        .expect("assignment proposed");
+    assert_eq!(proposed.status, AssignmentStatus::Proposed);
+    assert!(
+        store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("no active assignment yet")
+            .is_none(),
+        "a proposed assignment does not occupy the active slot"
+    );
+
+    // The session the activation names has to exist: the assignment row carries
+    // a foreign key to it.
+    store
+        .sessions()
+        .create_session(&session("SESS-1", "AGENT-1", "TASK-1"))
+        .await
+        .expect("session");
+
+    let mut activated = proposed;
+    activated.activate(SessionId::from_string("SESS-1"));
+    let active = store
+        .assignments()
+        .update_assignment(&activated)
+        .await
+        .expect("assignment activated");
+    assert_eq!(active.status, AssignmentStatus::Active);
+    assert_eq!(
+        store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("the active assignment")
+            .expect("there is one")
+            .id,
+        AssignmentId::from_string("ASG-1")
+    );
+
+    let released = store
+        .assignments()
+        .release_assignment(
+            &AssignmentId::from_string("ASG-1"),
+            ReleaseReason::WorkComplete,
+            active.state_version,
+        )
+        .await
+        .expect("assignment released");
+    assert_eq!(released.status, AssignmentStatus::Released);
+    assert_eq!(released.release_reason, Some(ReleaseReason::WorkComplete));
+    // The row is still there — released, not deleted.
+    assert!(
+        store
+            .assignments()
+            .get_assignment(&AssignmentId::from_string("ASG-1"))
+            .await
+            .expect("the released row is retained")
+            .status
+            == AssignmentStatus::Released
+    );
+}
+
+#[tokio::test]
+async fn assignment_history_retains_every_tenure() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-2"))
+        .await
+        .expect("second agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    store
+        .sessions()
+        .create_session(&session("SESS-1", "AGENT-1", "TASK-1"))
+        .await
+        .expect("session");
+
+    let first = store
+        .assignments()
+        .create_assignment(&assignment("ASG-1", "TASK-1", "AGENT-1"))
+        .await
+        .expect("first assignment");
+    let mut active = first;
+    active.activate(SessionId::from_string("SESS-1"));
+    let first_active = store
+        .assignments()
+        .update_assignment(&active)
+        .await
+        .expect("first activated");
+
+    // Hand the same task to a second agent. The first tenure is released, not
+    // removed — this is what makes "Claude then Codex worked on TASK-1" a query.
+    let second = store
+        .assignments()
+        .create_assignment(&assignment("ASG-2", "TASK-1", "AGENT-2"))
+        .await
+        .expect("second assignment");
+
+    store
+        .assignments()
+        .release_assignment(
+            &AssignmentId::from_string("ASG-1"),
+            ReleaseReason::Reassigned,
+            first_active.state_version,
+        )
+        .await
+        .expect("first tenure released");
+
+    let history = store
+        .assignments()
+        .assignment_history(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("history");
+    assert_eq!(history.len(), 2, "both tenures are retained");
+    assert_eq!(
+        history[0].agent_id,
+        AgentId::from_string("AGENT-1"),
+        "oldest first"
+    );
+    assert_eq!(history[1].agent_id, AgentId::from_string("AGENT-2"));
+    assert!(second.status == AssignmentStatus::Proposed);
+}
+
+#[tokio::test]
+async fn two_active_assignments_for_one_task_are_rejected() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    store
+        .sessions()
+        .create_session(&session("SESS-1", "AGENT-1", "TASK-1"))
+        .await
+        .expect("session");
+
+    let first = store
+        .assignments()
+        .create_assignment(&assignment("ASG-1", "TASK-1", "AGENT-1"))
+        .await
+        .expect("first assignment");
+    let mut active = first;
+    active.activate(SessionId::from_string("SESS-1"));
+    store
+        .assignments()
+        .update_assignment(&active)
+        .await
+        .expect("activated");
+
+    // A second assignment for the same task is allowed while proposed...
+    let second = store
+        .assignments()
+        .create_assignment(&assignment("ASG-2", "TASK-1", "AGENT-1"))
+        .await
+        .expect("second assignment");
+    // ...but activating it must fail: the partial unique index fires.
+    store
+        .sessions()
+        .create_session(&session("SESS-2", "AGENT-1", "TASK-1"))
+        .await
+        .expect("second session");
+    let mut second_active = second;
+    second_active.activate(SessionId::from_string("SESS-2"));
+    let err = store
+        .assignments()
+        .update_assignment(&second_active)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintViolation(_)),
+        "got {err:?}"
+    );
+    // The sitting agent keeps the task — the failed write changed nothing.
+    assert_eq!(
+        store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("the active assignment")
+            .expect("there is one")
+            .id,
+        AssignmentId::from_string("ASG-1")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoints: superseded, never deleted.
+// ---------------------------------------------------------------------------
+
+fn checkpoint(id: &str, task: &str, next: &str) -> Checkpoint {
+    Checkpoint::new(
+        CheckpointId::from_string(id),
+        TaskId::from_string(task),
+        "Retries are idempotent.",
+        "Three of five call sites updated.",
+        next,
+    )
+}
+
+#[tokio::test]
+async fn creating_a_checkpoint_supersedes_the_previous_one_without_deleting_it() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    let first = store
+        .checkpoints()
+        .create_checkpoint(&checkpoint("CHK-1", "TASK-1", "update the last two sites"))
+        .await
+        .expect("first checkpoint");
+    assert_eq!(first.status, CheckpointStatus::Current);
+
+    // Creating a second current checkpoint for the same task must succeed, not
+    // conflict: the latest-for-task pointer moves rather than being unique.
+    store
+        .checkpoints()
+        .create_checkpoint(&checkpoint("CHK-2", "TASK-1", "run the retry suite"))
+        .await
+        .expect("second checkpoint");
+
+    // The latest-for-task pointer moved.
+    let latest = store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the latest checkpoint")
+        .expect("there is one");
+    assert_eq!(latest.id, CheckpointId::from_string("CHK-2"));
+    assert_eq!(latest.status, CheckpointStatus::Current);
+
+    // And the first one is retained, marked superseded.
+    let all = store
+        .checkpoints()
+        .checkpoints_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("all checkpoints");
+    assert_eq!(all.len(), 2, "the superseded checkpoint is retained");
+    assert_eq!(
+        all[0].id,
+        CheckpointId::from_string("CHK-2"),
+        "newest first"
+    );
+    assert_eq!(all[1].status, CheckpointStatus::Superseded);
+}
+
+#[tokio::test]
+async fn latest_checkpoint_is_none_before_any_checkpoint_exists() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    assert!(store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("no checkpoint yet")
+        .is_none());
+}
+
+#[tokio::test]
+async fn a_checkpoint_carries_its_test_results_and_decisions() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    let mut cp = checkpoint("CHK-1", "TASK-1", "run the retry suite");
+    cp.test_results = Some(TestResults {
+        passed: 18,
+        failed: 2,
+        skipped: 1,
+        failures: vec!["retry_budget_is_bounded".into()],
+        run_at: chrono::Utc::now(),
+    });
+    cp.important_decisions = vec![director_domain::ids::DecisionId::from_string("DEC-1")];
+    cp.current_assumptions = vec!["the retry budget is per-customer".into()];
+    cp.changed_files = vec!["src/retry.rs".into()];
+
+    let stored = store
+        .checkpoints()
+        .create_checkpoint(&cp)
+        .await
+        .expect("checkpoint stored");
+    assert_eq!(stored.changed_files, vec!["src/retry.rs"]);
+    assert_eq!(
+        stored.current_assumptions,
+        vec!["the retry budget is per-customer"]
+    );
+    assert_eq!(
+        stored.important_decisions,
+        vec![director_domain::ids::DecisionId::from_string("DEC-1")]
+    );
+    assert!(stored.test_results.is_some(), "test results round-trip");
+}
+
+// ---------------------------------------------------------------------------
+// Normalized project state.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn project_state_is_replaced_on_each_observation() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+
+    assert!(store
+        .project_state()
+        .get_project_state(&ProjectId::from_string("PROJ-1"))
+        .await
+        .expect("no state yet")
+        .is_none());
+
+    let first = StoredProjectState {
+        project_id: ProjectId::from_string("PROJ-1"),
+        repository_id: Some(RepositoryId::from_string("REPO-1")),
+        branch: Some("main".into()),
+        head_commit: "abc123".into(),
+        working_tree_clean: true,
+        observation_version: 1,
+        last_observed_at: chrono::Utc::now(),
+        state_version: 1,
+    };
+    store
+        .project_state()
+        .update_project_state(&first)
+        .await
+        .expect("first observation");
+
+    // A later observation replaces it — one row per project, not an append.
+    let mut second = first;
+    second.head_commit = "def456".into();
+    second.observation_version = 2;
+    let updated = store
+        .project_state()
+        .update_project_state(&second)
+        .await
+        .expect("second observation");
+    assert_eq!(updated.head_commit, "def456");
+
+    let held = store
+        .project_state()
+        .get_project_state(&ProjectId::from_string("PROJ-1"))
+        .await
+        .expect("current state")
+        .expect("there is one");
+    assert_eq!(held.head_commit, "def456");
+    assert_eq!(held.observation_version, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Provider sync: a pointer and a status, not a replica.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn provider_sync_records_the_last_attempt_and_its_outcome() {
+    let (store, _path) = store().await;
+
+    assert!(store
+        .provider_sync()
+        .last_sync("TASK-1", "handoff-mcp")
+        .await
+        .expect("no sync yet")
+        .is_none());
+
+    let attempt = ProviderSync {
+        entity_id: "TASK-1".into(),
+        provider: "handoff-mcp".into(),
+        external_id: Some("t-42".into()),
+        last_sync_at: chrono::Utc::now(),
+        last_success_at: None,
+        last_error: Some("connection refused".into()),
+        external_version: None,
+    };
+    store
+        .provider_sync()
+        .record_sync(&attempt)
+        .await
+        .expect("failed attempt recorded");
+
+    let recorded = store
+        .provider_sync()
+        .last_sync("TASK-1", "handoff-mcp")
+        .await
+        .expect("the last sync")
+        .expect("there is one");
+    assert_eq!(recorded.external_id, Some("t-42".into()));
+    assert_eq!(recorded.last_error, Some("connection refused".into()));
+
+    // A later success replaces the failure, keyed on the same (entity, provider).
+    let success = ProviderSync {
+        last_success_at: Some(chrono::Utc::now()),
+        last_error: None,
+        external_version: Some("0.35.1".into()),
+        ..attempt
+    };
+    store
+        .provider_sync()
+        .record_sync(&success)
+        .await
+        .expect("success recorded");
+    let after = store
+        .provider_sync()
+        .last_sync("TASK-1", "handoff-mcp")
+        .await
+        .expect("the last sync")
+        .expect("there is one");
+    assert!(after.last_error.is_none());
+    assert_eq!(after.external_version, Some("0.35.1".into()));
+}

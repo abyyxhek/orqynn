@@ -1,0 +1,27 @@
+[package]
+name = "director-store"
+description = "Director Brain's own persistent store: SQLite-backed repositories for Director-owned state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+director-domain = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# `bundled` compiles SQLite from source. This machine has no system SQLite and
+# no MSVC toolchain, so bundling with the WinLibs gcc is the deterministic path;
+# it also removes any ambient-library surprise from a machine to another.
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

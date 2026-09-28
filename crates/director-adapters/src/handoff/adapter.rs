@@ -748,7 +748,7 @@ mod tests {
     use std::collections::HashMap;
 
     use director_domain::agent::Harness;
-    use director_domain::ids::{MachineId, TaskId};
+    use director_domain::ids::{MachineId, ProjectId, TaskId};
 
     /// A fake substrate: a map from tool name to canned reply.
     ///
@@ -1278,6 +1278,7 @@ mod tests {
         let adapter = adapter("AGENT-1");
         let session = AgentSession::start(
             SessionId::from_string("ignored".to_string()),
+            Some(ProjectId::from_string("PROJ-test".to_string())),
             adapter.agent_identity(),
             MachineId::from_string("MACH-x".to_string()),
             Some(TaskId::from_string("AUTH-9".to_string())),
@@ -1306,6 +1307,7 @@ mod tests {
         let started = adapter
             .start_session(AgentSession::start(
                 SessionId::from_string("ignored".to_string()),
+                Some(ProjectId::from_string("PROJ-test".to_string())),
                 adapter.agent_identity(),
                 MachineId::from_string("MACH-x".to_string()),
                 None,
@@ -1333,6 +1335,7 @@ mod tests {
         let parent = adapter
             .start_session(AgentSession::start(
                 SessionId::from_string("ignored".to_string()),
+                Some(ProjectId::from_string("PROJ-test".to_string())),
                 adapter.agent_identity(),
                 MachineId::from_string("MACH-x".to_string()),
                 None,

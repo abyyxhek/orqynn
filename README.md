@@ -14,9 +14,10 @@ their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
-> **Status: Phases 1–3 complete.** The canonical domain model, the provider
-> trait boundary, and both substrate adapters are in place, with zero substrate
-> coupling and a passing test suite (209 tests).
+> **Status: Phases 1–3 and 5 complete.** The canonical domain model, the
+> provider trait boundary, both substrate adapters, and Director's own
+> persistent store are in place, with zero substrate coupling and a passing
+> test suite (268 tests).
 >
 > - **Phase 1** — the domain model and the seven provider traits it depends on,
 >   plus an in-memory implementor of every one of them.
@@ -28,10 +29,14 @@ crates. A boundary test in this repo enforces that — see
 >   ai-memory. Orqyn's long-term memory is now a substrate it reuses rather
 >   than reimplements: FTS5, entity, and graph retrieval with decay are already
 >   solved well there.
+> - **Phase 5** — `director-store`, a SQLite store for the entities no
+>   substrate has. Checkpoints, assignments, decisions, and verification
+>   results now survive a restart. The task table deliberately names no agent,
+>   and "at most one active assignment per task" is a partial unique index in
+>   the schema, not a convention. (There is no Phase 4; the roadmap skips it.)
 >
-> There is no MCP server of Orqyn's own, no persistence of Orqyn-owned
-> entities, and no loop yet — those are later phases, and their absence here is
-> deliberate.
+> There is no MCP server of Orqyn's own and no loop yet — those are later
+> phases, and their absence here is deliberate.
 
 ---
 
@@ -72,19 +77,22 @@ orqyn/
 ├── crates/
 │   ├── director-domain/     # The vocabulary: every entity, identity, status
 │   │                        # enum, and provider trait. Knows no substrate.
-│   └── director-adapters/   # InMemoryProvider (all traits, in-process),
-│                            # LocalExecutor (real command execution), the
-│                            # git observation layer, and the handoff-mcp
-│                            # adapter. The ONLY crate allowed to name a
-│                            # substrate.
+│   ├── director-adapters/   # InMemoryProvider (all traits, in-process),
+│   │                        # LocalExecutor (real command execution), the
+│   │                        # git observation layer, and the handoff-mcp
+│   │                        # adapter. The ONLY crate allowed to name a
+│   │                        # substrate.
+│   └── director-store/      # SQLite store for Orqyn's own entities. Owns
+│                            # its schema; depends only on director-domain.
 ├── docs/
-│   ├── PHASE0-FORENSICS.md    # Read-only audit of both upstream repos:
-│   │                          # data models, ~30 vs ~80 MCP tools, feature
-│   │                          # comparison, integration risks, boundary design.
-│   ├── PHASE1-DOMAIN.md       # The canonical model and the provider boundary.
-│   ├── PHASE2-OBSERVATION.md  # The git observation layer.
-│   └── PHASE2-ADAPTERS.md     # The substrate adapters: mapping, transport,
-│                              # HandoffAdapter, incl. live-testing findings.
+│   ├── PHASE0-FORENSICS.md  # Read-only audit of both upstream repos:
+│   │                        # data models, ~30 vs ~80 MCP tools, feature
+│   │                        # comparison, integration risks, boundary design.
+│   ├── PHASE1-DOMAIN.md     # The model and the boundary.
+│   ├── PHASE2-ADAPTERS.md   # The HandoffAdapter over handoff-mcp on stdio.
+│   ├── PHASE2-OBSERVATION.md # The git observation layer.
+│   ├── PHASE3-MEMORY.md     # The AiMemoryAdapter over ai-memory.
+│   └── PHASE5-STORE.md      # The SQLite store and the invariants it holds.
 ├── Cargo.toml               # Workspace manifest.
 ├── rust-toolchain.toml      # Pinned: stable-x86_64-pc-windows-gnu.
 └── THIRD_PARTY_LICENSES.md  # MIT notices for both substrates (© 2026 Fabio Akita).

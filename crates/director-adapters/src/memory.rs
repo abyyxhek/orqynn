@@ -598,6 +598,7 @@ mod tests {
         let rt = rt();
         let s1 = AgentSession::start(
             SessionId::from_string("SESS-1"),
+            Some(ProjectId::from_string("PROJ-1")),
             AgentId::from_string("AGENT-1"),
             MachineId::from_string("MACH-a"),
             Some(TaskId::from_string("AUTH-1")),

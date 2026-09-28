@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/director-domain",
     "crates/director-adapters",
+    "crates/director-store",
 ]
 
 [workspace.package]
@@ -17,6 +18,7 @@ authors = ["Orqyn contributors"]
 # Inter-crate dependencies.
 director-domain = { path = "crates/director-domain" }
 director-adapters = { path = "crates/director-adapters" }
+director-store = { path = "crates/director-store" }
 
 # Shared runtime + serialization.
 tokio = { version = "1", features = ["full"] }

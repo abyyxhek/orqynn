@@ -62,6 +62,7 @@ pub mod providers;
 pub mod repository;
 pub mod session;
 pub mod state;
+pub mod store;
 pub mod task;
 
 // Flat re-exports: callers write `director_domain::Task`, not
@@ -72,7 +73,9 @@ pub use agent::{Agent, AgentStatus, Harness, Machine};
 pub use assignment::{AgentAssignment, AssignmentStatus, ReleaseReason};
 pub use blocker::{Blocker, BlockerKind, BlockerStatus};
 pub use capability::Capability;
-pub use checkpoint::{Checkpoint, ContinuationPackage, ResumeStatus, CHECKPOINT_FORMAT_VERSION};
+pub use checkpoint::{
+    Checkpoint, CheckpointStatus, ContinuationPackage, ResumeStatus, CHECKPOINT_FORMAT_VERSION,
+};
 pub use context::{ContextSnapshot, RecentContext, DEFAULT_MAX_ACTIONS};
 pub use decision::{Decision, DecisionStatus};
 pub use handoff::{Handoff, HandoffError, HandoffState};
@@ -93,6 +96,15 @@ pub use state::{
     TestResults,
 };
 pub use task::{Complexity, ExpectedOutput, Priority, Subtask, Task, TaskStatus};
+
+// Director's own store boundary: the repository traits and their vocabulary.
+// Flat for the same reason as everything else — callers say `TaskRepository`,
+// not `store::TaskRepository`.
+pub use store::{
+    AgentRepository, AssignmentRepository, CheckpointRepository, ProjectRepository,
+    ProjectStateRepository, ProviderSync, ProviderSyncRepository, SessionRepository, Store,
+    StoreError, StoredProjectState, TaskRepository, TaskStatusTransition,
+};
 
 #[cfg(test)]
 mod boundary_tests {
@@ -226,6 +238,7 @@ mod boundary_tests {
         );
         let session = AgentSession::start(
             SessionId::from_string("SESS-1"),
+            Some(ProjectId::from_string("PROJ-x")),
             AgentId::from_string("AGENT-1"),
             MachineId::from_string("MACH-a"),
             Some(TaskId::from_string("AUTH-42")),

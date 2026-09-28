@@ -61,6 +61,17 @@ pub struct AgentAssignment {
     pub release_reason: Option<ReleaseReason>,
     /// Free-form note, e.g. "reassigned because schema changed".
     pub note: Option<String>,
+    /// Monotonic version for optimistic concurrency — see
+    /// [`crate::project::Project::state_version`]. An assignment moves through
+    /// `Proposed → Active → Released`, and each move bumps this.
+    #[serde(default = "default_state_version")]
+    pub state_version: u64,
+}
+
+/// The version a freshly persisted record starts on. One, not zero: a record
+/// that exists has been written once.
+fn default_state_version() -> u64 {
+    1
 }
 
 impl AgentAssignment {
@@ -76,6 +87,7 @@ impl AgentAssignment {
             released_at: None,
             release_reason: None,
             note: None,
+            state_version: default_state_version(),
         }
     }
 
@@ -83,6 +95,7 @@ impl AgentAssignment {
     pub fn activate(&mut self, session_id: SessionId) {
         self.session_id = Some(session_id);
         self.status = AssignmentStatus::Active;
+        self.state_version += 1;
     }
 
     /// End the assignment with a reason.
@@ -90,6 +103,13 @@ impl AgentAssignment {
         self.status = AssignmentStatus::Released;
         self.release_reason = Some(reason);
         self.released_at = Some(chrono::Utc::now());
+        self.state_version += 1;
+    }
+
+    /// Advance the optimistic-concurrency version without changing status. The
+    /// store calls this when only the note or session reference changed.
+    pub fn bump_state_version(&mut self) {
+        self.state_version += 1;
     }
 
     /// True if this assignment is still in force.
@@ -192,5 +212,38 @@ mod tests {
         let json = serde_json::to_string(&a).unwrap();
         let back: AgentAssignment = serde_json::from_str(&json).unwrap();
         assert_eq!(a, back);
+    }
+
+    #[test]
+    fn each_lifecycle_step_advances_the_version() {
+        // Proposed = 1, Active = 2, Released = 3. A reader that saw version 2
+        // and writes against it must conflict with the release.
+        let mut a = AgentAssignment::propose(
+            AssignmentId::from_string("ASG-1"),
+            task(),
+            AgentId::from_string("AGENT-claude"),
+        );
+        assert_eq!(a.state_version, 1);
+        a.activate(SessionId::from_string("SESS-1"));
+        assert_eq!(a.state_version, 2);
+        a.release(ReleaseReason::AgentCrashed);
+        assert_eq!(a.state_version, 3);
+    }
+
+    #[test]
+    fn a_pre_phase4_assignment_payload_still_deserializes() {
+        let legacy = serde_json::json!({
+            "id": "ASG-1",
+            "task_id": "AUTH-42",
+            "agent_id": "AGENT-claude",
+            "session_id": null,
+            "status": "proposed",
+            "assigned_at": "2026-01-01T00:00:00Z",
+            "released_at": null,
+            "release_reason": null,
+            "note": null
+        });
+        let parsed: AgentAssignment = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.state_version, 1);
     }
 }

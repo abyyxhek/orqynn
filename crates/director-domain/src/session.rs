@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, MachineId, SessionId, TaskId};
+use crate::ids::{AgentId, MachineId, ProjectId, SessionId, TaskId};
 
 /// How a session ended, if it did. This is what tells recovery (Phase 11)
 /// whether it is recovering from a clean close or a disappearance.
@@ -58,6 +58,12 @@ impl SessionStatus {
 pub struct AgentSession {
     /// This session's identifier.
     pub id: SessionId,
+    /// The project this session worked in, once Director has scoped it. `None`
+    /// for a session imported from a substrate that carries no Director
+    /// project; Director's own store requires one at write time and rejects the
+    /// alternative rather than inventing a project.
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
     /// The agent running it.
     pub agent_id: AgentId,
     /// The machine it ran on.
@@ -71,6 +77,12 @@ pub struct AgentSession {
     /// If this session was forked from another, its parent. Mirrors
     /// handoff-mcp's `parent_session_id` lineage.
     pub parent_session_id: Option<SessionId>,
+    /// The branch the session had checked out, when Director knew it.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// The commit `HEAD` pointed at during the session, when Director knew it.
+    #[serde(default)]
+    pub commit_sha: Option<String>,
     /// When the session began.
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// When it ended, if it has.
@@ -80,27 +92,50 @@ pub struct AgentSession {
     /// Working directory the session ran in, so Director can tell a primary
     /// checkout from a worktree.
     pub workdir: Option<String>,
+    /// When Director last heard from the session.
+    #[serde(default)]
+    pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
+    /// Monotonic version for optimistic concurrency — see
+    /// [`crate::project::Project::state_version`].
+    #[serde(default = "default_state_version")]
+    pub state_version: u64,
+}
+
+/// The version a freshly persisted record starts on. One, not zero: a record
+/// that exists has been written once.
+fn default_state_version() -> u64 {
+    1
 }
 
 impl AgentSession {
     /// Start a new live session.
+    ///
+    /// `project_id` is optional at this layer because a session mapped out of a
+    /// substrate carries no Director project; Director's own store requires one
+    /// at write time. Callers that know the project pass `Some`.
     pub fn start(
         id: SessionId,
+        project_id: Option<ProjectId>,
         agent_id: AgentId,
         machine_id: MachineId,
         task_id: Option<TaskId>,
     ) -> Self {
         AgentSession {
             id,
+            project_id,
             agent_id,
             machine_id,
             task_id,
             status: SessionStatus::Active,
             parent_session_id: None,
+            branch: None,
+            commit_sha: None,
             started_at: chrono::Utc::now(),
             ended_at: None,
             end: None,
             workdir: None,
+            last_seen: None,
+            state_version: default_state_version(),
         }
     }
 
@@ -108,12 +143,14 @@ impl AgentSession {
     pub fn fork(&self, new_id: SessionId) -> AgentSession {
         let mut child = AgentSession::start(
             new_id,
+            self.project_id.clone(),
             self.agent_id.clone(),
             self.machine_id.clone(),
             self.task_id.clone(),
         );
         child.parent_session_id = Some(self.id.clone());
         child.workdir = self.workdir.clone();
+        child.branch = self.branch.clone();
         child
     }
 
@@ -122,6 +159,13 @@ impl AgentSession {
         self.status = SessionStatus::Closed;
         self.end = Some(end);
         self.ended_at = Some(chrono::Utc::now());
+    }
+
+    /// Advance the optimistic-concurrency version. The store calls this on a
+    /// successful update.
+    pub fn bump_state_version(&mut self) {
+        self.state_version += 1;
+        self.last_seen = Some(chrono::Utc::now());
     }
 
     /// True if this session ended without a clean close — the signal that
@@ -141,6 +185,7 @@ mod tests {
     fn session() -> AgentSession {
         AgentSession::start(
             SessionId::from_string("SESS-1"),
+            Some(ProjectId::from_string("PROJ-1")),
             AgentId::from_string("AGENT-1"),
             MachineId::from_string("MACH-a"),
             Some(TaskId::from_string("AUTH-42")),

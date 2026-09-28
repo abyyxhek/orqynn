@@ -463,8 +463,12 @@ pub fn session_from_wire(summary: &crate::handoff::wire::SessionSummary) -> Agen
         .agent_id
         .clone()
         .unwrap_or_else(|| unknown_agent_id().to_string());
+    // The substrate's session records carry no Director project. Rather than
+    // invent one, the session is mapped unscoped; whoever persists it supplies
+    // the project — or the store rejects it.
     let mut session = AgentSession::start(
         SessionId::from_string(summary.id.clone()),
+        None,
         AgentId::from_string(agent_id),
         MachineId::from_string(machine_id_for(
             summary.worktree.as_deref().unwrap_or("unknown"),

@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capability::Capability;
-use crate::ids::{SubtaskId, TaskId};
+use crate::ids::{ProjectId, SubtaskId, TaskId};
 
 /// Scheduling priority. Lower `rank()` sorts earlier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -175,10 +175,20 @@ pub struct ExpectedOutput {
 pub struct Task {
     /// Stable, agent-independent identifier.
     pub id: TaskId,
+    /// The project this task belongs to. `None` for a task Director has seen in
+    /// a substrate but not yet claimed for a project; Director's own store
+    /// requires one at write time and rejects the alternative rather than
+    /// inventing a project.
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
     /// Short human-facing label.
     pub title: String,
     /// What "done" means, in the agent's terms.
     pub objective: String,
+    /// Longer prose: context, rationale, links. Distinct from `objective`,
+    /// which is the acceptance contract; this is the narrative around it.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Observable criteria for completion. Empty is legal but produces a task
     /// that can never be verified — the planner (Phase 7) must fill this in.
     pub expected_outputs: Vec<ExpectedOutput>,
@@ -197,10 +207,24 @@ pub struct Task {
     pub required_capabilities: Vec<Capability>,
     /// Decomposition for larger tasks.
     pub subtasks: Vec<Subtask>,
+    /// Monotonic version for optimistic concurrency — see
+    /// [`crate::project::Project::state_version`]. Bumped by the store on a
+    /// successful update; two writers who both read version *n* cannot both
+    /// write *n+1*.
+    #[serde(default = "default_state_version")]
+    pub state_version: u64,
     /// When Director first recorded the task.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// When the task last changed.
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The version a freshly persisted record starts on. One, not zero: a record
+/// that exists has been written once. Shared with
+/// [`crate::project::Project::state_version`] so every mutable entity starts
+/// from the same baseline.
+fn default_state_version() -> u64 {
+    1
 }
 
 impl Task {
@@ -209,8 +233,10 @@ impl Task {
         let now = chrono::Utc::now();
         Task {
             id,
+            project_id: None,
             title: title.into(),
             objective: objective.into(),
+            description: None,
             expected_outputs: vec![],
             status: TaskStatus::Backlog,
             priority: None,
@@ -219,9 +245,24 @@ impl Task {
             scope_paths: vec![],
             required_capabilities: vec![],
             subtasks: vec![],
+            state_version: default_state_version(),
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// Create a task that belongs to `project_id`. The shape the store expects;
+    /// [`Task::new`] leaves the project unset for callers that only need an
+    /// unconstrained task.
+    pub fn for_project(
+        project_id: ProjectId,
+        id: TaskId,
+        title: impl Into<String>,
+        objective: impl Into<String>,
+    ) -> Self {
+        let mut task = Task::new(id, title, objective);
+        task.project_id = Some(project_id);
+        task
     }
 
     /// Whether every dependency has completed successfully.
@@ -269,6 +310,13 @@ impl Task {
     /// Record a change, stamping `updated_at`.
     pub fn touch(&mut self) {
         self.updated_at = chrono::Utc::now();
+    }
+
+    /// Advance the optimistic-concurrency version and stamp the time. The store
+    /// calls this on a successful update; callers never bump by hand.
+    pub fn bump_state_version(&mut self) {
+        self.state_version += 1;
+        self.touch();
     }
 }
 
@@ -422,5 +470,57 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         let back: Task = serde_json::from_str(&json).unwrap();
         assert_eq!(t, back);
+    }
+
+    #[test]
+    fn a_new_task_starts_at_version_one_with_no_project() {
+        let t = Task::new(TaskId::from_string("AUTH-42"), "Auth", "Build login");
+        assert_eq!(t.state_version, 1);
+        assert!(t.project_id.is_none());
+        assert!(t.description.is_none());
+    }
+
+    #[test]
+    fn a_task_can_be_scoped_to_a_project() {
+        let t = Task::for_project(
+            ProjectId::from_string("PROJ-1"),
+            TaskId::from_string("AUTH-42"),
+            "Auth",
+            "Build login",
+        );
+        assert_eq!(t.project_id.as_ref().map(|id| id.as_str()), Some("PROJ-1"));
+    }
+
+    #[test]
+    fn bumping_the_task_version_advances_it_by_one() {
+        let mut t = Task::new(TaskId::from_string("AUTH-42"), "Auth", "Build login");
+        t.bump_state_version();
+        t.bump_state_version();
+        assert_eq!(t.state_version, 3);
+    }
+
+    #[test]
+    fn a_pre_phase4_task_payload_still_deserializes() {
+        // A payload written before Phase 4 has none of the new fields. All three
+        // default, so an old task record still reads.
+        let legacy = serde_json::json!({
+            "id": "AUTH-42",
+            "title": "Auth",
+            "objective": "Build login",
+            "expected_outputs": [],
+            "status": "backlog",
+            "priority": null,
+            "complexity": "unknown",
+            "dependencies": [],
+            "scope_paths": [],
+            "required_capabilities": [],
+            "subtasks": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let parsed: Task = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.state_version, 1);
+        assert!(parsed.project_id.is_none());
+        assert!(parsed.description.is_none());
     }
 }

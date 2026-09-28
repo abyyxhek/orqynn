@@ -67,6 +67,26 @@ pub struct Checkpoint {
 
     /// Format version of the checkpoint payload.
     pub context_version: u32,
+    /// The project's state version when the checkpoint was taken, if known.
+    /// Pairs with [`Checkpoint::task_state_version`] to answer "was the world
+    /// this checkpoint describes still the world when it is read".
+    #[serde(default)]
+    pub project_state_version: Option<u64>,
+    /// The task's state version when the checkpoint was taken, if known. If the
+    /// task has since moved on, the checkpoint describes work that is no longer
+    /// the current effort, and a reader must reconcile rather than apply.
+    #[serde(default)]
+    pub task_state_version: Option<u64>,
+    /// Where this checkpoint sits in the task's recovery lineage. Only the
+    /// latest checkpoint for a task is [`CheckpointStatus::Current`]; earlier
+    /// ones are retained, never deleted, so the task's recovery history stays
+    /// answerable.
+    #[serde(default)]
+    pub status: CheckpointStatus,
+    /// Monotonic version for optimistic concurrency — see
+    /// [`crate::project::Project::state_version`].
+    #[serde(default = "default_state_version")]
+    pub state_version: u64,
     /// When the checkpoint was taken.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Agent and session that produced the checkpoint, for attribution only —
@@ -74,6 +94,28 @@ pub struct Checkpoint {
     pub created_by_agent: Option<crate::ids::AgentId>,
     /// The session that produced it, for attribution only.
     pub created_by_session: Option<crate::ids::SessionId>,
+}
+
+/// Where a checkpoint sits in a task's recovery lineage.
+///
+/// Defaults to [`CheckpointStatus::Current`]: a payload written before Phase 4
+/// predates the notion of supersession, so it was the latest checkpoint for its
+/// task when it was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointStatus {
+    /// The newest checkpoint for its task. The one a resume uses.
+    #[default]
+    Current,
+    /// Superseded by a newer checkpoint for the same task. Retained for
+    /// history; not used for recovery.
+    Superseded,
+}
+
+/// The version a freshly persisted record starts on. One, not zero: a record
+/// that exists has been written once.
+fn default_state_version() -> u64 {
+    1
 }
 
 impl Checkpoint {
@@ -101,10 +143,22 @@ impl Checkpoint {
             current_assumptions: vec![],
             next_action: next_action.into(),
             context_version: CHECKPOINT_FORMAT_VERSION,
+            project_state_version: None,
+            task_state_version: None,
+            status: CheckpointStatus::Current,
+            state_version: default_state_version(),
             created_at: chrono::Utc::now(),
             created_by_agent: None,
             created_by_session: None,
         }
+    }
+
+    /// Mark this checkpoint as no longer the latest for its task. A new
+    /// checkpoint supersedes the previous one rather than replacing it, so the
+    /// recovery history stays intact.
+    pub fn supersede(&mut self) {
+        self.status = CheckpointStatus::Superseded;
+        self.state_version += 1;
     }
 
     /// Whether the checkpoint records the same commit as observed state.
@@ -401,5 +455,65 @@ mod tests {
         let back: Checkpoint = serde_json::from_str(&json).unwrap();
         assert_eq!(cp, back);
         assert_eq!(back.context_version, CHECKPOINT_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn a_new_checkpoint_is_current_at_version_one() {
+        let cp = Checkpoint::new(
+            CheckpointId::from_string("CHK-1"),
+            TaskId::from_string("AUTH-42"),
+            "auth",
+            "p",
+            "n",
+        );
+        assert_eq!(cp.status, CheckpointStatus::Current);
+        assert_eq!(cp.state_version, 1);
+        assert!(cp.project_state_version.is_none());
+        assert!(cp.task_state_version.is_none());
+    }
+
+    #[test]
+    fn superseding_a_checkpoint_marks_it_and_advances_the_version() {
+        let mut cp = Checkpoint::new(
+            CheckpointId::from_string("CHK-1"),
+            TaskId::from_string("AUTH-42"),
+            "auth",
+            "p",
+            "n",
+        );
+        assert_eq!(cp.status, CheckpointStatus::Current);
+        cp.supersede();
+        assert_eq!(cp.status, CheckpointStatus::Superseded);
+        assert_eq!(cp.state_version, 2);
+    }
+
+    #[test]
+    fn a_pre_phase4_checkpoint_payload_still_deserializes() {
+        // A payload written before Phase 4 has none of the new fields. All four
+        // default, so an old checkpoint still reads.
+        let legacy = serde_json::json!({
+            "id": "CHK-1",
+            "task_id": "AUTH-42",
+            "objective": "auth",
+            "progress": "p",
+            "progress_fraction": 0.0,
+            "branch": null,
+            "commit_sha": null,
+            "changed_files": [],
+            "test_results": null,
+            "current_blocker": null,
+            "important_decisions": [],
+            "current_assumptions": [],
+            "next_action": "n",
+            "context_version": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+            "created_by_agent": null,
+            "created_by_session": null
+        });
+        let parsed: Checkpoint = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.state_version, 1);
+        assert_eq!(parsed.status, CheckpointStatus::Current);
+        assert!(parsed.project_state_version.is_none());
+        assert!(parsed.task_state_version.is_none());
     }
 }

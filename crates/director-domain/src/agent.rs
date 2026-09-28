@@ -122,10 +122,33 @@ pub struct Agent {
     /// assignment record; this is a denormalized view for fast lookups and is
     /// reconciled by the assignment service.
     pub current_task: Option<TaskId>,
+    /// The substrate that hosts this agent's registry, when known — e.g.
+    /// `handoff-mcp`. Recorded so Director can tell which provider a record
+    /// came from; the provider's own internals are never stored here.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Free-form attribution metadata the provider surfaced, e.g. a vendor
+    /// display tier. Never used for decisions; stored for reporting.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    /// Monotonic version for optimistic concurrency — see
+    /// [`crate::project::Project::state_version`].
+    #[serde(default = "default_state_version")]
+    pub state_version: u64,
     /// When Director first registered the agent.
     pub registered_at: chrono::DateTime<chrono::Utc>,
     /// When Director last heard from the agent.
     pub last_seen: chrono::DateTime<chrono::Utc>,
+    /// When this record last changed. Separate from `last_seen`: a heartbeat
+    /// moves `last_seen`, while `updated_at` moves on any write.
+    #[serde(default)]
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The version a freshly persisted record starts on. One, not zero: a record
+/// that exists has been written once.
+fn default_state_version() -> u64 {
+    1
 }
 
 impl Agent {
@@ -147,8 +170,12 @@ impl Agent {
             machine,
             status: AgentStatus::Available,
             current_task: None,
+            provider: None,
+            metadata: serde_json::Value::Null,
+            state_version: default_state_version(),
             registered_at: now,
             last_seen: now,
+            updated_at: None,
         }
     }
 
@@ -167,6 +194,13 @@ impl Agent {
         let previous = self.last_seen;
         self.last_seen = chrono::Utc::now();
         previous
+    }
+
+    /// Advance the optimistic-concurrency version and stamp `updated_at`. The
+    /// store calls this on a successful update.
+    pub fn bump_state_version(&mut self) {
+        self.state_version += 1;
+        self.updated_at = Some(chrono::Utc::now());
     }
 
     /// Derive status from heartbeat age.
