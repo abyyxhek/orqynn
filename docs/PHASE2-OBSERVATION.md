@@ -1,20 +1,20 @@
-# Phase 2 — Git Observation: Director's Own Source of Truth
+# Phase 2 — Git Observation: Orqyn's Own Source of Truth
 
-> Director Brain · Phase 2 deliverable (observation half)
+> Orqyn · Phase 2 deliverable (observation half)
 > Date: 2026-09-25
 > Scope: `director-domain::repository`, `director-adapters::git`. No MCP server,
 > no substrate connection, no loop.
 
 ## Goal
 
-Give Director an **independent** way to learn what happened in a working tree —
+Give Orqyn an **independent** way to learn what happened in a working tree —
 one that does not depend on any agent reporting correctly, and does not depend
 on either substrate.
 
 Phase 1's second invariant is that nothing self-reports completion: `TaskStatus::Done`
-is unreachable from an agent's report, and only Director's own verification
-engine can set it. That invariant is a promise about the model until Director
-has eyes of its own. Phase 2's observation half builds those eyes: Director
+is unreachable from an agent's report, and only Orqyn's own verification
+engine can set it. That invariant is a promise about the model until Orqyn
+has eyes of its own. Phase 2's observation half builds those eyes: Orqyn
 reads git itself, records what it saw, and can later compare a claim against
 the repository rather than against another report.
 
@@ -32,7 +32,7 @@ Phase 2 separates them:
 | Type | Question it answers | Persists? |
 |---|---|---|
 | `GitObserver` | What happened in git? | No |
-| `RepositoryStore` | What has Director recorded? | Yes (JSON) |
+| `RepositoryStore` | What has Orqyn recorded? | Yes (JSON) |
 | `GitService` | What does this mean for project state? | Yes, via the store |
 
 `GitObserver` is stateless — every call opens the repository afresh, which is
@@ -46,7 +46,7 @@ important.
 
 ## The decision worth writing down: git is a tool, not a substrate
 
-Phase 0's boundary says Director talks to handoff-mcp and ai-memory
+Phase 0's boundary says Orqyn talks to handoff-mcp and ai-memory
 *exclusively over MCP*, and Phase 1's boundary test fails the build if anything
 outside `director-adapters` names either one. The observation layer depends on
 `git2`, which is neither substrate, and the test permits it.
@@ -54,18 +54,18 @@ outside `director-adapters` names either one. The observation layer depends on
 The distinction is not "git2 is fine because it is not in the list". It is:
 
 - A **substrate** is an external system with its own data model that
-  competes with Director's. Coupling to it means inheriting its semantics —
+  competes with Orqyn's. Coupling to it means inheriting its semantics —
   handoff-mcp's self-reported `done` is the whole reason Phase 1 exists. So
-  Director speaks to substrates over a process boundary and translates through
+  Orqyn speaks to substrates over a process boundary and translates through
   the wire/mapping layers.
-- **git** is a tool Director reads, like `std::process`. Linking a git library
+- **git** is a tool Orqyn reads, like `std::process`. Linking a git library
   imports a data format, not a competing model of tasks or agents. The same
-  reasoning covers `LocalExecutor`: running a command is tool use, and Director
+  reasoning covers `LocalExecutor`: running a command is tool use, and Orqyn
   reads the exit code itself.
 
 The test's rule is therefore *no coupling to a competing model*, not *no
 dependencies at all*. Git is also the substrate-independent ground truth: it is
-the one thing Director can inspect that neither substrate controls.
+the one thing Orqyn can inspect that neither substrate controls.
 
 ## What was built
 
@@ -79,7 +79,7 @@ The adapter owns the git2 handle; the domain owns the shape of the answer.
   branch (`None` under detached HEAD), current and last-observed commit, and a
   monotonic observation version.
 - **`WorktreeState`** — git's flat `(xy-code, path)` status report bucketed
-  into the categories Director reasons about: modified, added, deleted,
+  into the categories Orqyn reasons about: modified, added, deleted,
   renamed, copied, untracked. Nothing is lost in normalization — every entry
   keeps its git-reported kind, and renames keep both paths. `clean` is
   **derived** from the buckets rather than passed in, so it can never disagree
@@ -89,7 +89,7 @@ The adapter owns the git2 handle; the domain owns the shape of the answer.
   `WorktreeChanged`, and `has_important_change` is what a later loop will key
   on. Distinct from `state::StateComparison`, which compares a *checkpoint*
   against observed state to decide whether a resume is safe.
-- **`ObservationEvent`** — one fact Director learned, with a typed `EventData`
+- **`ObservationEvent`** — one fact Orqyn learned, with a typed `EventData`
   payload (kept structured rather than a free `Value` so consumers match on it
   without re-parsing) and a `source` field. Git is the only source this phase;
   filesystem and verification sources can join later without changing the
@@ -116,7 +116,7 @@ detection, remote URL, default branch, recent commits, commit-range walk, diff
 contents. `open()` validates the path and then checks the opened repository's
 working directory **back** against the requested path, because
 `Repository::open` searches upward — a caller pointing at a subdirectory must
-not have Director silently observe a repository rooted above it.
+not have Orqyn silently observe a repository rooted above it.
 
 Two consequences of the implementation choice:
 
@@ -178,7 +178,7 @@ as another distinct constant, so it can never collide with a real blob either.
 
 1. `open()` validates and canonicalizes the path, then confirms the opened
    repository is rooted exactly there.
-2. Read branch, HEAD commit, worktree state, and — for a repository Director
+2. Read branch, HEAD commit, worktree state, and — for a repository Orqyn
    has seen before — the previous snapshot from the store.
 3. Walk the commit range from the previous anchor to HEAD, oldest first (the
    order they happened, which is the order events are emitted in). If the
@@ -199,10 +199,10 @@ payloads written by Phase 1 still deserialize. The fields carry the comments
 explaining why each defaults.
 
 The widening carries one rule with it: **a commit message is evidence, not
-verified truth.** Director records it; no task is ever completed because a
+verified truth.** Orqyn records it; no task is ever completed because a
 message says "done". This is the same invariant as `Done` being unreachable by
 agent report, extended to the repository — a commit titled `fix: done` is a
-fact Director observed, not a conclusion it reached.
+fact Orqyn observed, not a conclusion it reached.
 
 ## Definition of done — status
 
@@ -253,10 +253,10 @@ the observation layer back up.
   provider traits yet.
 - **No semantic interpretation.** A commit is a commit; whether it satisfies an
   acceptance criterion is a later question.
-- **No writes to git, ever.** Director does not commit, push, branch, or merge
+- **No writes to git, ever.** Orqyn does not commit, push, branch, or merge
   on an observed repository. Read-only is a property of the type: there is no
   method to call.
-- **No persistence of Director's own state.** The JSON store holds *observed
+- **No persistence of Orqyn's own state.** The JSON store holds *observed
   repository state* — a cache for change detection. Checkpoints, plans,
   decisions, and verifications remain Phase 5.
 - **No event retention policy.** Events accumulate without bound. Pruning by

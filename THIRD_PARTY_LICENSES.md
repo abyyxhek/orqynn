@@ -1,16 +1,16 @@
 # Third-Party Licenses
 
-Director Brain is MIT-licensed. It communicates, as separate and independent
+Orqyn is MIT-licensed. It communicates, as separate and independent
 works, with two upstream open-source projects over the Model Context Protocol.
 Neither project's source is included in, linked into, or derived from by this
 repository; both are run as separate processes.
 
-## director-brain
+## orqyn
 
 ```
 MIT License
 
-Copyright (c) 2026 Director Brain contributors
+Copyright (c) 2026 Orqyn contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -33,7 +33,7 @@ SOFTWARE.
 
 ## ai-memory (akitaonrails/ai-memory) — v2.4.0
 
-Used as the **memory and retrieval substrate**. Director consumes its
+Used as the **memory and retrieval substrate**. Orqyn consumes its
 `memory_*` MCP tools (wiki read/write, FTS5/vector retrieval, handoff records,
 hook-captured observations). No source from ai-memory is copied or linked; it
 is run as a separate server process and spoken to over MCP.
@@ -64,12 +64,12 @@ SOFTWARE.
 
 ## handoff-mcp (alphaelements/handoff-mcp) — v0.35.1
 
-Used as the **task, session, and agent substrate**. Director consumes its
+Used as the **task, session, and agent substrate**. Orqyn consumes its
 `handoff_*` MCP tools (task CRUD, dependencies, agent registry with heartbeat,
 claim leases, session state machine). No source from handoff-mcp is copied or
 linked; it is run as a separate stdio MCP server per project and spoken to over
 MCP. Its Claude/Codex skills and JS workflow libraries are deliberately **not**
-installed — Director replaces the task loop with its own harness-agnostic
+installed — Orqyn replaces the task loop with its own harness-agnostic
 equivalent (Phase 9).
 
 ```
@@ -100,6 +100,6 @@ SOFTWARE.
 
 Both upstream projects are © 2026 Fabio Akita and are MIT-licensed, as recorded
 in their respective repositories at the versions audited in
-`docs/PHASE0-FORENSICS.md`. Director Brain is an independent work that
+`docs/PHASE0-FORENSICS.md`. Orqyn is an independent work that
 interoperates with them over MCP; it is not a derivative of either project's
 source code.

@@ -1,9 +1,9 @@
 # Phase 2 — Substrate Adapters and the Git Observation Layer
 
-> Director Brain · Phase 2 deliverable
+> Orqyn · Phase 2 deliverable
 > Date: 2026-09-25
-> Scope: `director-adapters` only. No loop, no persistence of Director-owned
-> entities, no MCP server of Director's own.
+> Scope: `director-adapters` only. No loop, no persistence of Orqyn-owned
+> entities, no MCP server of Orqyn's own.
 
 ## Goal
 
@@ -11,7 +11,7 @@ Make Phase 1's trait boundary real against something that is not a `HashMap`.
 
 Phase 1 ended with seven provider traits and one in-memory implementor, which
 proves the core is substrate-independent and nothing else. Phase 2 wires
-Director to the two things it can actually reach — a real substrate over MCP,
+Orqyn to the two things it can actually reach — a real substrate over MCP,
 and a real git repository — and proves the boundary holds under that wiring.
 
 The phase has two independent halves, and they are different in kind:
@@ -20,8 +20,8 @@ The phase has two independent halves, and they are different in kind:
   stdio JSON-RPC, where every interaction crosses a process boundary and every
   vocabulary mismatch has to be translated deliberately.
 - **The git half** is an *observation layer*: git2-backed reading of a working
-  tree, plus a file-backed store for what Director has recorded about it. Git is
-  a tool Director reads, not a substrate Director negotiates with, so this half
+  tree, plus a file-backed store for what Orqyn has recorded about it. Git is
+  a tool Orqyn reads, not a substrate Orqyn negotiates with, so this half
   never crosses the MCP boundary at all.
 
 ## The handoff half
@@ -31,7 +31,7 @@ Four modules in `crates/director-adapters/src/handoff/`, each with one job:
 | Module | Job |
 |---|---|
 | `wire` | Serde mirrors of handoff-mcp's JSON shapes. Deliberately *not* the domain types and unable to become them, so every schema difference is visible in one place. |
-| `transport` | A stdio JSON-RPC 2.0 client. Spawns `handoff-mcp` as a child and speaks line-delimited JSON over stdin/stdout. Director never links the substrate's code. |
+| `transport` | A stdio JSON-RPC 2.0 client. Spawns `handoff-mcp` as a child and speaks line-delimited JSON over stdin/stdout. Orqyn never links the substrate's code. |
 | `mapping` | Bidirectional translation between the two models, and the record of every place they are not isomorphic. |
 | `adapter` | [`HandoffAdapter`] — `TaskProvider`, `AgentProvider`, and `SessionProvider` made real by composing the three above, plus the state none of them can carry. |
 
@@ -42,13 +42,13 @@ Four modules in `crates/director-adapters/src/handoff/`, each with one job:
 The two task models are not isomorphic, and three vocabularies do not line up.
 Each is handled explicitly rather than coerced:
 
-1. **Status.** The substrate has 6 states; Director has 8. Director-only states
+1. **Status.** The substrate has 6 states; Orqyn has 8. Orqyn-only states
    fall back to the nearest state the substrate can express.
-2. **Priority.** The substrate has `low`/`medium`/`high`; Director adds
+2. **Priority.** The substrate has `low`/`medium`/`high`; Orqyn adds
    `Critical`, which maps down to `high`.
 3. **`done`.** The load-bearing one. handoff-mcp's `done` is an agent
    self-report — Phase 0 finding R6: `handoff_check_criterion` is a checkbox an
-   agent ticks. A substrate `done` therefore never becomes Director `Done`; it
+   agent ticks. A substrate `done` therefore never becomes Orqyn `Done`; it
    becomes `VerificationPending`, because nothing verified it.
 
 That third rule is the acceptance criterion — *agent claims done, tests fail →
@@ -59,7 +59,7 @@ loop. It is the reason the adapter exists as a layer rather than as a set of
 ### What the `extra` channel turned out to be worth
 
 `TaskData.extra` is a genuine `#[serde(flatten)]` map inside the substrate's
-storage layer, so it was natural to plan on stashing Director-only state there:
+storage layer, so it was natural to plan on stashing Orqyn-only state there:
 `Backlog`/`Failed`/`Cancelled`, `Critical`, capabilities, complexity, and the
 `director_verified` marker that would let a `done` be trusted.
 
@@ -70,14 +70,14 @@ the channel is closed at the MCP boundary in **both** directions:
   never serialized onto the wire.
 - **Writes.** `handoff_update_task` reconstructs the record from named fields. A
   *create* starts from an empty map; an *update* copies only known fields. In
-  neither case does anything Director sends in `extra` reach the file.
+  neither case does anything Orqyn sends in `extra` reach the file.
 
-So a Director-only status and a `Critical` priority do **not** survive a
+So a Orqyn-only status and a `Critical` priority do **not** survive a
 substrate round trip. The write path still populates `extra` — it is the right
 shape if the substrate ever exposes the field, and it costs nothing — but
 nothing depends on it. What the boundary *can* rely on is the **trusted-done
-set**: the ids Director itself moved to `Done`, kept by the adapter and handed
-to the mapping on every read. Because only Director's own writes can add to it,
+set**: the ids Orqyn itself moved to `Done`, kept by the adapter and handed
+to the mapping on every read. Because only Orqyn's own writes can add to it,
 an agent cannot promote a task by writing `done`.
 
 This is why the adapter is generic over a [`HandoffWire`]` trait with one method:
@@ -92,20 +92,20 @@ replies.
 
 ### Write-path repairs
 
-Two substrate rules would reject Director's writes outright, so the adapter
+Two substrate rules would reject Orqyn's writes outright, so the adapter
 addresses them at the boundary instead of working around them at call sites:
 
 - **Criteria must be checked to reach `done`.** The substrate bails on an
-  unchecked criterion. Director reaches `Done` only through its own
-  verification, so the adapter ticks the criteria when it writes a Director
+  unchecked criterion. Orqyn reaches `Done` only through its own
+  verification, so the adapter ticks the criteria when it writes a Orqyn
   completion — recording a verdict, not rubber-stamping a claim, because an
   agent's report never reaches that path.
 - **Estimates are required.** `require_estimate_hours` defaults on and rejects
   any `in_progress`/`review`/`done` write without `schedule.estimate_hours` —
-  which covers almost every status Director writes, since
-  `VerificationPending` maps to `in_progress`. Director never writes an
+  which covers almost every status Orqyn writes, since
+  `VerificationPending` maps to `in_progress`. Orqyn never writes an
   estimate: inventing hours would corrupt the substrate's metrics. Instead the
-  adapter disables the setting in Director's own integration project at setup.
+  adapter disables the setting in Orqyn's own integration project at setup.
 
 ### Identity is process-global
 
@@ -121,10 +121,10 @@ cannot be. The pool that manages several identities is Phase 8.
 
 The ordering of `env`/`env_remove` in `McpTransport::spawn` is load-bearing for
 exactly this reason and is not obvious: `Command` applies removals after sets,
-so clearing the ambient variable must happen *before* setting Director's, or the
-removal also deletes the value Director set. Live testing caught this; the
+so clearing the ambient variable must happen *before* setting Orqyn's, or the
+removal also deletes the value Orqyn set. Live testing caught this; the
 symptom was the substrate registering agents under a generated timestamp id
-instead of Director's.
+instead of Orqyn's.
 
 ### Where the substrate has no answer
 
@@ -132,10 +132,10 @@ The adapter says so instead of approximating:
 
 - `set_agent_status` — the substrate derives status from heartbeat age on every
   read, so there is nothing to write. An operator taking an agent offline is a
-  Director-owned fact for Director's own store (Phase 5).
+  Orqyn-owned fact for Orqyn's own store (Phase 5).
 - `HandoffProvider`, `MemoryProvider`, `ProjectStateProvider`,
   `ExecutionProvider` — not implemented here. The substrate's handoff is
-  session-scoped notes, not Director's claim-once transfer; its memory tools are
+  session-scoped notes, not Orqyn's claim-once transfer; its memory tools are
   the ai-memory adapter's job (Phase 3); observing git is the git half below;
   running commands is `LocalExecutor`.
 
@@ -149,7 +149,7 @@ what to do about it are three different jobs*, and only the first two live here.
 | Module | Job |
 |---|---|
 | `observer` | "What happened in git?" A read-only lens over one working tree, backed by git2. Persists nothing. |
-| `store` | "What has Director recorded?" One JSON file per repository, written atomically, with optimistic version checks. |
+| `store` | "What has Orqyn recorded?" One JSON file per repository, written atomically, with optimistic version checks. |
 | `service` | "What does this mean for the project state?" Composes the two, runs the deterministic comparison, persists the result. |
 
 git2 rather than the git CLI, because the specification asks for a proper git
@@ -219,15 +219,15 @@ and the identity refusal. All five pass against v0.35.1 as of this writing.
 
 ## What Phase 2 deliberately does not do
 
-- **No persistence of Director-owned entities.** Checkpoint, plan, decision,
+- **No persistence of Orqyn-owned entities.** Checkpoint, plan, decision,
   blocker, verification, and assignment storage is Phase 5. The adapters expose
   nothing for them, because no substrate owns them.
 - **No ai-memory adapter.** That is Phase 3.
 - **No multi-agent pool.** One adapter speaks as one agent, by the substrate's
   design.
 - **No verification engine.** The boundary makes the rule enforceable; Phase 10
-  is where Director decides whether a task is really done.
-- **No recovery of Director-only state through the substrate.** Where the
+  is where Orqyn decides whether a task is really done.
+- **No recovery of Orqyn-only state through the substrate.** Where the
   substrate cannot carry a value, the adapter degrades to the nearest honest
   state and says so, rather than encoding state in a field that belongs to the
   substrate.

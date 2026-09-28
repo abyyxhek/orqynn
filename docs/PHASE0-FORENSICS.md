@@ -1,6 +1,6 @@
 # Phase 0 — Repository Forensics: ai-memory vs handoff-mcp
 
-> Director Brain · Phase 0 deliverable
+> Orqyn · Phase 0 deliverable
 > Date: 2026-09-24
 > Scope: READ-ONLY audit of both upstream repositories. No code was modified.
 
@@ -140,7 +140,7 @@ before injected handoffs and briefs. Per-project authz design; API-key auth; aud
 security-boundary regressions across handoff, page-sharing, message, and lifecycle-guard
 invariants" plus a "mandatory adversarial-test rule" — security is a live discipline here.
 
-### 1.10 The one feature closest to Director Brain: `ai-memory run`
+### 1.10 The one feature closest to Orqyn: `ai-memory run`
 
 `docs/managed-workstreams.md`: an opt-in launcher letting one logical coding session move
 between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build, Antigravity CLI,
@@ -150,7 +150,7 @@ etc. Quit Claude, continue the same workstream in Codex, return to Claude later 
 This is real cross-harness continuity — but at the **memory/session** layer, not the
 **task/planning/verification** layer.
 
-### 1.11 Limitations for Director Brain
+### 1.11 Limitations for Orqyn
 
 - **No task model at all.** No tasks, no subtasks, no dependency graph, no estimation. Grep
   for `\btask\b` hits only incidental mentions.
@@ -344,7 +344,7 @@ unregistered callers both resolve to it, so a plain `==` would silently release 
 caller's state. That is careful, adversarial-aware engineering. Shell-script hooks exist for
 Codex. `THIRD_PARTY_LICENSES.md` is maintained. npm ships prebuilt binaries per platform.
 
-### 2.9 Limitations for Director Brain
+### 2.9 Limitations for Orqyn
 
 - **No checkpoint concept.** `grep -rin "checkpoint" src plugin-task-loop skills` → **zero
   matches.** Nothing records task/branch/commit/blocker/next-action together for resumption.
@@ -397,7 +397,7 @@ Codex. `THIRD_PARTY_LICENSES.md` is maintained. npm ships prebuilt binaries per 
 
 ## 4. Overlapping Functionality
 
-These are the seams where the two systems collide. Director must not implement any of these.
+These are the seams where the two systems collide. Orqyn must not implement any of these.
 
 1. **Session representation and lifecycle.** Both model sessions with agent identity, both
    synthesize session summaries, both support a "next session picks up where we left off"
@@ -445,19 +445,19 @@ lifecycle and its writer actor; depending on `handoff-mcp` as a library means im
 process-local file-lock model that assumes it owns `.handoff/`.
 
 **R5 — Orchestration in handoff-mcp is harness-coupled.** The task loop lives in prompt
-markdown + JS inside Claude/Codex. Director cannot reuse it without becoming
+markdown + JS inside Claude/Codex. Orqyn cannot reuse it without becoming
 harness-specific — directly contradicting the vendor-independence requirement.
 
 **R6 — handoff-mcp's verification is not verification.** `handoff_check_criterion` is a
-self-report. Building Director's verification on it would inherit the exact failure mode the
+self-report. Building Orqyn's verification on it would inherit the exact failure mode the
 acceptance criteria forbid ("Agent claims 'Done.' Tests fail → must not become COMPLETED").
 
 **R7 — Neither has cross-machine state.** handoff-mcp state is gitignored by design;
 ai-memory needs manual rsync/backup. The Computer A → Computer B acceptance test cannot be
 satisfied by either as-is.
 
-**R8 — Double-capture double-write.** If Director sits in front of ai-memory's MCP *and*
-ai-memory's hooks still fire, the same tool call is captured twice (Director's own observation
+**R8 — Double-capture double-write.** If Orqyn sits in front of ai-memory's MCP *and*
+ai-memory's hooks still fire, the same tool call is captured twice (Orqyn's own observation
 + ai-memory's ambient hook capture). Must be de-duplicated or the layers must divide capture
 responsibility explicitly.
 
@@ -467,12 +467,12 @@ responsibility explicitly.
 
 ```
                     ┌─────────────────────────────────────────────┐
-                    │            DIRECTOR BRAIN                    │
+                    │            ORQYN                             │
                     │  (owns: plan, task, assign, verify,          │
                     │   checkpoint, recover, replan, context)      │
                     │                                             │
                     │   ┌───────────────────────────────────────┐  │
-                    │   │  Canonical domain model (Director's    │  │
+                    │   │  Canonical domain model (Orqyn's       │  │
                     │   │  OWN entities + provider TRAITS)       │  │
                     │   └───────────────┬───────────────────────┘  │
                     │                   │                          │
@@ -493,7 +493,7 @@ responsibility explicitly.
               └────────┬───────────┘      └────────────┬─────────────┘
                        │                                │
                        └────────────┬───────────────────┘
-                                    │  (Director drives these)
+                                    │  (Orqyn drives these)
                                     ▼
                     ┌──────────────────────────────────────┐
                     │  HARNESS LAYER: Claude Code, Codex,   │
@@ -505,29 +505,29 @@ responsibility explicitly.
 
 **Boundary rules:**
 
-1. **Director talks to both substrates exclusively over MCP**, never by importing their
-   internal storage structs. This is the single most important rule: it means Director's
-   `Task` never touches `TaskData`, and Director's `Memory` never touches a wiki `Page`.
+1. **Orqyn talks to both substrates exclusively over MCP**, never by importing their
+   internal storage structs. This is the single most important rule: it means Orqyn's
+   `Task` never touches `TaskData`, and Orqyn's `Memory` never touches a wiki `Page`.
    Both substrates already speak MCP — use the boundary that already exists.
-2. **Director owns the task lifecycle, both substrates own persistence of their own
-   records.** Director's `Plan`, `Checkpoint`, `Verification`, `Decision`, `Blocker`,
-   `Recovery`, and `RecentContext` entities live in **Director's own store** and are never
+2. **Orqyn owns the task lifecycle, both substrates own persistence of their own
+   records.** Orqyn's `Plan`, `Checkpoint`, `Verification`, `Decision`, `Blocker`,
+   `Recovery`, and `RecentContext` entities live in **Orqyn's own store** and are never
    delegated. The substrates are read/write backends for tasks, sessions, agents, memory.
 3. **handoff-mcp becomes the task/session/agent substrate.** Its `TaskData`,
    `dependencies`, `AgentRecord` with heartbeat, `TaskLock` claim leases, and session state
-   machine are exactly what Director needs for assignment and coordination — and they are
+   machine are exactly what Orqyn needs for assignment and coordination — and they are
    already agent-independent.
 4. **ai-memory becomes the memory/retrieval substrate.** Its wiki, FTS5+vector retrieval,
    ambient hook capture, typed claim-once handoffs, and `ai-memory run` cross-harness
-   workstreams are exactly what Director needs for recent context, project knowledge, and
+   workstreams are exactly what Orqyn needs for recent context, project knowledge, and
    evidence.
-5. **Director's checkpoint is Director's own.** Neither substrate has one, and a checkpoint
+5. **Orqyn's checkpoint is Orqyn's own.** Neither substrate has one, and a checkpoint
    must record task + objective + branch + commit + changed files + tests + blockers +
    decisions + next action together — a cross-subsystem composite no single substrate can
-   express. Director must own it.
-6. **Director's verification is Director's own.** It must inspect git/files/tests directly,
+   express. Orqyn must own it.
+6. **Orqyn's verification is Orqyn's own.** It must inspect git/files/tests directly,
    never trusting a self-reported criterion tick.
-7. **Director owns cross-machine continuity**, because neither substrate has it.
+7. **Orqyn owns cross-machine continuity**, because neither substrate has it.
 
 ---
 
@@ -538,38 +538,38 @@ responsibility explicitly.
 | From | What | Why it's safe |
 |---|---|---|
 | handoff-mcp | task CRUD, `dependencies`, `bulk_update_tasks` | Mature, agent-independent, exactly the right granularity |
-| handoff-mcp | `AgentRecord` registry + heartbeat + TTL/GC | Director's AgentRegistry maps onto it directly |
+| handoff-mcp | `AgentRecord` registry + heartbeat + TTL/GC | Orqyn's AgentRegistry maps onto it directly |
 | handoff-mcp | `claim_task`/`reclaim_task`/`release_task` + `TaskLock` | Cross-process safety already solved |
 | handoff-mcp | session state machine, `fork_session`/`merge_sessions` | Resume and parallel-work support already solved |
 | handoff-mcp | `auto_schedule` topological ready-set | Dependency-aware scheduling already solved |
-| handoff-mcp | `scope_paths` overlap warnings | Seed for Director's conflict detection |
-| handoff-mcp | `events.jsonl` append-only audit | Director's audit log substrate |
+| handoff-mcp | `scope_paths` overlap warnings | Seed for Orqyn's conflict detection |
+| handoff-mcp | `events.jsonl` append-only audit | Orqyn's audit log substrate |
 | ai-memory | `memory_query` / `memory_recent` / `memory_briefing` | Retrieval is solved properly; do not rewrite |
 | ai-memory | wiki `write_page`/`read_page`/`explore` | Durable project knowledge store |
 | ai-memory | typed handoff `begin`/`accept`/`list` | Claim-once handoff protocol |
 | ai-memory | `hook` capture + observations | Ambient activity capture for RecentContext |
 | ai-memory | `ai-memory run` | Cross-harness session launching |
 
-### 7.2 Wrap (adapter, Director owns the interface)
+### 7.2 Wrap (adapter, Orqyn owns the interface)
 
 - `HandoffAdapter` → implements `TaskProvider`, `AgentProvider`, `SessionProvider`,
-  `HandoffProvider` by calling handoff-mcp MCP tools; maps `TaskData` ↔ Director `Task`.
+  `HandoffProvider` by calling handoff-mcp MCP tools; maps `TaskData` ↔ Orqyn `Task`.
 - `AiMemoryAdapter` → implements `MemoryProvider`, `ProjectStateProvider`,
-  `EvidenceProvider` by calling ai-memory MCP tools; maps wiki `Page` ↔ Director `Memory`.
-- Both adapters translate identity (Director `AgentId`/`TaskId` ↔ substrate ids) and absorb
-  schema differences so Director's core never sees a foreign struct.
+  `EvidenceProvider` by calling ai-memory MCP tools; maps wiki `Page` ↔ Orqyn `Memory`.
+- Both adapters translate identity (Orqyn `AgentId`/`TaskId` ↔ substrate ids) and absorb
+  schema differences so Orqyn's core never sees a foreign struct.
 
 ### 7.3 Keep separate
 
 - handoff-mcp's `/session-loop`, `$handoff-session-loop`, `/research-loop`, and all JS
-  workflow libs. They are harness-coupled prompt orchestration. Director replaces them with
+  workflow libs. They are harness-coupled prompt orchestration. Orqyn replaces them with
   its own harness-agnostic execution loop.
 - ai-memory's auto-improvement / consolidation LLM pipeline. It is a memory-maintenance
-  feature, orthogonal to orchestration. Director may consume its output; it must not drive
-  Director's loop.
-- ai-memory's web UI and multiuser authz. Separate concern; Director fronts its own MCP.
+  feature, orthogonal to orchestration. Orqyn may consume its output; it must not drive
+  Orqyn's loop.
+- ai-memory's web UI and multiuser authz. Separate concern; Orqyn fronts its own MCP.
 
-### 7.4 Director must implement itself (no substrate covers it)
+### 7.4 Orqyn must implement itself (no substrate covers it)
 
 1. **Checkpoint engine** — neither has any checkpoint concept.
 2. **Verification engine** — independent git/file/test inspection; substrate "verification"
@@ -581,8 +581,8 @@ responsibility explicitly.
 6. **Multi-agent conflict detection** — deterministic file/branch/task overlap, beyond the
    advisory warning.
 7. **Cross-machine state continuity** — the Computer A → B test.
-8. **Director's own persistence** — checkpoints, plans, verifications, decisions, and
-   recovery packages are Director records and need Director's store.
+8. **Orqyn's own persistence** — checkpoints, plans, verifications, decisions, and
+   recovery packages are Orqyn records and need Orqyn's store.
 
 ---
 
@@ -590,19 +590,19 @@ responsibility explicitly.
 
 | Repo | Verdict | Boundary |
 |---|---|---|
-| **ai-memory** | **USE as an external dependency, via MCP.** Do not fork, do not copy source, do not depend on its crates. | Run it as a local server (Docker or binary) and talk to it over MCP/HTTP. Consume `memory_*` tools and hook-captured observations. Its hook layer stays the ambient capture mechanism. If Director needs an LLM-bearing summary, call `memory_consolidate`. |
-| **handoff-mcp** | **USE as an external dependency, via MCP.** Do not fork, do not copy source. | Run it as a stdio MCP server per project and talk to it over MCP. Director becomes the *only* writer through its tools, so its file-lock model stays coherent. Its skills/plugins are NOT installed in Director's path — Director replaces the task loop. |
-| **Both** | **Wrap behind adapters.** Director's core depends only on Director's own traits. | A `#[cfg(test)]` in-memory fake implements every provider trait, so Director's logic is testable with zero external processes. |
+| **ai-memory** | **USE as an external dependency, via MCP.** Do not fork, do not copy source, do not depend on its crates. | Run it as a local server (Docker or binary) and talk to it over MCP/HTTP. Consume `memory_*` tools and hook-captured observations. Its hook layer stays the ambient capture mechanism. If Orqyn needs an LLM-bearing summary, call `memory_consolidate`. |
+| **handoff-mcp** | **USE as an external dependency, via MCP.** Do not fork, do not copy source. | Run it as a stdio MCP server per project and talk to it over MCP. Orqyn becomes the *only* writer through its tools, so its file-lock model stays coherent. Its skills/plugins are NOT installed in Orqyn's path — Orqyn replaces the task loop. |
+| **Both** | **Wrap behind adapters.** Orqyn's core depends only on Orqyn's own traits. | A `#[cfg(test)]` in-memory fake implements every provider trait, so Orqyn's logic is testable with zero external processes. |
 
 **Why MCP rather than library dependency:** the integration rule says prefer the boundary
 that is cleanest and most stable. Both projects already expose MCP. MCP gives process
-isolation (Director cannot crash the memory server, and vice versa), version independence
-(upgrade ai-memory without recompiling Director), language independence (the adapter could
+isolation (Orqyn cannot crash the memory server, and vice versa), version independence
+(upgrade ai-memory without recompiling Orqyn), language independence (the adapter could
 be reimplemented), and it forces the adapter boundary to be real rather than conventional.
 Library coupling would import two incompatible storage lifecycles, two lock models, and two
 migration chains into one binary — precisely the failure mode the brief warns against.
 
-**Attribution:** both are MIT. Director will carry `THIRD_PARTY_LICENSES.md` reproducing both
+**Attribution:** both are MIT. Orqyn will carry `THIRD_PARTY_LICENSES.md` reproducing both
 MIT notices (© 2026 Fabio Akita) and will document that it communicates with both as separate
 works over MCP. No source is copied.
 
@@ -615,12 +615,12 @@ works over MCP. No source is copied.
 1. Both substrates are Rust. The adapter boundary is lowest-friction in Rust — serde types
    map directly onto both projects' JSON, and the MCP client (JSON-RPC over stdio/HTTP) is
    trivially expressed.
-2. Director's core loop is a long-running, concurrent state machine with an event/log tail,
+2. Orqyn's core loop is a long-running, concurrent state machine with an event/log tail,
    exactly the profile where Rust's fearless concurrency and zero-cost abstraction pay off,
    and where Python's GIL and runtime cost hurt.
-3. Director's own persistence needs transactions, WAL, and a single-writer pattern — the same
+3. Orqyn's own persistence needs transactions, WAL, and a single-writer pattern — the same
    design ai-memory already proved in Rust with `rusqlite`.
-4. Performance class: Director is on the hot path of every agent action (observation,
+4. Performance class: Orqyn is on the hot path of every agent action (observation,
    checkpoint, heartbeat). Python would add per-event overhead and GC pauses to a system
    whose whole purpose is low-latency continuity.
 
@@ -635,13 +635,13 @@ prerequisite, not an architectural decision.
 
 ---
 
-## 10. Proposed Director Architecture
+## 10. Proposed Orqyn Architecture
 
 ```
-director-brain/
+orqyn/
 ├── crates/
 │   ├── director-domain/       # Canonical entities + provider TRAITS. Zero deps on substrates.
-│   ├── director-store/        # Director's own SQLite: checkpoints, plans, verifications,
+│   ├── director-store/        # Orqyn's own SQLite: checkpoints, plans, verifications,
 │   │                          # decisions, recent context, recovery packages.
 │   ├── director-adapters/     # HandoffAdapter + AiMemoryAdapter (MCP clients) + InMemory fake.
 │   ├── director-context/      # RecentContext engine (bounded window + compaction).
@@ -666,7 +666,7 @@ OBSERVE (git/fs/tests + substrate events + agent heartbeats)
          → ASSIGN (capability match + claim lease via HandoffAdapter)
             → MONITOR (heartbeat TTL, lease expiry, progress reports)
                → VERIFY (independent git/file/test inspection)
-                  → UPDATE STATE (Director store + substrate records)
+                  → UPDATE STATE (Orqyn store + substrate records)
                      → loop back, or RECOVER on failure
 ```
 
@@ -674,12 +674,12 @@ OBSERVE (git/fs/tests + substrate events + agent heartbeats)
 
 ## 11. Recommended Phase 1 Plan
 
-**Goal:** establish Director's canonical domain model and the provider trait boundary, with
+**Goal:** establish Orqyn's canonical domain model and the provider trait boundary, with
 zero coupling to either substrate and passing tests.
 
 **Scope (Phase 1 only):**
 
-1. Create the `director-brain` Rust workspace, edition 2021 (widest compatibility; no need
+1. Create the `orqyn` Rust workspace, edition 2021 (widest compatibility; no need
    for edition 2024's features in a domain crate), toolchain pinned via `rust-toolchain.toml`.
 2. Crate `director-domain`:
    - Entities: `Project`, `Task`, `Subtask`, `Agent`, `AgentSession`, `Machine`,
@@ -692,7 +692,7 @@ zero coupling to either substrate and passing tests.
      share one vocabulary.
 3. Provider traits in `director-domain::providers`:
    `MemoryProvider`, `HandoffProvider`, `SessionProvider`, `TaskProvider`, `AgentProvider`,
-   `ProjectStateProvider`, `ExecutionProvider` — each `async fn`, each returning Director's
+   `ProjectStateProvider`, `ExecutionProvider` — each `async fn`, each returning Orqyn's
    own types, each with an associated `Error`.
 4. Crate `director-adapters` with an `InMemoryProvider` implementing every trait, so all
    later phases are testable without external processes.
