@@ -4,6 +4,7 @@ members = [
     "crates/director-domain",
     "crates/director-adapters",
     "crates/director-store",
+    "crates/director-app",
 ]
 
 [workspace.package]
