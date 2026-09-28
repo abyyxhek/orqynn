@@ -1,15 +1,15 @@
-# Director Brain
+# Orqyn
 
 A vendor-independent orchestration brain for multi-agent software work.
 
-Director Brain sits **above** the coding agents (Claude Code, Codex, DeepSeek,
+Orqyn sits **above** the coding agents (Claude Code, Codex, DeepSeek,
 OpenCode, Goose, Cursor, …) and **beside** the memory/tooling substrates
 ([handoff-mcp](https://github.com/alphaelements/handoff-mcp) and
 [ai-memory](https://github.com/akitaonrails/ai-memory)). It owns the parts
 neither of those systems has: planning, assignment, checkpointing, independent
 verification, recovery, and replanning.
 
-Director talks to both substrates **exclusively over MCP**. It never imports
+Orqyn talks to both substrates **exclusively over MCP**. It never imports
 their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
@@ -21,15 +21,15 @@ crates. A boundary test in this repo enforces that — see
 >
 > - **The observation half** — a git2-backed observer, a file-backed store, and
 >   the service that composes them into `ProjectStateSnapshot` with
->   deterministic change detection. Read-only by construction: Director never
+>   deterministic change detection. Read-only by construction: Orqyn never
 >   mutates a repository it is verifying.
 > - **The handoff-mcp half** — wire types, a stdio JSON-RPC transport, the
 >   bidirectional mapping, and `HandoffAdapter`, which composes those three into
 >   live `TaskProvider`, `AgentProvider`, and `SessionProvider` implementations
 >   against a real substrate process.
 >
-> Director's provider traits are now implemented against something that is not a
-> `HashMap`. There is no MCP server of Director's own, no persistence, and no
+> Orqyn's provider traits are now implemented against something that is not a
+> `HashMap`. There is no MCP server of Orqyn's own, no persistence, and no
 > loop yet — those are later phases, and their absence here is deliberate.
 
 ---
@@ -53,7 +53,7 @@ before, during, and after — while the full tenure history remains recoverable.
 ### 2. Nothing self-reports completion
 
 `TaskStatus::Done` is **not reachable** from an agent's report. There is no
-provider method an agent can call that completes a task. Only Director's own
+provider method an agent can call that completes a task. Only Orqyn's own
 verification engine — which inspects git, files, and test exit codes itself —
 can do that.
 
@@ -67,7 +67,7 @@ checkbox tick, and ai-memory has no task model at all.
 ## Repository layout
 
 ```
-director-brain/
+orqyn/
 ├── crates/
 │   ├── director-domain/     # The vocabulary: every entity, identity, status
 │   │                        # enum, and provider trait. Knows no substrate.
@@ -91,7 +91,7 @@ director-brain/
 
 ### `director-domain` — the vocabulary
 
-Every entity Director speaks, with invariants encoded in types rather than in
+Every entity Orqyn speaks, with invariants encoded in types rather than in
 prose.
 
 | Module | Entities | Invariant it enforces |
@@ -111,12 +111,12 @@ prose.
 | `blocker` | `Blocker`, `BlockerKind`, `BlockerStatus` | "Still blocked after three replans" is a reportable condition. `Obsolete` ≠ `Resolved`. |
 | `handoff` | `Handoff`, `HandoffState`, `HandoffError` | Claim-once: only the addressed agent may accept, and only while open. |
 | `project` | `Project`, `DefaultBranch` | A root, not a container — tasks are referenced by id, never nested. |
-| `repository` | `Repository`, `ProjectStateSnapshot`, `WorktreeState`, `ObservationEvent`, `SyncResult` | What Director learned by looking at git, and how it tells one observation from the next. Neither substrate has this. |
+| `repository` | `Repository`, `ProjectStateSnapshot`, `WorktreeState`, `ObservationEvent`, `SyncResult` | What Orqyn learned by looking at git, and how it tells one observation from the next. Neither substrate has this. |
 | `providers` | 7 provider traits + `Provider`, `ProviderError`, `Memory`, `MemoryQuery`, `CommandSpec`, `CommandOutcome` | The trait boundary. |
 
 ### `providers` — the boundary
 
-Seven traits, all `async`, all returning Director's own types, each with an
+Seven traits, all `async`, all returning Orqyn's own types, each with an
 associated `Error`:
 
 | Trait | Purpose |
@@ -124,23 +124,23 @@ associated `Error`:
 | `TaskProvider` | CRUD, status, `ready_tasks`, dependency edges |
 | `AgentProvider` | Registry, heartbeat, availability |
 | `SessionProvider` | Lifecycle, per-task history, fork |
-| `HandoffProvider` | Director's claim-once transfer |
+| `HandoffProvider` | Orqyn's claim-once transfer |
 | `MemoryProvider` | Durable knowledge, query, recency |
 | `ProjectStateProvider` | Observed git/filesystem state |
-| `ExecutionProvider` | Run real commands; Director reads the exit code itself |
+| `ExecutionProvider` | Run real commands; Orqyn reads the exit code itself |
 
 Four rules are baked in:
 
 1. Methods are `async` — every real substrate is an I/O boundary.
-2. Inputs and outputs are Director's types, never a substrate's struct.
+2. Inputs and outputs are Orqyn's types, never a substrate's struct.
 3. Each trait has an associated `Error`, so a substrate's failure vocabulary
-   cannot become Director's.
+   cannot become Orqyn's.
 4. **Nothing here completes a task.**
 
 Deliberately absent from the traits: checkpoint, plan, decision, blocker,
-verification, and assignment storage. Those are Director-owned entities in
-Director's own store. Exposing them as provider traits would invite a substrate
-to become authoritative over Director's own state.
+verification, and assignment storage. Those are Orqyn-owned entities in
+Orqyn's own store. Exposing them as provider traits would invite a substrate
+to become authoritative over Orqyn's own state.
 
 ### `director-adapters` — the proof
 
@@ -148,7 +148,7 @@ to become authoritative over Director's own state.
   against in-process `HashMap`s. It is faithful to the trait *contracts*
   (claim-once handoffs, unique ids, dependency-aware readiness) so a test
   passing against it is evidence about the loop, not a tautology. This is why
-  Director's loop can be developed and tested with zero external processes.
+  Orqyn's loop can be developed and tested with zero external processes.
 - **`LocalExecutor`** — a real `ExecutionProvider` that runs commands via
   `std::process` with a timeout. It is the reference local executor and the
   fallback the verification engine will use when a substrate cannot execute
@@ -180,20 +180,20 @@ holds four layers:
 - **`wire`** — serde mirrors of handoff-mcp's JSON shapes. Deliberately not the
   domain types and unable to become them, so every schema difference lives in
   one place.
-- **`transport`** — a stdio JSON-RPC client. Director spawns the server as a
+- **`transport`** — a stdio JSON-RPC client. Orqyn spawns the server as a
   child process and speaks line-delimited JSON-RPC 2.0 over stdin/stdout. It
   never links the substrate's code; it crosses a process boundary.
 - **`mapping`** — the bidirectional translation, and the layer that earns its
   keep. The two models are not isomorphic: task statuses (6 vs 8 states),
   priorities, and — critically — the meaning of `done`. handoff-mcp's `done` is
   an agent self-report, so it becomes `VerificationPending`, not `Done`, unless
-  Director itself produced it (a marker stashed in the substrate's `extra`
+  Orqyn itself produced it (a marker stashed in the substrate's `extra`
   map). That is the acceptance criterion "agent claims done, tests fail → must
   not become COMPLETED", enforced at the boundary.
 - **`adapter`** — [`HandoffAdapter`], composing the three above into live
   `TaskProvider`, `AgentProvider`, and `SessionProvider` over any
   `HandoffWire` connection. It holds the one piece of state none of those
-  layers can carry: the `trusted_done_ids` set of task ids Director itself
+  layers can carry: the `trusted_done_ids` set of task ids Orqyn itself
   completed, which is the only thing that lets a substrate `done` come back as
   `Done` instead of `VerificationPending`.
 
@@ -203,11 +203,11 @@ The adapter is covered by 15 unit tests against a fake wire connection plus 5
 live tests that spawn the real handoff-mcp server binary (marked `#[ignore]` so
 they do not run by default). Live testing surfaced two findings recorded in
 [`docs/PHASE2-ADAPTERS.md`](docs/PHASE2-ADAPTERS.md): the substrate's `extra`
-channel is closed at the MCP boundary in both directions, so Director-only
+channel is closed at the MCP boundary in both directions, so Orqyn-only
 statuses do not round-trip; and two wire mirrors had to be corrected from the
 real server's shapes.
 
-The `AiMemoryAdapter` is Phase 3. Until it lands, Director's core must remain
+The `AiMemoryAdapter` is Phase 3. Until it lands, Orqyn's core must remain
 provably independent of the substrates — `InMemoryProvider` is the proof.
 
 ---
@@ -224,7 +224,7 @@ the build** if:
 
 The test looks for the identifiers a `use` statement would need — not for
 English. `director-domain`'s doc comments name both substrates, because
-explaining *why* Director's model differs from `TaskData` is the design
+explaining *why* Orqyn's model differs from `TaskData` is the design
 rationale for avoiding it. That is the opposite of coupling.
 
 ---
@@ -233,12 +233,12 @@ rationale for avoiding it. That is the opposite of coupling.
 
 ```
                     ┌─────────────────────────────────────────────┐
-                    │            DIRECTOR BRAIN                    │
+                    │            ORQYN                             │
                     │  owns: plan, task, assign, verify,          │
                     │   checkpoint, recover, replan, context       │
                     │                                             │
                     │   ┌───────────────────────────────────────┐  │
-                    │   │  Canonical domain model (Director's    │  │
+                    │   │  Canonical domain model (Orqyn's       │  │
                     │   │  OWN entities + provider TRAITS)       │  │
                     │   └───────────────┬───────────────────────┘  │
                     │                   │                          │
@@ -259,7 +259,7 @@ rationale for avoiding it. That is the opposite of coupling.
               └────────┬───────────┘      └────────────┬─────────────┘
                        │                                │
                        └────────────┬───────────────────┘
-                                    │  (Director drives these)
+                                    │  (Orqyn drives these)
                                     ▼
                     ┌──────────────────────────────────────┐
                     │  HARNESS LAYER: Claude Code, Codex,   │
@@ -269,7 +269,7 @@ rationale for avoiding it. That is the opposite of coupling.
                                  Git / Code → PROJECT
 ```
 
-Director's eventual control loop (the shape is fixed now; the behavior is not
+Orqyn's eventual control loop (the shape is fixed now; the behavior is not
 built yet):
 
 ```
@@ -279,15 +279,15 @@ OBSERVE (git/fs/tests + substrate events + agent heartbeats)
          → ASSIGN (capability match + claim lease via HandoffAdapter)
             → MONITOR (heartbeat TTL, lease expiry, progress reports)
                → VERIFY (independent git/file/test inspection)
-                  → UPDATE STATE (Director store + substrate records)
+                  → UPDATE STATE (Orqyn store + substrate records)
                      → loop back, or RECOVER on failure
 ```
 
 Boundary rules, in full, are in [`docs/PHASE0-FORENSICS.md`](docs/PHASE0-FORENSICS.md)
-§6. The short version: Director owns the task lifecycle and everything
+§6. The short version: Orqyn owns the task lifecycle and everything
 upstream of it; the substrates are read/write backends for tasks, sessions,
 agents, and memory. handoff-mcp becomes the task/session/agent substrate;
-ai-memory becomes the memory/retrieval substrate. Director's checkpoint and
+ai-memory becomes the memory/retrieval substrate. Orqyn's checkpoint and
 verification are its own because neither substrate has them.
 
 ---
@@ -310,7 +310,7 @@ cargo test --workspace
 > directory off OneDrive:
 >
 > ```sh
-> export CARGO_TARGET_DIR="$HOME/.director-brain-target"
+> export CARGO_TARGET_DIR="$HOME/.orqyn-target"
 > cargo test --workspace
 > ```
 >
@@ -329,24 +329,24 @@ than the plumbing:
 - The recent-context window never exceeds its bound.
 - A handoff cannot be accepted twice or by the wrong agent.
 - `StateComparison` distinguishes a head advance from a rebase.
-- Every public entity round-trips through serde — because everything Director
+- Every public entity round-trips through serde — because everything Orqyn
   persists crosses a serialization boundary sooner or later.
 - No crate outside `director-adapters` references a substrate.
 
 ---
 
-## What Director deliberately does not do yet
+## What Orqyn deliberately does not do yet
 
 - **No persistence.** `InMemoryProvider` is in-process only; the store crate
   comes with checkpoints in a later phase. (The git observation layer's JSON
   store holds observed repository state only — it is a cache for change
-  detection, not Director's own state.)
-- **No MCP server.** Director's own tool surface is a later phase.
+  detection, not Orqyn's own state.)
+- **No MCP server.** Orqyn's own tool surface is a later phase.
 - **No planner, no verification engine, no loop.** The traits exist; the
   behavior does not.
 - **No ai-memory adapter yet.** The handoff-mcp side is wired end to end —
   `HandoffAdapter` runs live against a real substrate process — but the
-  `AiMemoryAdapter` is Phase 3. Until it lands, Director's core must remain
+  `AiMemoryAdapter` is Phase 3. Until it lands, Orqyn's core must remain
   provably independent of the substrates, and `InMemoryProvider` is the proof.
 
 ## Roadmap
@@ -357,7 +357,7 @@ than the plumbing:
 | **1** ✅ | Canonical domain model + provider trait boundary, zero substrate coupling. |
 | **2** ✅ | Git observation layer (observer, store, service, `ProjectStateSnapshot`) **+ handoff-mcp client** (wire, transport, mapping, `HandoffAdapter` running live against the real server). |
 | 3 | `AiMemoryAdapter` — MCP client for ai-memory. |
-| 5 | `director-store` — Director's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
+| 5 | `director-store` — Orqyn's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
 | 10 | The verification engine. |
 | — | The loop: OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN. |
 
@@ -365,7 +365,7 @@ than the plumbing:
 
 ## Attribution
 
-Director Brain communicates with
+Orqyn communicates with
 [handoff-mcp](https://github.com/alphaelements/handoff-mcp) and
 [ai-memory](https://github.com/akitaonrails/ai-memory) as separate works over
 MCP. No source is copied from either. Both are MIT (© 2026 Fabio Akita); their
