@@ -14,10 +14,10 @@ their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
-> **Status: Phases 1–3 and 5 complete.** The canonical domain model, the
-> provider trait boundary, both substrate adapters, and Orqyn's own
-> persistent store are in place, with zero substrate coupling and a passing
-> test suite (268 tests).
+> **Status: Phases 1–3, 5 complete; Phase 6 underway (OBSERVE landed).** The
+> canonical domain model, the provider trait boundary, both substrate adapters,
+> Orqyn's own persistent store, and the first step of the control loop are in
+> place, with zero substrate coupling and a passing test suite (287 tests).
 >
 > - **Phase 1** — the domain model and the seven provider traits it depends on,
 >   plus an in-memory implementor of every one of them.
@@ -30,13 +30,18 @@ crates. A boundary test in this repo enforces that — see
 >   than reimplements: FTS5, entity, and graph retrieval with decay are already
 >   solved well there.
 > - **Phase 5** — `director-store`, a SQLite store for the entities no
->   substrate has. Checkpoints, assignments, decisions, and verification
->   results now survive a restart. The task table deliberately names no agent,
->   and "at most one active assignment per task" is a partial unique index in
->   the schema, not a convention. (There is no Phase 4; the roadmap skips it.)
+>   substrate has. Checkpoints, assignments, plans, and decisions now survive a
+>   restart, superseded rather than deleted. The task table deliberately names
+>   no agent, and "at most one active assignment per task" is a partial unique
+>   index in the schema, not a convention. (There is no Phase 4; the roadmap
+>   skips it.)
+> - **Phase 6** — `director-app`, the crate that drives the loop
+>   `OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN`. Its first step,
+>   OBSERVE, is landed: an observed repository becomes normalized belief in
+>   Orqyn's store. The remaining steps are next.
 >
-> There is no MCP server of Orqyn's own and no loop yet — those are later
-> phases, and their absence here is deliberate.
+> There is no MCP server of Orqyn's own yet and only one step of the loop
+> exists — those are later phases, and their absence here is deliberate.
 
 ---
 
@@ -82,8 +87,10 @@ orqyn/
 │   │                        # git observation layer, and the handoff-mcp
 │   │                        # adapter. The ONLY crate allowed to name a
 │   │                        # substrate.
-│   └── director-store/      # SQLite store for Orqyn's own entities. Owns
-│                            # its schema; depends only on director-domain.
+│   ├── director-store/      # SQLite store for Orqyn's own entities. Owns
+│   │                        # its schema; depends only on director-domain.
+│   └── director-app/        # The control loop. Composes the layers into
+│                            # steps; only OBSERVE exists today.
 ├── docs/
 │   ├── PHASE0-FORENSICS.md  # Read-only audit of both upstream repos:
 │   │                        # data models, ~30 vs ~80 MCP tools, feature
@@ -92,7 +99,8 @@ orqyn/
 │   ├── PHASE2-ADAPTERS.md   # The HandoffAdapter over handoff-mcp on stdio.
 │   ├── PHASE2-OBSERVATION.md # The git observation layer.
 │   ├── PHASE3-MEMORY.md     # The AiMemoryAdapter over ai-memory.
-│   └── PHASE5-STORE.md      # The SQLite store and the invariants it holds.
+│   ├── PHASE5-STORE.md      # The SQLite store and the invariants it holds.
+│   └── PHASE6-APP.md        # The control loop, and its first step.
 ├── Cargo.toml               # Workspace manifest.
 ├── rust-toolchain.toml      # Pinned: stable-x86_64-pc-windows-gnu.
 └── THIRD_PARTY_LICENSES.md  # MIT notices for both substrates (© 2026 Fabio Akita).
@@ -278,8 +286,8 @@ rationale for avoiding it. That is the opposite of coupling.
                                  Git / Code → PROJECT
 ```
 
-Orqyn's eventual control loop (the shape is fixed now; the behavior is not
-built yet):
+Orqyn's control loop (the shape is fixed; OBSERVE is built, the remaining
+steps are not):
 
 ```
 OBSERVE (git/fs/tests + substrate events + agent heartbeats)
@@ -343,23 +351,27 @@ than the plumbing:
 - `StateComparison` distinguishes a head advance from a rebase.
 - Every public entity round-trips through serde — because everything Orqyn
   persists crosses a serialization boundary sooner or later.
+- A project is never left with two active plans: activation supersedes the
+  sitting plan in one transaction, and a second activation attempt against the
+  partial unique index is an error rather than a silent second authoritative
+  plan. A superseded plan survives, linked both ways.
+- A reversed decision is marked, not deleted, and cannot be reversed twice.
+- A stale write is rejected rather than silently overwriting a newer one.
 - No crate outside `director-adapters` references a substrate.
 
 ---
 
 ## What Orqyn deliberately does not do yet
 
-- **No persistence.** `InMemoryProvider` is in-process only; the store crate
-  comes with checkpoints in a later phase. (The git observation layer's JSON
-  store holds observed repository state only — it is a cache for change
-  detection, not Orqyn's own state.)
-- **No MCP server.** Orqyn's own tool surface is a later phase.
-- **No planner, no verification engine, no loop.** The traits exist; the
-  behavior does not.
-- **No persistence of Orqyn-owned entities.** Both substrate adapters are
-  landed, but Orqyn's own checkpoint, plan, and decision storage is Phase 5.
-  Until then, `InMemoryProvider` is the proof that Orqyn's core is
-  independent of the substrates.
+- **No planner.** Orqyn stores plans and activates them, and the loop's first
+  step (OBSERVE) is landed, but nothing yet *writes* a plan from observed
+  state. That is the next step.
+- **No verification engine.** The model treats a task as not-done until
+  something independent confirms it; the verifier that holds the "nothing
+  self-reports completion" invariant is a later phase.
+- **No MCP server, no binary.** Orqyn's own tool surface and the process that
+  runs the loop unattended are later phases. Until then, the library's tests
+  are its caller.
 
 ## Roadmap
 
@@ -369,9 +381,10 @@ than the plumbing:
 | **1** ✅ | Canonical domain model + provider trait boundary, zero substrate coupling. |
 | **2** ✅ | Git observation layer (observer, store, service, `ProjectStateSnapshot`) + `HandoffAdapter`: handoff-mcp client implementing `TaskProvider`/`AgentProvider`/`SessionProvider`. |
 | **3** ✅ | `AiMemoryAdapter` — ai-memory client implementing `MemoryProvider`. |
-| 5 | `director-store` — Orqyn's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
+| **5** ✅ | `director-store` — Orqyn's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
+| **6** ⧗ | `director-app` — the control loop. OBSERVE is landed and tested (git layer composed with the store); the remaining steps are built next. |
 | 10 | The verification engine. |
-| — | The loop: OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN. |
+| — | The loop's remaining steps, built one at a time in the order they run: PLAN → ASSIGN → MONITOR → VERIFY → REPLAN. |
 
 ---
 
