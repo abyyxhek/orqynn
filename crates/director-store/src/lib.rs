@@ -75,6 +75,8 @@ use std::path::Path;
 
 use director_domain::assignment::AgentAssignment;
 use director_domain::ids::{AgentId, AssignmentId, TaskId};
+use director_domain::plan::Plan;
+use director_domain::task::Task;
 use director_domain::StoreError;
 
 pub use migrations::{latest_version, migrations, Migration};
@@ -169,6 +171,24 @@ impl Store {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<AgentAssignment, StoreError> {
         assignments::assign_task(&self.pool, task_id, agent_id, assignment_id, now).await
+    }
+
+    /// Create a plan, persist every task it decomposes into, and activate it:
+    /// one transaction, all or nothing. The project's sitting active plan is
+    /// superseded — marked and linked, never deleted — inside the same
+    /// transaction, so a project is never left with two active plans and a
+    /// failed plan never leaves half-written tasks behind.
+    ///
+    /// This is the operation the loop's PLAN step uses; the repository's
+    /// `create_plan` and `activate_plan` are the lower-level halves.
+    pub async fn create_active_plan(
+        &self,
+        plan: &Plan,
+        tasks: &[Task],
+        authorized_by: &AgentId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(Plan, Vec<Task>), StoreError> {
+        plans::create_active_plan(&self.pool, plan, tasks, authorized_by, now).await
     }
 
     /// Checkpoints: Orqyn's own resumption documents. Superseded ones are

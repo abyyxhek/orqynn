@@ -15,8 +15,9 @@
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
-use director_domain::ids::{AgentId, PlanId, ProjectId};
+use director_domain::ids::{AgentId, PlanId, ProjectId, TaskId};
 use director_domain::plan::{Plan, PlanStatus};
+use director_domain::task::Task;
 use director_domain::StoreError;
 
 use crate::connection::{translate_error, PooledConn};
@@ -47,29 +48,12 @@ impl director_domain::Store for SqlitePlanRepository {
 impl director_domain::PlanRepository for SqlitePlanRepository {
     async fn create_plan(&self, plan: &Plan) -> Result<Plan, StoreError> {
         let plan = plan.clone();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO plans (id, project_id, objective, task_ids, rationale, status,
-                                supersedes, superseded_by, created_by, state_version,
-                                created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params![
-                plan.id.as_str(),
-                plan.project_id.as_str(),
-                plan.objective,
-                json::to_json(&plan.task_ids)?,
-                plan.rationale,
-                json::to_json(&plan.status)?,
-                plan.supersedes.as_ref().map(PlanId::as_str),
-                plan.superseded_by.as_ref().map(PlanId::as_str),
-                plan.created_by.as_ref().map(AgentId::as_str),
-                plan.state_version as i64,
-                json::timestamp(plan.created_at),
-                json::timestamp(plan.updated_at),
-            ],
-        )
-        .map_err(translate_error)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(translate_error)?;
 
+        insert_plan(&tx, &plan)?;
+
+        tx.commit().map_err(translate_error)?;
         load_plan(&conn, &plan.id)
     }
 
@@ -139,56 +123,10 @@ impl director_domain::PlanRepository for SqlitePlanRepository {
             )));
         }
 
-        // Supersede the sitting active plan, if there is one, and link both
-        // ways. Same transaction as the promotion, so the two never diverge.
-        // Status is compared as JSON, because that is how it is written: a bare
-        // 'active' in the predicate never matches a column holding "active".
-        let previous: Option<Plan> = tx
-            .query_row(
-                &format!("SELECT {PLAN_COLUMNS} FROM plans WHERE project_id = ?1 AND status = ?2"),
-                rusqlite::params![
-                    plan.project_id.as_str(),
-                    json::to_json(&PlanStatus::Active)?
-                ],
-                row_to_plan,
-            )
-            .optional()
-            .map_err(translate_error)?;
-
-        if let Some(previous) = previous.as_ref() {
-            tx.execute(
-                "UPDATE plans SET status = ?2, superseded_by = ?3,
-                                  state_version = state_version + 1, updated_at = ?4
-                  WHERE id = ?1",
-                rusqlite::params![
-                    previous.id.as_str(),
-                    json::to_json(&PlanStatus::Superseded)?,
-                    id.as_str(),
-                    json::timestamp(chrono::Utc::now()),
-                ],
-            )
-            .map_err(translate_error)?;
-            plan.supersedes = Some(previous.id.clone());
-        }
-
-        // Promote. `activate` records who authorized it; the state version the
-        // caller read is the precondition, as on every other update.
-        plan.activate(authorized_by);
-        tx.execute(
-            "UPDATE plans
-                SET status = ?2, created_by = ?3, supersedes = ?4,
-                    state_version = state_version + 1, updated_at = ?5
-              WHERE id = ?1 AND state_version = ?6",
-            rusqlite::params![
-                plan.id.as_str(),
-                json::to_json(&PlanStatus::Active)?,
-                plan.created_by.as_ref().map(AgentId::as_str),
-                plan.supersedes.as_ref().map(PlanId::as_str),
-                json::timestamp(plan.updated_at),
-                plan.state_version as i64,
-            ],
-        )
-        .map_err(translate_error)?;
+        // Supersede the sitting active plan and promote this one. Shared with
+        // [`create_active_plan`], so a plan activated on its own and a plan
+        // activated as part of its own creation leave an identical trail.
+        promote_plan(&tx, &mut plan, authorized_by, chrono::Utc::now())?;
 
         tx.commit().map_err(translate_error)?;
         load_plan(&conn, &id)
@@ -228,6 +166,160 @@ impl director_domain::PlanRepository for SqlitePlanRepository {
         }
         Ok(all)
     }
+}
+
+/// Insert a plan row. Called inside the caller's transaction, so
+/// [`create_active_plan`] can write the plan and its tasks as one statement
+/// group.
+fn insert_plan(tx: &rusqlite::Transaction<'_>, plan: &Plan) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO plans (id, project_id, objective, task_ids, rationale, status,
+                            supersedes, superseded_by, created_by, state_version,
+                            created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            plan.id.as_str(),
+            plan.project_id.as_str(),
+            plan.objective,
+            json::to_json(&plan.task_ids)?,
+            plan.rationale,
+            json::to_json(&plan.status)?,
+            plan.supersedes.as_ref().map(PlanId::as_str),
+            plan.superseded_by.as_ref().map(PlanId::as_str),
+            plan.created_by.as_ref().map(AgentId::as_str),
+            plan.state_version as i64,
+            json::timestamp(plan.created_at),
+            json::timestamp(plan.updated_at),
+        ],
+    )
+    .map_err(translate_error)?;
+    Ok(())
+}
+
+/// Supersede the project's sitting active plan and promote this one, inside the
+/// caller's transaction.
+///
+/// This is the half of activation that mutates rows, split out so that
+/// [`PlanRepository::activate_plan`] and [`create_active_plan`] run *identical*
+/// supersession logic — a plan activated on its own and a plan activated as
+/// part of its own creation leave the same trail. One implementation, two
+/// callers; the alternative is two copies of a load-bearing rule drifting
+/// apart.
+fn promote_plan(
+    tx: &rusqlite::Transaction<'_>,
+    plan: &mut Plan,
+    authorized_by: AgentId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), StoreError> {
+    // Supersede the sitting active plan, if there is one, and link both ways.
+    // Same transaction as the promotion, so the two never diverge. Status is
+    // compared as JSON, because that is how it is written: a bare 'active' in
+    // the predicate never matches a column holding "active".
+    let previous: Option<Plan> = tx
+        .query_row(
+            &format!("SELECT {PLAN_COLUMNS} FROM plans WHERE project_id = ?1 AND status = ?2"),
+            rusqlite::params![
+                plan.project_id.as_str(),
+                json::to_json(&PlanStatus::Active)?
+            ],
+            row_to_plan,
+        )
+        .optional()
+        .map_err(translate_error)?;
+
+    if let Some(previous) = previous.as_ref() {
+        tx.execute(
+            "UPDATE plans SET status = ?2, superseded_by = ?3,
+                              state_version = state_version + 1, updated_at = ?4
+              WHERE id = ?1",
+            rusqlite::params![
+                previous.id.as_str(),
+                json::to_json(&PlanStatus::Superseded)?,
+                plan.id.as_str(),
+                json::timestamp(now),
+            ],
+        )
+        .map_err(translate_error)?;
+        plan.supersedes = Some(previous.id.clone());
+    }
+
+    // Promote. `activate` records who authorized it; the state version the
+    // caller read is the precondition, as on every other update.
+    plan.activate(authorized_by);
+    tx.execute(
+        "UPDATE plans
+            SET status = ?2, created_by = ?3, supersedes = ?4,
+                state_version = state_version + 1, updated_at = ?5
+          WHERE id = ?1 AND state_version = ?6",
+        rusqlite::params![
+            plan.id.as_str(),
+            json::to_json(&PlanStatus::Active)?,
+            plan.created_by.as_ref().map(AgentId::as_str),
+            plan.supersedes.as_ref().map(PlanId::as_str),
+            json::timestamp(plan.updated_at),
+            plan.state_version as i64,
+        ],
+    )
+    .map_err(translate_error)?;
+
+    Ok(())
+}
+
+/// Create a plan, create every task in it, and activate the plan — one
+/// transaction, all or nothing.
+///
+/// This is the operation the loop's PLAN step uses. Writing a plan's rows
+/// piecemeal would leave a window in which an active plan exists with no tasks,
+/// or tasks exist belonging to a plan that was never activated; doing all three
+/// in one transaction means a caller sees either a complete, active plan or no
+/// change at all. The supersession of the project's previously active plan
+/// happens in the same transaction via [`promote_plan`], so the partial unique
+/// index `idx_plans_active_per_project` never observes two active rows.
+///
+/// Returns the plan and tasks as they now stand, with `supersedes` reflecting
+/// what was written.
+pub async fn create_active_plan(
+    pool: &crate::connection::ConnectionPool,
+    plan: &Plan,
+    tasks: &[Task],
+    authorized_by: &AgentId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(Plan, Vec<Task>), StoreError> {
+    let mut plan = plan.clone();
+    let task_ids: Vec<TaskId> = tasks.iter().map(|task| task.id.clone()).collect();
+    let mut conn = pool.get();
+    let tx = conn.transaction().map_err(translate_error)?;
+
+    // 1. The plan, as a draft. Activation is step 3, so the partial unique
+    //    index on active plans is only ever asked to hold one active row for
+    //    this project at the moment it matters — supersession and promotion
+    //    are a single swap, not two steps that can be observed between.
+    insert_plan(&tx, &plan)?;
+
+    // 2. Every task the plan decomposes into. `insert_task` writes each row
+    //    and its dependency edges; a duplicate task id fails the primary key
+    //    here and rolls the whole plan back.
+    for task in tasks {
+        crate::tasks::insert_task(&tx, task)?;
+    }
+
+    // 3. Supersede whatever the project was executing against and promote this
+    //    plan to active. The plan's authoritative task order is what was passed
+    //    in; the tasks themselves carry their own dependencies.
+    plan.task_ids = task_ids;
+    promote_plan(&tx, &mut plan, authorized_by.clone(), now)?;
+
+    tx.commit().map_err(translate_error)?;
+
+    // Read everything back as it stands, the same way the single-purpose
+    // repositories do — what is returned is what was written, not what was
+    // passed in.
+    let stored_plan = load_plan(&conn, &plan.id)?;
+    let stored_tasks = tasks
+        .iter()
+        .map(|task| crate::tasks::load_task(&conn, &task.id))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((stored_plan, stored_tasks))
 }
 
 /// The columns every plan query selects, in order. One place, so the SELECTs

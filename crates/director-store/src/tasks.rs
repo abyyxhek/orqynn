@@ -53,46 +53,9 @@ impl director_domain::TaskRepository for SqliteTaskRepository {
     async fn create_task(&self, task: &Task) -> Result<Task, StoreError> {
         let task = task.clone();
         let mut conn = self.conn();
-
-        // A task must belong to a project. The store rejects an unscoped task
-        // rather than inventing a project to hang it on.
-        let project_id = task.project_id.as_ref().ok_or_else(|| {
-            StoreError::ConstraintViolation(format!(
-                "task {} has no project; Orqyn's store requires one",
-                task.id
-            ))
-        })?;
-
         let tx = conn.transaction().map_err(translate_error)?;
-        tx.execute(
-            "INSERT INTO tasks (id, project_id, title, objective, description, status,
-                                priority, complexity, expected_outputs, dependencies,
-                                scope_paths, required_capabilities, subtasks,
-                                state_version, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            rusqlite::params![
-                task.id.as_str(),
-                project_id.as_str(),
-                task.title,
-                task.objective,
-                task.description,
-                json::to_json(&task.status)?,
-                json::to_json_or_null(task.priority.as_ref())?,
-                json::to_json(&task.complexity)?,
-                json::to_json(&task.expected_outputs)?,
-                json::to_json(&task.dependencies)?,
-                json::to_json(&task.scope_paths)?,
-                json::to_json(&task.required_capabilities)?,
-                json::to_json(&task.subtasks)?,
-                task.state_version as i64,
-                json::timestamp(task.created_at),
-                json::timestamp(task.updated_at),
-            ],
-        )
-        .map_err(translate_error)?;
 
-        // The queryable dependency graph, kept alongside the JSON column.
-        replace_dependencies(&tx, &task.id, &task.dependencies)?;
+        insert_task(&tx, &task)?;
 
         tx.commit().map_err(translate_error)?;
         load_task(&conn, &task.id)
@@ -232,6 +195,55 @@ impl director_domain::TaskRepository for SqliteTaskRepository {
         }
         Ok(all)
     }
+}
+
+/// Insert a task row together with its dependency edges.
+///
+/// Called inside the caller's transaction, so a task never lands without the
+/// graph that describes it — and so [`crate::plans::create_active_plan`] can
+/// write a plan's tasks in the *same* transaction as the plan itself, making a
+/// partially created plan impossible.
+pub(crate) fn insert_task(tx: &rusqlite::Transaction<'_>, task: &Task) -> Result<(), StoreError> {
+    // A task must belong to a project. The store rejects an unscoped task
+    // rather than inventing a project to hang it on.
+    let project_id = task.project_id.as_ref().ok_or_else(|| {
+        StoreError::ConstraintViolation(format!(
+            "task {} has no project; Orqyn's store requires one",
+            task.id
+        ))
+    })?;
+
+    tx.execute(
+        "INSERT INTO tasks (id, project_id, title, objective, description, status,
+                            priority, complexity, expected_outputs, dependencies,
+                            scope_paths, required_capabilities, subtasks,
+                            state_version, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        rusqlite::params![
+            task.id.as_str(),
+            project_id.as_str(),
+            task.title,
+            task.objective,
+            task.description,
+            json::to_json(&task.status)?,
+            json::to_json_or_null(task.priority.as_ref())?,
+            json::to_json(&task.complexity)?,
+            json::to_json(&task.expected_outputs)?,
+            json::to_json(&task.dependencies)?,
+            json::to_json(&task.scope_paths)?,
+            json::to_json(&task.required_capabilities)?,
+            json::to_json(&task.subtasks)?,
+            task.state_version as i64,
+            json::timestamp(task.created_at),
+            json::timestamp(task.updated_at),
+        ],
+    )
+    .map_err(translate_error)?;
+
+    // The queryable dependency graph, kept alongside the JSON column.
+    replace_dependencies(tx, &task.id, &task.dependencies)?;
+
+    Ok(())
 }
 
 /// Rewrite the dependency rows for a task from its current dependency list.
