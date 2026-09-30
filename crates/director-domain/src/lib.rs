@@ -38,6 +38,7 @@
 //!   deterministic change detection over its state.
 //! - [`assignment`] / [`capability`] — who does what, and on what basis.
 //! - [`plan`] / [`decision`] / [`blocker`] — planning artifacts.
+//! - [`graph`] — dependency-graph validation and deterministic task ordering.
 //! - [`checkpoint`] / [`context`] / [`action`] — continuity and evidence.
 //! - [`state`] — observed project state, never remembered.
 //! - [`handoff`] — Orqyn's own claim-once task transfer.
@@ -54,6 +55,7 @@ pub mod capability;
 pub mod checkpoint;
 pub mod context;
 pub mod decision;
+pub mod graph;
 pub mod handoff;
 pub mod ids;
 pub mod plan;
@@ -78,6 +80,7 @@ pub use checkpoint::{
 };
 pub use context::{ContextSnapshot, RecentContext, DEFAULT_MAX_ACTIONS};
 pub use decision::{Decision, DecisionStatus};
+pub use graph::{order as order_plan, GraphError, PlanNode};
 pub use handoff::{Handoff, HandoffError, HandoffState};
 pub use ids::{
     ActionId, AgentId, AssignmentId, BlockerId, CheckpointId, DecisionId, EventId, HandoffId, Id,
