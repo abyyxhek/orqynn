@@ -1405,6 +1405,245 @@ async fn acknowledge_assignment_leaves_an_operators_offline_standing() {
 }
 
 // ---------------------------------------------------------------------------
+// The atomic completion report: the thing the loop's MONITOR step calls when
+// an agent says it finished.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn report_completion_awaits_verification_without_completing() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+
+    let (assignment, task, session) = store
+        .report_completion(&AssignmentId::from_string("ASG-1"), chrono::Utc::now())
+        .await
+        .expect("reported")
+        .expect("there was a tenure to end");
+
+    // The task awaits Orqyn's verdict. It is not `done` — no report an agent
+    // makes can reach `done` — and the tenure is over.
+    assert_eq!(task.status, TaskStatus::VerificationPending);
+    assert_eq!(assignment.status, AssignmentStatus::Released);
+    assert_eq!(assignment.release_reason, Some(ReleaseReason::WorkComplete));
+    assert!(session.is_none(), "no session was ever acknowledged");
+    assert!(
+        store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("the query")
+            .is_none(),
+        "the task is Orqyn's to judge now"
+    );
+
+    // The move is in the history, read back from the store.
+    let history = store
+        .tasks()
+        .task_history(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("history");
+    let last = history.last().expect("there is a transition");
+    assert_eq!(last.from, TaskStatus::InProgress);
+    assert_eq!(last.to, TaskStatus::VerificationPending);
+}
+
+#[tokio::test]
+async fn report_completion_closes_the_session_cleanly_and_frees_the_agent() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+    store
+        .acknowledge_assignment(
+            &AssignmentId::from_string("ASG-1"),
+            &session("SESS-1", "AGENT-1", "TASK-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("acknowledged");
+
+    let (_, _, session) = store
+        .report_completion(&AssignmentId::from_string("ASG-1"), chrono::Utc::now())
+        .await
+        .expect("reported")
+        .expect("there was a tenure to end");
+
+    // The agent said it was done, which is a clean end — not a disappearance.
+    let session = session.expect("the tenure had a session");
+    assert_eq!(session.status, SessionStatus::Closed);
+    assert_eq!(session.end, Some(SessionEnd::Clean));
+
+    // The agent is free to take work again and holds nothing.
+    let agent = store
+        .agents()
+        .get_agent(&AgentId::from_string("AGENT-1"))
+        .await
+        .expect("agent");
+    assert_eq!(agent.status, AgentStatus::Available);
+    assert_eq!(agent.current_task, None);
+}
+
+#[tokio::test]
+async fn report_completion_leaves_an_operators_offline_standing() {
+    // An operator took the agent offline, and it reported finishing anyway. The
+    // tenure ends and the task awaits verification, but the operator's status
+    // is not softened to `Available`.
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+    let mut agent = store
+        .agents()
+        .get_agent(&AgentId::from_string("AGENT-1"))
+        .await
+        .expect("agent");
+    agent.status = AgentStatus::Offline;
+    store
+        .agents()
+        .update_agent(&agent)
+        .await
+        .expect("agent taken offline");
+
+    store
+        .report_completion(&AssignmentId::from_string("ASG-1"), chrono::Utc::now())
+        .await
+        .expect("reported");
+
+    assert_eq!(
+        store
+            .agents()
+            .get_agent(&AgentId::from_string("AGENT-1"))
+            .await
+            .expect("agent")
+            .status,
+        AgentStatus::Offline
+    );
+}
+
+#[tokio::test]
+async fn report_completion_does_not_end_a_tenure_that_was_reassigned() {
+    // The race the id match exists for: ASG-1 held the task, then a
+    // reassignment handed the task to AGENT-2 as ASG-2. A completion report for
+    // ASG-1 must end nothing — and in particular must not release ASG-2 with
+    // ASG-1's completion or touch the task ASG-1 no longer holds.
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+    store
+        .assign_task(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-2"),
+            &AssignmentId::from_string("ASG-2"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("reassigned");
+
+    let outcome = store
+        .report_completion(&AssignmentId::from_string("ASG-1"), chrono::Utc::now())
+        .await
+        .expect("the round");
+
+    assert!(outcome.is_none(), "ASG-1 is not the tenure any more");
+
+    // ASG-1 keeps the reason the reassignment gave it, not a completion.
+    let asg_1 = store
+        .assignments()
+        .get_assignment(&AssignmentId::from_string("ASG-1"))
+        .await
+        .expect("ASG-1");
+    assert_eq!(asg_1.release_reason, Some(ReleaseReason::Reassigned));
+
+    // ASG-2 still holds the task, and the task is still in progress.
+    assert_eq!(
+        store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("the query")
+            .expect("someone holds it")
+            .id,
+        AssignmentId::from_string("ASG-2")
+    );
+    assert_eq!(
+        store
+            .tasks()
+            .get_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("task")
+            .status,
+        TaskStatus::InProgress
+    );
+}
+
+#[tokio::test]
+async fn report_completion_on_a_tenure_that_ran_out_reports_none() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+    store
+        .expire_lease(&TaskId::from_string("TASK-1"), chrono::Utc::now())
+        .await
+        .expect("lease expired");
+
+    let outcome = store
+        .report_completion(&AssignmentId::from_string("ASG-1"), chrono::Utc::now())
+        .await
+        .expect("the round");
+
+    assert!(outcome.is_none(), "the tenure already ended");
+    // The expiry's write stands.
+    assert_eq!(
+        store
+            .tasks()
+            .get_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("task")
+            .status,
+        TaskStatus::Todo
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Checkpoints: superseded, never deleted.
 // ---------------------------------------------------------------------------
 fn checkpoint(id: &str, task: &str, next: &str) -> Checkpoint {

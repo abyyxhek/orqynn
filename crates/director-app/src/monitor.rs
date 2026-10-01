@@ -6,6 +6,13 @@
 //! the holder's heartbeats say, and reclaims the leases whose holder has gone
 //! quiet long enough that the work is not being done.
 //!
+//! It is also the step that takes the holder's reports about the work it holds.
+//! [`acknowledge`] records that the agent *began*, attaching the session doing
+//! the work; [`report_done`] records that the agent *finished*, ending the
+//! tenure and moving the task to `verification_pending`. The two are symmetric,
+//! and both belong here for the same reason: they are what the holder says
+//! about the work, and MONITOR owns the honesty of the in-flight picture.
+//!
 //! ```text
 //! OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN
 //!                            ▲
@@ -18,18 +25,22 @@
 //! ## What MONITOR is responsible for, and what it is not
 //!
 //! MONITOR owns the *honesty of the in-flight picture*. It derives liveness
-//! from heartbeat age, it expires leases that have run out, and it records the
-//! sessions agents report when they start work. A round writes nothing about
-//! tasks that are merely quiet — `Stale` is a report, not an intervention,
-//! because a quiet agent may be thinking and a lease that ends early is work
-//! that has to restart.
+//! from heartbeat age, it expires leases that have run out, it records the
+//! sessions agents report when they start work, and it ends the tenures whose
+//! holders report finishing. A survey round writes nothing about tasks that are
+//! merely quiet — `Stale` is a report, not an intervention, because a quiet
+//! agent may be thinking and a lease that ends early is work that has to
+//! restart.
 //!
-//! MONITOR does **not** decide what to do with a task whose lease it expired.
-//! Putting the task back to `todo` is as far as it goes: choosing the next agent
-//! is ASSIGN's job, and choosing whether the work is still worth doing is
-//! REPLAN's. It also does not decide that an agent is dead — it derives liveness
-//! from the same 30/60-minute windows the substrate uses, and it reclaims; the
-//! agent's own registry is what says what it is.
+//! MONITOR does **not** decide what to do with a task whose lease it expired,
+//! and it does not decide whether work an agent reported finishing is any good.
+//! Putting the task back to `todo` is as far as the expiry goes: choosing the
+//! next agent is ASSIGN's job, and choosing whether the work is still worth
+//! doing is REPLAN's. Moving a reported task to `verification_pending` is as far
+//! as the report goes: judging it is VERIFY's. It also does not decide that an
+//! agent is dead — it derives liveness from the same 30/60-minute windows the
+//! substrate uses, and it reclaims; the agent's own registry is what says what
+//! it is.
 //!
 //! ## Why the expiry is one write
 //!
@@ -338,6 +349,101 @@ pub fn validate_acknowledgment(assignment: &AgentAssignment) -> Result<(), Monit
     Ok(())
 }
 
+/// A request to record that an agent finished the work it was handed.
+///
+/// The caller names the tenure, and Orqyn derives the task from it, so the
+/// report cannot name a task the assignment does not hold. Like
+/// [`AcknowledgeRequest`], everything the store writes is derived from records
+/// Orqyn already holds.
+#[derive(Debug, Clone)]
+pub struct ReportRequest {
+    /// The assignment the agent was given. It must still be active.
+    pub assignment_id: AssignmentId,
+}
+
+/// The outcome of a completion report: a tenure ended as `work_complete`, and a
+/// task left awaiting independent verification.
+#[derive(Debug, Clone)]
+pub struct Reported {
+    /// The assignment, released because its holder reported finishing. Retained
+    /// in the history, like every tenure.
+    pub assignment: AgentAssignment,
+    /// The task, now `verification_pending`. It is not done — nothing an agent
+    /// reports is — and the VERIFY step is what judges it next.
+    pub task: Task,
+    /// The session that did the work, closed as `clean` if it was still live.
+    /// `None` when the agent never acknowledged a session: the report came
+    /// before Orqyn learned which invocation was doing the work.
+    pub session: Option<AgentSession>,
+}
+
+/// Record that an agent finished the work it was handed: the task moves to
+/// `verification_pending`, the tenure ends as `work_complete`, the session
+/// closes cleanly, and the agent is free to take work again — one transaction.
+///
+/// This is the counterpart of [`acknowledge`]: that records the agent *began*,
+/// this records it *finished*. Both are MONITOR's concern because both are
+/// reports from the holder about the work it holds, and together they are what
+/// VERIFY reads — a task sitting in `verification_pending` is a task whose
+/// holder said it was done, and nothing more.
+///
+/// The task is not `done` after this and never could be: [`TaskStatus::Done`]
+/// is not reachable from an agent's report, by construction. This step ends the
+/// agent's part and hands the judgment to VERIFY.
+pub async fn report_done(store: &Store, request: ReportRequest) -> Result<Reported, MonitorError> {
+    report_done_at(store, request, chrono::Utc::now()).await
+}
+
+/// [`report_done`], with the moment the report is recorded supplied by the
+/// caller.
+pub async fn report_done_at(
+    store: &Store,
+    request: ReportRequest,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Reported, MonitorError> {
+    // 1. The assignment the caller named, loaded before validation because the
+    //    question is about the world: a tenure's real status is what decides
+    //    whether its holder can report finishing.
+    let assignment = lookup(store, &request.assignment_id).await?;
+
+    // 2. The legality check. Pure, once the load has happened.
+    validate_completion(&assignment)?;
+
+    // 3. The write, atomic: the task's move to `verification_pending`, the
+    //    tenure's release, the session's close, and the agent's release from
+    //    the work land together, or none of them does. The store matches the
+    //    tenure by id and by still being active, so a reassignment that landed
+    //    since the read is reported as "not active" rather than ending the
+    //    newcomer's tenure with this report.
+    let (assignment, task, session) = store
+        .report_completion(&assignment.id, now)
+        .await?
+        .ok_or_else(|| MonitorError::AssignmentNotActive(assignment.id.clone()))?;
+
+    Ok(Reported {
+        assignment,
+        task,
+        session,
+    })
+}
+
+/// The pure half of a completion report: given the tenure as it stands, can its
+/// holder report the work finished?
+///
+/// No store, no I/O, no clock — everything about the world has already been
+/// loaded by [`report_done_at`]. Extracted so the rule can be tested directly.
+pub fn validate_completion(assignment: &AgentAssignment) -> Result<(), MonitorError> {
+    // A released tenure is over, whatever ended it — the lease ran out, the
+    // work was reassigned, or the agent already reported finishing. Reporting
+    // completion on it again would end an already-ended tenure, and the store
+    // would find nothing to release.
+    if !assignment.is_active() {
+        return Err(MonitorError::AssignmentNotActive(assignment.id.clone()));
+    }
+
+    Ok(())
+}
+
 /// Load an assignment, translating the store's "no such row" into the caller's
 /// "you named an assignment Orqyn does not have" and leaving every other failure
 /// a store failure.
@@ -434,6 +540,37 @@ mod tests {
         });
         assert!(!noisy.is_quiet());
         assert_eq!(noisy.orphaned().len(), 1);
+    }
+
+    #[test]
+    fn an_active_assignment_can_report_completion() {
+        assert!(validate_completion(&active_assignment()).is_ok());
+    }
+
+    #[test]
+    fn a_released_assignment_cannot_report_completion() {
+        // Whatever ended the tenure — the lease ran out, the work was
+        // reassigned, or the agent already reported finishing — it is over, and
+        // reporting it again finds nothing to end.
+        let mut assignment = active_assignment();
+        assignment.release(director_domain::assignment::ReleaseReason::WorkComplete);
+
+        let err = validate_completion(&assignment).unwrap_err();
+        assert!(
+            matches!(err, MonitorError::AssignmentNotActive(ref id)
+                if *id == AssignmentId::from_string("ASG-1")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_assignment_that_never_acknowledged_can_still_report() {
+        // A tenure with no session behind it is still a tenure: the agent may
+        // have done the work without Orqyn ever learning which invocation was
+        // doing it. The report is about the tenure, not the session.
+        let assignment = active_assignment();
+        assert!(assignment.session_id.is_none());
+        assert!(validate_completion(&assignment).is_ok());
     }
 
     #[test]

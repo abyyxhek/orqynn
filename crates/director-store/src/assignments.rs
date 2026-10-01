@@ -654,6 +654,199 @@ pub async fn acknowledge_assignment(
     Ok((assignment, session))
 }
 
+/// Record that the agent holding a tenure finished the work it was handed: the
+/// task moves to `verification_pending`, the tenure is released as
+/// `WorkComplete`, the session that did the work is closed as `Clean` if it
+/// was still live, the agent's `current_task` view is cleared, and an agent
+/// that was `Busy` on this work is `Available` again — one transaction, all or
+/// nothing.
+///
+/// This is the operation the loop's MONITOR step uses when an agent reports it
+/// has finished. The task is deliberately *not* moved to `done`: nothing
+/// self-reports completion in Orqyn, and `done` is a verdict only the
+/// verification engine reaches. Ending the tenure here is what keeps "the
+/// agent's part is over" distinct from "the work is verified" — the task is
+/// now Orqyn's to judge, and the agent is free to take other work while it is
+/// judged.
+///
+/// The tenure is matched by id *and* by still being active, in that order. A
+/// reassignment that landed between the caller's read and this write would put
+/// a different tenure behind the same task, and matching on the task alone
+/// would end the newcomer's tenure with someone else's completion — so the
+/// release is what decides whether there is anything to report, and a
+/// concurrently-ended tenure reports `None` rather than reaching for the task.
+///
+/// The agent is moved to `Available` only if it was `Busy`. A heartbeat that
+/// says the agent went quiet or gone is left standing, because a completion
+/// report is not a heartbeat: the registry's own evidence about the agent is
+/// the authority on the agent, and this write is about the task.
+///
+/// Returns `None` when the tenure is not active at write time. That is the race
+/// a concurrent release or expiry wins: nothing is ended, because there was no
+/// tenure to end.
+pub async fn report_completion(
+    pool: &crate::connection::ConnectionPool,
+    assignment_id: &AssignmentId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<(AgentAssignment, Task, Option<AgentSession>)>, StoreError> {
+    let mut conn = pool.get();
+    let tx = conn.transaction().map_err(translate_error)?;
+
+    // 1. The tenure as it stands, matched on the id the caller named *and* on
+    //    still being active. Read before anything is written because after the
+    //    release the row no longer carries the `active` status that identifies
+    //    it, and because the rest of the transaction works from the task,
+    //    agent, and session this tenure names rather than from the caller's
+    //    belief about them.
+    let assignment: Option<AgentAssignment> = tx
+        .query_row(
+            "SELECT id, task_id, agent_id, session_id, status, assigned_at, released_at,
+                    release_reason, note, state_version
+             FROM agent_assignments WHERE id = ?1 AND status = ?2",
+            rusqlite::params![
+                assignment_id.as_str(),
+                json::to_json(&AssignmentStatus::Active)?
+            ],
+            row_to_assignment,
+        )
+        .optional()
+        .map_err(translate_error)?;
+    let Some(assignment) = assignment else {
+        // Commit the empty transaction so the connection comes back to the pool
+        // clean rather than dropped mid-transaction.
+        tx.commit().map_err(translate_error)?;
+        return Ok(None);
+    };
+
+    // 2. End the tenure, guarded on it still being active. This is the first
+    //    write, so it is what takes the write lock, and its row count is what
+    //    decides whether there is anything to report: a tenure a concurrent
+    //    writer ended between step 1 and here matches nothing, and the whole
+    //    report is abandoned rather than reaching for a task this tenure no
+    //    longer holds.
+    let rows = tx
+        .execute(
+            "UPDATE agent_assignments
+                SET status = ?2, released_at = ?3, release_reason = ?4,
+                    state_version = state_version + 1
+              WHERE id = ?1 AND status = ?5",
+            rusqlite::params![
+                assignment.id.as_str(),
+                json::to_json(&AssignmentStatus::Released)?,
+                json::timestamp(now),
+                json::to_json(&ReleaseReason::WorkComplete)?,
+                json::to_json(&AssignmentStatus::Active)?,
+            ],
+        )
+        .map_err(translate_error)?;
+    if rows == 0 {
+        tx.commit().map_err(translate_error)?;
+        return Ok(None);
+    }
+
+    // 3. The status the task is moving from, read inside the transaction so the
+    //    history records what the store saw — not what the caller believed when
+    //    it decided the work was done.
+    let previous_status: Option<TaskStatus> = tx
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            [assignment.task_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(translate_error)?
+        .map(|text| json::from_json::<TaskStatus>(&text))
+        .transpose()?;
+
+    // 4. The task is awaiting Orqyn's verdict. `verification_pending` is as far
+    //    as an agent's own report can reach; `done` is the verification
+    //    engine's to write.
+    tx.execute(
+        "UPDATE tasks
+            SET status = ?2, state_version = state_version + 1, updated_at = ?3
+          WHERE id = ?1",
+        rusqlite::params![
+            assignment.task_id.as_str(),
+            json::to_json(&TaskStatus::VerificationPending)?,
+            json::timestamp(now),
+        ],
+    )
+    .map_err(translate_error)?;
+
+    // 5. The session, closed as `Clean` if it was still live. The agent
+    //    reported finishing, which is a clean end from its side — and an
+    //    expiry that races this report must not overwrite it with a
+    //    disappearance it inferred, so a session that already closed is left
+    //    exactly as it was.
+    let mut session = None;
+    if let Some(session_id) = assignment.session_id.as_ref() {
+        let held: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT state_version, status FROM agent_sessions WHERE id = ?1",
+                [session_id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(translate_error)?;
+        if let Some((version, status)) = held {
+            if json::from_json::<SessionStatus>(&status)?.is_live() {
+                crate::sessions::close_session(
+                    &tx,
+                    session_id,
+                    SessionEnd::Clean,
+                    now,
+                    version as u64,
+                )?;
+                session = Some(crate::sessions::load_session(&tx, session_id)?);
+            }
+        }
+    }
+
+    // 6. The agent no longer holds this task. The assignment row is the
+    //    authority; this clears the denormalized view it reflects, tolerating
+    //    an agent row that has since moved on to other work.
+    clear_current_task_if_still(&tx, &assignment.agent_id, &assignment.task_id)?;
+
+    // 7. An agent that was working this task is free again — but only if it was
+    //    working. A heartbeat that already said the agent went quiet or gone is
+    //    the stronger statement about the agent, and it is left standing.
+    tx.execute(
+        "UPDATE agents
+            SET status = ?2, updated_at = ?3, state_version = state_version + 1
+          WHERE id = ?1 AND status = ?4",
+        rusqlite::params![
+            assignment.agent_id.as_str(),
+            json::to_json(&AgentStatus::Available)?,
+            json::timestamp(now),
+            json::to_json(&AgentStatus::Busy)?,
+        ],
+    )
+    .map_err(translate_error)?;
+
+    // 8. The transition, recorded the same way every other status move records
+    //    one: same transaction as the update, and only when the status
+    //    genuinely changed, so the history never accumulates no-op entries.
+    if previous_status != Some(TaskStatus::VerificationPending) {
+        tx.execute(
+            "INSERT INTO task_status_history (task_id, from_status, to_status, occurred_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                assignment.task_id.as_str(),
+                json::to_json_or_null(previous_status.as_ref())?,
+                json::to_json(&TaskStatus::VerificationPending)?,
+                json::timestamp(now),
+            ],
+        )
+        .map_err(translate_error)?;
+    }
+
+    tx.commit().map_err(translate_error)?;
+
+    let assignment = load_assignment(&conn, &assignment.id)?;
+    let task = crate::tasks::load_task(&conn, &assignment.task_id)?;
+    Ok(Some((assignment, task, session)))
+}
+
 /// Insert an assignment row in whatever status it carries.
 pub(crate) fn insert_assignment(
     conn: &PooledConn,

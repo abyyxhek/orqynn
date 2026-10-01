@@ -16,11 +16,12 @@
 
 use director_app::assign::{assign, ready_tasks, AssignRequest};
 use director_app::monitor::{
-    acknowledge, monitor_at, validate_acknowledgment, AcknowledgeRequest, InFlight,
+    acknowledge, monitor_at, report_done, validate_acknowledgment, validate_completion,
+    AcknowledgeRequest, InFlight, ReportRequest,
 };
 use director_app::MonitorError;
 use director_domain::agent::{Agent, AgentStatus, Harness};
-use director_domain::assignment::{AssignmentStatus, ReleaseReason};
+use director_domain::assignment::{AgentAssignment, AssignmentStatus, ReleaseReason};
 use director_domain::capability::Capability;
 use director_domain::ids::{
     AgentId, AssignmentId, MachineId, PlanId, ProjectId, SessionId, TaskId,
@@ -581,4 +582,211 @@ fn the_acknowledgment_rules_are_the_pure_half_of_the_step() {
         validate_acknowledgment(&assignment).is_err(),
         "already has a session"
     );
+}
+
+mod completion {
+    use super::*;
+
+    /// Hand a task to the fixture's agent and have it report finishing, the way
+    /// MONITOR's two halves compose in the running loop.
+    async fn assign_and_report(fixture: &Fixture, task: &str) {
+        fixture.assign(task).await;
+        report_done(
+            &fixture.store,
+            ReportRequest {
+                assignment_id: AssignmentId::from_string("ASG-1"),
+            },
+        )
+        .await
+        .expect("reported");
+    }
+
+    #[tokio::test]
+    async fn a_completion_report_awaits_verification_without_completing() {
+        // The acceptance criterion the whole model exists for: an agent saying
+        // "done" must not complete a task. It moves to `verification_pending`,
+        // and only verification reaches `done`.
+        let fixture = Fixture::new(&["A"]).await;
+        assign_and_report(&fixture, "A").await;
+
+        let task = fixture.reload_task("A").await;
+        assert_eq!(task.status, TaskStatus::VerificationPending);
+        assert_ne!(task.status, TaskStatus::Done, "nothing self-completes");
+
+        // The tenure is retained and its reason says the agent finished —
+        // distinct from a lease that ran out or a reassignment.
+        let tenure = fixture
+            .store
+            .assignments()
+            .assignment_history(&TaskId::from_string("A"))
+            .await
+            .expect("history");
+        assert_eq!(tenure.len(), 1, "the tenure is retained");
+        assert_eq!(tenure[0].status, AssignmentStatus::Released);
+        assert_eq!(tenure[0].release_reason, Some(ReleaseReason::WorkComplete));
+
+        // And no assignment is in force: the work is Orqyn's to judge now.
+        assert!(fixture
+            .store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("A"))
+            .await
+            .expect("the query")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reported_task_closes_its_session_and_frees_the_agent() {
+        // The full sequence: the agent acknowledges the work, then reports
+        // finishing. Its session closes cleanly and it is available again.
+        let fixture = Fixture::new(&["A"]).await;
+        fixture.assign("A").await;
+        acknowledge(
+            &fixture.store,
+            AcknowledgeRequest {
+                assignment_id: AssignmentId::from_string("ASG-1"),
+                session_id: SessionId::from_string("SESS-1"),
+            },
+        )
+        .await
+        .expect("acknowledged");
+        assert_eq!(fixture.reload_agent().await.status, AgentStatus::Busy);
+
+        let reported = report_done(
+            &fixture.store,
+            ReportRequest {
+                assignment_id: AssignmentId::from_string("ASG-1"),
+            },
+        )
+        .await
+        .expect("reported");
+
+        // The session ended cleanly — the agent said it was done, which is a
+        // clean close from its side, not a disappearance.
+        let session = reported.session.expect("the lease had a session");
+        assert_eq!(session.status, SessionStatus::Closed);
+        assert_eq!(session.end, Some(SessionEnd::Clean));
+        assert!(!session.ended_uncleanly());
+
+        // The agent holds nothing and is free to take work again.
+        let agent = fixture.reload_agent().await;
+        assert_eq!(agent.current_task, None);
+        assert_eq!(agent.status, AgentStatus::Available);
+    }
+
+    #[tokio::test]
+    async fn a_reported_task_is_no_longer_work_in_flight() {
+        // The report and the survey compose: a task awaiting verification is
+        // not being worked, so MONITOR's next round does not survey it.
+        let fixture = Fixture::new(&["A"]).await;
+        assign_and_report(&fixture, "A").await;
+
+        let report = monitor_at(&fixture.store, &fixture.project, fixture.now)
+            .await
+            .expect("the round");
+
+        assert!(report.in_flight.is_empty(), "nothing is in flight");
+        assert!(report.is_quiet());
+    }
+
+    #[tokio::test]
+    async fn reporting_done_on_a_lease_that_already_expired_is_refused() {
+        // The tenure ran out before the agent reported, so there is nothing to
+        // end. The refusal names the assignment, and the store's state is what
+        // the expiry left it in.
+        let fixture = Fixture::new(&["A"]).await;
+        fixture.assign("A").await;
+        fixture.quiet_for(90).await;
+        monitor_at(&fixture.store, &fixture.project, fixture.now)
+            .await
+            .expect("the lease expired");
+
+        let err = report_done(
+            &fixture.store,
+            ReportRequest {
+                assignment_id: AssignmentId::from_string("ASG-1"),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, MonitorError::AssignmentNotActive(ref id)
+                if *id == AssignmentId::from_string("ASG-1")),
+            "got {err:?}"
+        );
+
+        // The expiry's write stands: the task is back to `todo`, not
+        // `verification_pending`.
+        assert_eq!(fixture.reload_task("A").await.status, TaskStatus::Todo);
+    }
+
+    #[tokio::test]
+    async fn reporting_done_on_an_unknown_assignment_is_refused() {
+        let fixture = Fixture::new(&["A"]).await;
+        fixture.assign("A").await;
+
+        let err = report_done(
+            &fixture.store,
+            ReportRequest {
+                assignment_id: AssignmentId::from_string("ASG-nope"),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, MonitorError::UnknownAssignment(ref id)
+                if *id == AssignmentId::from_string("ASG-nope")),
+            "got {err:?}"
+        );
+
+        // Nothing was ended: the task is still in flight and still held.
+        assert_eq!(
+            fixture.reload_task("A").await.status,
+            TaskStatus::InProgress
+        );
+        assert!(fixture
+            .store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("A"))
+            .await
+            .expect("the query")
+            .is_some());
+    }
+
+    #[test]
+    fn the_completion_rules_are_the_pure_half_of_the_report() {
+        // The tenure must be in force to be ended; an agent that already
+        // reported, or whose lease ran out, has nothing to report.
+        assert!(validate_completion(&active_tenure()).is_ok());
+
+        let mut released = active_tenure();
+        released.release(ReleaseReason::WorkComplete);
+        assert!(
+            validate_completion(&released).is_err(),
+            "already reported — the tenure is over"
+        );
+
+        let mut expired = active_tenure();
+        expired.release(ReleaseReason::LeaseExpired);
+        assert!(
+            validate_completion(&expired).is_err(),
+            "the lease ran out — the tenure is over"
+        );
+    }
+
+    /// An active tenure on TASK-A, with no session yet.
+    fn active_tenure() -> AgentAssignment {
+        AgentAssignment {
+            id: AssignmentId::from_string("ASG-1"),
+            task_id: TaskId::from_string("A"),
+            agent_id: AgentId::from_string("AGENT-1"),
+            session_id: None,
+            status: AssignmentStatus::Active,
+            assigned_at: chrono::Utc::now(),
+            released_at: None,
+            release_reason: None,
+            note: None,
+            state_version: 1,
+        }
+    }
 }

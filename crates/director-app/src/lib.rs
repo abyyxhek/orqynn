@@ -19,12 +19,13 @@
 //! tested before the next is written — the loop is built in the order it will
 //! run, so a step is never written against steps that do not exist yet.
 //!
-//! Only OBSERVE exists today. It is the natural first step for a structural
+//! Five of the six steps are in place. OBSERVE is first for a structural
 //! reason: it is the only one whose inputs come entirely from outside Orqyn.
 //! PLAN reads the state OBSERVE produced; ASSIGN reads what PLAN decided;
 //! MONITOR and VERIFY read what ASSIGN started. Every step after the first
 //! consumes the output of the one before it, so writing OBSERVE first is what
-//! gives the rest something to be tested against.
+//! gave the rest something to be tested against. REPLAN is built last, with
+//! the remaining steps the README's fuller diagram names.
 //!
 //! ## What this crate is not
 //!
@@ -38,6 +39,7 @@ pub mod assign;
 pub mod monitor;
 pub mod observe;
 pub mod plan;
+pub mod verify;
 
 use director_domain::capability::Capability;
 use director_domain::ids::{AgentId, AssignmentId, PlanId, ProjectId, SessionId, TaskId};
@@ -332,5 +334,32 @@ pub enum MonitorError {
 impl From<director_domain::StoreError> for MonitorError {
     fn from(err: director_domain::StoreError) -> Self {
         MonitorError::Store(err.to_string())
+    }
+}
+
+/// Every way a VERIFY round can fail, in one place.
+///
+/// Like the other steps' error enums, this is flat with no source chains,
+/// because there is only one failure mode: the store. The verdict itself never
+/// errors — a check that cannot be run is reported as
+/// [`crate::verify::UnverifiableReason::EvidenceMissing`] rather than raised,
+/// because broken evidence is a property of the environment, not a failure of
+/// the round. That distinction is what keeps an environment hiccup from being
+/// recorded as a verdict on someone's work.
+///
+/// [`Self::Store`] means the round could not read the tasks awaiting a verdict
+/// or could not persist one. A verdict is one task write with its history row,
+/// so this leaves the task awaiting verification exactly as the round found it
+/// — which is also why an unverifiable task is safe to survey again next tick.
+#[derive(Debug, Error)]
+pub enum VerifyError {
+    /// Orqyn could not read or write its own state.
+    #[error("the store rejected the verification round: {0}")]
+    Store(String),
+}
+
+impl From<director_domain::StoreError> for VerifyError {
+    fn from(err: director_domain::StoreError) -> Self {
+        VerifyError::Store(err.to_string())
     }
 }

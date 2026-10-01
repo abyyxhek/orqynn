@@ -248,6 +248,30 @@ impl Store {
         assignments::acknowledge_assignment(&self.pool, assignment_id, session, now).await
     }
 
+    /// Record that the agent holding a tenure finished the work it was handed:
+    /// the task moves to `verification_pending`, the tenure is released as
+    /// `WorkComplete`, the session that did the work is closed as `Clean` if it
+    /// was still live, the agent's `current_task` view is cleared, and an agent
+    /// that was `Busy` on this work is `Available` again — one transaction, all
+    /// or nothing.
+    ///
+    /// This is the operation the loop's MONITOR step uses when an agent reports
+    /// it has finished. The task is not `done` and this write never makes it
+    /// so: `done` is the verdict only the VERIFY step reaches, and ending the
+    /// tenure here is what frees the agent while Orqyn judges the result. The
+    /// tenure is matched by id *and* by still being active, so a reassignment
+    /// that landed between the caller's read and this write cannot make this
+    /// report end a different tenure. Returns `None` when the tenure is not
+    /// active at write time, which is the race a concurrent release or expiry
+    /// wins.
+    pub async fn report_completion(
+        &self,
+        assignment_id: &AssignmentId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<(AgentAssignment, Task, Option<AgentSession>)>, StoreError> {
+        assignments::report_completion(&self.pool, assignment_id, now).await
+    }
+
     /// Checkpoints: Orqyn's own resumption documents. Superseded ones are
     /// retained.
     pub fn checkpoints(&self) -> SqliteCheckpointRepository {

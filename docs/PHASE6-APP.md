@@ -1,8 +1,8 @@
 # Phase 6 — The Control Loop, and Its First Steps
 
-> **Status: underway.** The `director-app` crate exists and its first four
-> steps — OBSERVE, PLAN, ASSIGN, and MONITOR — are landed and tested. The
-> remaining steps are built next, one at a time, in the order they run.
+> **Status: underway.** The `director-app` crate exists and its first five
+> steps — OBSERVE, PLAN, ASSIGN, MONITOR, and VERIFY — are landed and tested.
+> REPLAN is the remaining step, built last.
 
 ## Goal
 
@@ -202,6 +202,50 @@ released tenure cannot acknowledge a session — that would give an ended
 assignment evidence of work it never did — and a tenure with a session cannot
 acknowledge a second.
 
+### The completion report: a claim becomes work awaiting judgment
+
+The other half of MONITOR's job is to take the holder's word for the *state* of
+the work, not just its existence. `report_done()` is the counterpart of
+`acknowledge()`: that records the agent *began*, this records it *finished*.
+Both are MONITOR's because both are reports from the holder about the work it
+holds.
+
+What the report does *not* do is complete anything. The task moves to
+`verification_pending` and stops there — this is the whole shape of the
+model's second invariant, that nothing self-reports completion. `Done` is not
+reachable from an agent's report; only VERIFY writes it. The report ends the
+*agent's* part and hands the judgment to Orqyn, and the two are deliberately
+separate facts: an agent finishing is evidence about the agent, a task passing
+verification is evidence about the work.
+
+The store's `report_completion` is one transaction doing five things: the task
+moves to `verification_pending` with a status transition, the tenure is
+released as `WorkComplete` (the reason that already existed for exactly this
+case, and which distinguishes it from a lease that ran out or a reassignment),
+the session that did the work is closed as `Clean` if it was still live, the
+agent's denormalized `current_task` is cleared, and an agent that was `Busy`
+becomes `Available` again. Releasing the tenure here — rather than when the
+verdict lands — is what frees the agent while Orqyn still judges the result,
+and what leaves a task awaiting verification with no tenant, which is what
+keeps VERIFY's write to a single row.
+
+Three details are in that transaction for specific reasons, all inherited from
+the same reasoning that shaped the expiry:
+
+- The tenure is matched by id *and* by still being active, in that order. A
+  reassignment that landed between the caller's read and the write would put a
+  *different* tenure behind the same task; matching on the task alone would
+  end the newcomer's tenure with someone else's completion. The release is the
+  first write in the transaction, so its row count is what decides whether
+  there is anything to report at all.
+- The agent is freed only if it was `Busy`. A heartbeat that already said the
+  agent went quiet or gone is left standing, because a completion report is
+  not a heartbeat and the registry's own evidence is the authority on the
+  agent.
+- The session closes as `Clean` only if it was still live, so an expiry that
+  races this report leaves the cleaner evidence in place rather than
+  overwriting it.
+
 ### Why a quiet round is not an empty report
 
 A round that found nothing to reclaim returns a report full of `Live` entries
@@ -217,6 +261,74 @@ task whose holder is quiet is reported every round and written never.
 
 Keeping each step that narrow is what makes them testable in isolation: each
 one consumes the state the previous one produced and needs nothing more.
+
+## VERIFY: a claim becomes a verdict
+
+MONITOR's completion report leaves a task at `verification_pending` and stops
+there. VERIFY is what moves it next, and it is the only step that may reach
+`done` — the whole model's second invariant, that nothing self-reports
+completion, needs a counterweight that actually looks at the work.
+
+It looks by running something. Each of the task's `ExpectedOutput`s can carry a
+check: a command line, run through the `ExecutionProvider` in a working
+directory, with Orqyn reading the exit code. The agent whose work is being
+judged never reports the outcome, and the provider that runs the command never
+interprets it. That is the acceptance criterion "agent claims done, tests fail
+→ must not become completed," made mechanical — and it is why the tests in
+`tests/verify.rs` run real commands (`git`) through the real `LocalExecutor`
+rather than a mocked executor: a mock could confirm the step calls
+`run_command`, but not that an exit code the executor produces and a verdict
+the step reaches agree.
+
+Three verdicts are possible, and only two of them write:
+
+- **Pass** — every check ran and exited zero. The task becomes `done`.
+- **Fail** — a check ran and did not exit zero, or the executor killed it for
+  exceeding its timeout. The task becomes `failed`, and what happens to failed
+  work is REPLAN's.
+- **Unverifiable** — the round writes nothing and leaves the task awaiting
+  verification. Either the task names no check at all, or a check exists and
+  the round could not run it: the executor refused, or the command names no
+  program.
+
+The distinction between the last two is the one design point that is easy to
+get backwards. An unrunnable check is *not* a failure: broken evidence is a
+property of the environment, not of the work, and marking work failed because
+the harness could not run a test would turn every environment hiccup into a
+false verdict on someone's task. So a check that cannot run is reported — with
+the error, so a caller can tell a broken environment from broken work — and
+the task is surveyed again next tick, which is safe precisely because the round
+wrote nothing about it.
+
+The precedence between the verdicts is the rest of the design, and it is
+extracted into a pure `judge()` so the rules can be tested without running
+anything:
+
+1. A failure decides. Nothing else the round observed undoes an observed
+   failure, so `Failed` comes first — a task with one failing check and one
+   unrunnable one has been judged.
+2. Missing evidence blocks a pass only when nothing failed.
+3. Otherwise at least one check must have passed. A task whose criteria are all
+   prose has nothing Orqyn verified, and Orqyn does not complete work it did
+   not check.
+
+A criterion with no machine check is `Unchecked`, reported to the caller and
+never blocking: Orqyn verifies what it can check and says plainly what it
+could not, rather than silently satisfying a criterion it never tested.
+
+### Why the write is one row
+
+The verdict is a single `update_task`, status and history transition in one
+transaction. There is no second fact that has to land with it: MONITOR's report
+already ended the tenure, closed the session, and freed the agent, so a task
+awaiting verification has no tenant and no session left to clean up. That is
+why the report ends the tenure when the agent finishes rather than when the
+verdict lands — it keeps this step's write to a single row, and it is what lets
+the agent take other work while Orqyn is still judging the last of it.
+
+The round is idempotent, which is what makes it safe to run on every tick. A
+task it passed is `done` and a task it failed is `failed`, so the next round
+surveys neither; only the tasks it could not judge come around again.
 
 ## What the crate is not
 
@@ -291,3 +403,34 @@ minutes and the tests move the heartbeats rather than the clock:
   the agent acknowledged is closed as `vanished` when its lease runs out.
 - Acknowledging an unknown assignment, a tenure twice, or a tenure whose lease
   already expired is refused in each case with nothing written.
+- A completion report moves the task to `verification_pending` and ends the
+  tenure as `work_complete` without ever reaching `done` — the invariant the
+  whole model exists for — and no assignment is in force afterward, so the
+  work is Orqyn's to judge. The session the agent acknowledged closes as
+  `clean`, and the agent is free to take work again.
+- Reporting on a tenure a reassignment already replaced writes nothing and
+  leaves the newcomer's tenure standing, which is what the id match in the
+  transaction is for; reporting on a lease that ran out is refused with the
+  expiry's write intact.
+- A reported task is no longer work in flight, so the next MONITOR round does
+  not survey it.
+
+`tests/verify.rs` works against a real store and a real executor, and its tasks
+arrive at `verification_pending` the way they do in the running loop — ASSIGN
+hands them out, then MONITOR records the holder finishing — rather than a
+status being poked by hand:
+
+- A task whose checks pass becomes `done` in the store the next tick reads, and
+  a task whose check fails becomes `failed` and is not `done`. The failing
+  check is reported with its exit code and stderr, so a caller can say *why*
+  the work failed rather than just that it did.
+- The verdict lands in the append-only history as a transition from
+  `verification_pending`.
+- A task whose only criterion is prose stays awaiting verification — nothing
+  was verified, so nothing was written — and prose alongside a passing check
+  does not block the pass.
+- A check naming a program that does not exist stays awaiting verification with
+  the error carried: missing evidence is not a verdict.
+- A round that passes one task and fails another judges each on its own
+  evidence, surveys only the tasks awaiting a verdict, and judges each task
+  once — a second round after a pass or a fail has nothing to do.
