@@ -34,6 +34,7 @@ use rusqlite::OptionalExtension;
 
 use director_domain::assignment::{AgentAssignment, AssignmentStatus, ReleaseReason};
 use director_domain::ids::{AgentId, AssignmentId, SessionId, TaskId};
+use director_domain::task::{Task, TaskStatus};
 use director_domain::StoreError;
 
 use crate::connection::{row_count_to_outcome, translate_error, PooledConn};
@@ -185,24 +186,22 @@ impl director_domain::AssignmentRepository for SqliteAssignmentRepository {
     }
 }
 
-/// The atomic assignment operation: release any sitting tenant, insert the new
-/// assignment as active, and move the agent's `current_task` view — one
-/// transaction, all or nothing.
+/// The handoff itself, run inside the caller's transaction: release any sitting
+/// tenant, clear their `current_task` view, insert the new assignment as
+/// active, and point the incoming agent's view at the task. Returns the agent
+/// that was displaced, if any, so the caller can report the move.
 ///
-/// This is the method a caller uses to *assign* a task. The trait's
-/// `create_assignment` inserts a row in any status (a `Proposed` assignment
-/// that is not yet acknowledged); this is the operation that actually hands the
-/// task to an agent.
-pub async fn assign_task(
-    pool: &crate::connection::ConnectionPool,
+/// Extracted because two operations need this exact sequence. [`assign_task`]
+/// commits it on its own; [`assign_and_start`] folds the task's status move into
+/// the same transaction, so an assignment never lands without the task
+/// reflecting it — and a failure partway through never lands at all.
+fn handoff(
+    tx: &rusqlite::Transaction<'_>,
     task_id: &TaskId,
     agent_id: &AgentId,
     assignment_id: &AssignmentId,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<AgentAssignment, StoreError> {
-    let mut conn = pool.get();
-    let tx = conn.transaction().map_err(translate_error)?;
-
+) -> Result<Option<AgentId>, StoreError> {
     // 1. Who is being displaced, if anyone? This has to be learned *before* the
     //    release in step 2, because afterwards the row no longer carries the
     //    `active` status that identifies it as the sitting tenant.
@@ -242,7 +241,7 @@ pub async fn assign_task(
     //    point at the task. Clearing only if the view still names this task
     //    keeps a late release of an older assignment from undoing a newer move.
     if let Some(departing) = &sitting {
-        clear_current_task_if_still(&tx, departing, task_id)?;
+        clear_current_task_if_still(tx, departing, task_id)?;
     }
 
     // 4. The new assignment. Status is `active`: this operation is the handoff.
@@ -272,9 +271,19 @@ pub async fn assign_task(
     )
     .map_err(translate_error)?;
 
-    tx.commit().map_err(translate_error)?;
+    Ok(sitting)
+}
 
-    let assignment = AgentAssignment {
+/// The assignment row as [`handoff`] leaves it: active, with no session yet,
+/// starting at version 1. A session arrives when the agent acknowledges the
+/// work, which is the MONITOR step's concern rather than the handoff's.
+fn assignment_row(
+    task_id: &TaskId,
+    agent_id: &AgentId,
+    assignment_id: &AssignmentId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> AgentAssignment {
+    AgentAssignment {
         id: assignment_id.clone(),
         task_id: task_id.clone(),
         agent_id: agent_id.clone(),
@@ -285,8 +294,111 @@ pub async fn assign_task(
         release_reason: None,
         note: None,
         state_version: 1,
-    };
-    Ok(assignment)
+    }
+}
+
+/// The atomic assignment operation: release any sitting tenant, insert the new
+/// assignment as active, and move the agent's `current_task` view — one
+/// transaction, all or nothing.
+///
+/// This is the method a caller uses to *assign* a task. The trait's
+/// `create_assignment` inserts a row in any status (a `Proposed` assignment
+/// that is not yet acknowledged); this is the operation that actually hands the
+/// task to an agent.
+pub async fn assign_task(
+    pool: &crate::connection::ConnectionPool,
+    task_id: &TaskId,
+    agent_id: &AgentId,
+    assignment_id: &AssignmentId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<AgentAssignment, StoreError> {
+    let mut conn = pool.get();
+    let tx = conn.transaction().map_err(translate_error)?;
+    handoff(&tx, task_id, agent_id, assignment_id, now)?;
+    tx.commit().map_err(translate_error)?;
+
+    Ok(assignment_row(task_id, agent_id, assignment_id, now))
+}
+
+/// [`assign_task`], and the task starts: the same atomic handoff, plus the
+/// task's move to `in_progress` and the status transition that records it — all
+/// one transaction.
+///
+/// This is the operation the loop's ASSIGN step uses. Splitting the handoff
+/// from the status move across two store calls would leave a window in which
+/// the task was assigned but still read `todo`, which is precisely the state a
+/// crash between the two calls would leave behind. Folding them together makes
+/// "an assigned task is an in-progress task" a guarantee of the write rather
+/// than a caller's ordering.
+///
+/// Returns the assignment, the task as it now stands, and the agent the handoff
+/// displaced — all read back from the store rather than echoed from the input.
+pub async fn assign_and_start(
+    pool: &crate::connection::ConnectionPool,
+    task_id: &TaskId,
+    agent_id: &AgentId,
+    assignment_id: &AssignmentId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(AgentAssignment, Task, Option<AgentId>), StoreError> {
+    let mut conn = pool.get();
+    let tx = conn.transaction().map_err(translate_error)?;
+
+    // The status the task is moving from, read inside the transaction so the
+    // transition history records what the store actually saw — not what the
+    // caller believed when it decided to assign. A task that is not `todo` is
+    // not started here; the handoff still happens, and the history records the
+    // real transition, so the record stays honest even if a concurrent writer
+    // moved the task between the caller's validation and this write.
+    let previous_status: Option<TaskStatus> = tx
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            [task_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(translate_error)?
+        .map(|text| json::from_json::<TaskStatus>(&text))
+        .transpose()?;
+
+    let sitting = handoff(&tx, task_id, agent_id, assignment_id, now)?;
+
+    // The task reflects the assignment: an agent is expected to be working it.
+    // Version is bumped by the write itself, the way `update_task` does it, so
+    // the caller's read of the task does not become a stale-write hazard here.
+    tx.execute(
+        "UPDATE tasks
+            SET status = ?2, state_version = state_version + 1, updated_at = ?3
+          WHERE id = ?1",
+        rusqlite::params![
+            task_id.as_str(),
+            json::to_json(&TaskStatus::InProgress)?,
+            json::timestamp(now),
+        ],
+    )
+    .map_err(translate_error)?;
+
+    // The transition, recorded the same way `update_task` records one: same
+    // transaction as the update, and only when the status genuinely changed, so
+    // the history never accumulates no-op entries.
+    if previous_status != Some(TaskStatus::InProgress) {
+        tx.execute(
+            "INSERT INTO task_status_history (task_id, from_status, to_status, occurred_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                task_id.as_str(),
+                json::to_json_or_null(previous_status.as_ref())?,
+                json::to_json(&TaskStatus::InProgress)?,
+                json::timestamp(now),
+            ],
+        )
+        .map_err(translate_error)?;
+    }
+
+    tx.commit().map_err(translate_error)?;
+
+    let assignment = load_assignment(&conn, assignment_id)?;
+    let task = crate::tasks::load_task(&conn, task_id)?;
+    Ok((assignment, task, sitting))
 }
 
 /// Insert an assignment row in whatever status it carries.

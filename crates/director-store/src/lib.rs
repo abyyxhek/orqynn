@@ -173,6 +173,29 @@ impl Store {
         assignments::assign_task(&self.pool, task_id, agent_id, assignment_id, now).await
     }
 
+    /// Hand a task to an agent and start it: [`Self::assign_task`]'s atomic
+    /// handoff, plus the task's move to `in_progress` and the status transition
+    /// that records it — all one transaction, all or nothing.
+    ///
+    /// This is the operation the loop's ASSIGN step uses. The handoff and the
+    /// status move cannot be left in separate calls, because the window between
+    /// them is exactly the state a crash would strand: an agent assigned to a
+    /// task that still reads `todo`. Folding them together makes "an assigned
+    /// task is an in-progress task" a property of the write rather than an
+    /// ordering the caller has to get right.
+    ///
+    /// Returns the assignment, the task as it now stands, and the agent the
+    /// handoff displaced — read back from the store, not echoed from the input.
+    pub async fn assign_and_start(
+        &self,
+        task_id: &TaskId,
+        agent_id: &AgentId,
+        assignment_id: &AssignmentId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(AgentAssignment, Task, Option<AgentId>), StoreError> {
+        assignments::assign_and_start(&self.pool, task_id, agent_id, assignment_id, now).await
+    }
+
     /// Create a plan, persist every task it decomposes into, and activate it:
     /// one transaction, all or nothing. The project's sitting active plan is
     /// superseded — marked and linked, never deleted — inside the same

@@ -14,10 +14,11 @@ their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
-> **Status: Phases 1–3, 5 complete; Phase 6 underway (OBSERVE landed).** The
-> canonical domain model, the provider trait boundary, both substrate adapters,
-> Orqyn's own persistent store, and the first step of the control loop are in
-> place, with zero substrate coupling and a passing test suite (310 tests).
+> **Status: Phases 1–3, 5 complete; Phase 6 underway (OBSERVE, PLAN, and ASSIGN
+> landed).** The canonical domain model, the provider trait boundary, both
+> substrate adapters, Orqyn's own persistent store, and the first three steps
+> of the control loop are in place, with zero substrate coupling and a passing
+> test suite (325 tests).
 >
 > - **Phase 1** — the domain model and the seven provider traits it depends on,
 >   plus an in-memory implementor of every one of them.
@@ -36,17 +37,22 @@ crates. A boundary test in this repo enforces that — see
 >   index in the schema, not a convention. (There is no Phase 4; the roadmap
 >   skips it.)
 > - **Phase 6** — `director-app`, the crate that drives the loop
->   `OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN`. Its first two steps
+>   `OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN`. Its first three steps
 >   are landed. OBSERVE: an observed repository becomes normalized belief in
 >   Orqyn's store. PLAN: a stated objective and task decomposition are validated
 >   — no self-dependencies, no edges to tasks outside the plan, no cycles —
 >   ordered deterministically, and persisted as the project's active plan in one
 >   transaction, superseding whatever it was executing before. The decomposition
 >   itself arrives from the caller; PLAN makes it real, ordered, and durable
->   rather than inventing it. The remaining steps are next.
+>   rather than inventing it. ASSIGN: a task the active plan makes eligible is
+>   handed to a named agent — the handoff, the task's move to `in_progress`, and
+>   the status transition recording it are one transaction, so an assigned task
+>   is never left un-started. Which agent gets which task arrives from the
+>   caller too; `ready_tasks` is the read a scheduler will drive off. The
+>   remaining steps are next.
 >
-> There is no MCP server of Orqyn's own yet and only the first two steps of the
-> loop are wired in — those are later phases, and their absence here is
+> There is no MCP server of Orqyn's own yet and only the first three steps of
+> the loop are wired in — those are later phases, and their absence here is
 > deliberate.
 
 ---
@@ -96,7 +102,7 @@ orqyn/
 │   ├── director-store/      # SQLite store for Orqyn's own entities. Owns
 │   │                        # its schema; depends only on director-domain.
 │   └── director-app/        # The control loop. Composes the layers into
-│                            # steps; OBSERVE and PLAN are wired in.
+│                            # steps; OBSERVE, PLAN, and ASSIGN are wired in.
 ├── docs/
 │   ├── PHASE0-FORENSICS.md  # Read-only audit of both upstream repos:
 │   │                        # data models, ~30 vs ~80 MCP tools, feature
@@ -293,8 +299,8 @@ rationale for avoiding it. That is the opposite of coupling.
                                  Git / Code → PROJECT
 ```
 
-Orqyn's control loop (the shape is fixed; OBSERVE and PLAN are built, the
-remaining steps are not):
+Orqyn's control loop (the shape is fixed; OBSERVE, PLAN, and ASSIGN are built,
+the remaining steps are not):
 
 ```
 OBSERVE (git/fs/tests + substrate events + agent heartbeats)
@@ -390,6 +396,15 @@ than the plumbing:
   middleware → tests is a reasoning step and arrives from the caller as
   `TaskSpec`s; PLAN makes it real, ordered, and durable rather than inventing
   it. A step that writes its own decomposition is a later phase.
+- **No scheduling.** The ASSIGN step is landed: it hands a task to a named agent
+  — refusing a task the active plan does not name, a task whose dependencies
+  are not finished, a task an agent already holds, and an agent that is
+  unavailable or lacks a required capability — and commits the handoff and the
+  task's start in one transaction. What it does not do is decide *which* agent
+  gets *which* task. Matching tasks to agents by capability and load is a
+  scheduling judgment and arrives from the caller; `ready_tasks` reports the
+  work that can be handed out right now, and a step that assigns on its own is
+  a later phase.
 - **No verification engine.** The model treats a task as not-done until
   something independent confirms it; the verifier that holds the "nothing
   self-reports completion" invariant is a later phase.
@@ -406,9 +421,9 @@ than the plumbing:
 | **2** ✅ | Git observation layer (observer, store, service, `ProjectStateSnapshot`) + `HandoffAdapter`: handoff-mcp client implementing `TaskProvider`/`AgentProvider`/`SessionProvider`. |
 | **3** ✅ | `AiMemoryAdapter` — ai-memory client implementing `MemoryProvider`. |
 | **5** ✅ | `director-store` — Orqyn's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
-| **6** ⧗ | `director-app` — the control loop. OBSERVE and PLAN are landed and tested (git layer composed with the store; plan, tasks, and activation in one transaction), and the dependency-graph validation PLAN builds on is landed in `director-domain`; the remaining steps are built next. |
+| **6** ⧗ | `director-app` — the control loop. OBSERVE, PLAN, and ASSIGN are landed and tested (git layer composed with the store; plan, tasks, and activation in one transaction; a task handed to an agent and started in one transaction), and the dependency-graph validation PLAN builds on is landed in `director-domain`; the remaining steps are built next. |
 | 10 | The verification engine. |
-| — | The loop's remaining steps, built one at a time in the order they run: PLAN → ASSIGN → MONITOR → VERIFY → REPLAN. |
+| — | The loop's remaining steps, built one at a time in the order they run: MONITOR → VERIFY → REPLAN. |
 
 ---
 

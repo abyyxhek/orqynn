@@ -34,10 +34,13 @@
 //! complete enough to run unattended, a thin binary will wrap it; until then,
 //! the tests are the caller.
 
+pub mod assign;
 pub mod observe;
 pub mod plan;
 
-use director_domain::ids::TaskId;
+use director_domain::capability::Capability;
+use director_domain::ids::{AgentId, AssignmentId, PlanId, ProjectId, TaskId};
+use director_domain::task::TaskStatus;
 use thiserror::Error;
 
 /// Every way an OBSERVE round can fail, in one place.
@@ -169,5 +172,117 @@ pub enum PlanError {
 impl From<director_domain::StoreError> for PlanError {
     fn from(err: director_domain::StoreError) -> Self {
         PlanError::Store(err.to_string())
+    }
+}
+
+/// Every way an ASSIGN round can fail, in one place.
+///
+/// Like [`ObserveError`] and [`PlanError`], this flattens its sources into one
+/// enum with no chains, because the failure modes are disjoint and a caller
+/// that wants to react has to know which one happened. The split that matters
+/// here is between a handoff that is illegal as stated and a store that would
+/// not take it:
+///
+/// - The legality errors are rejected before anything is written. Each one
+///   names the ids involved, because "cannot assign" is not actionable — a
+///   caller needs the task, and usually the reason.
+/// - [`Self::NoActivePlan`] means the project is not executing anything, so
+///   there is nothing to hand out. PLAN has not run, or its plan was archived.
+/// - [`Self::Store`] means the store rejected the write. Because
+///   [`crate::assign::assign`] does the whole handoff in one transaction, this
+///   leaves the task unassigned and `todo`, so a retry is clean.
+#[derive(Debug, Error)]
+pub enum AssignError {
+    /// Orqyn could not read or write its own state.
+    #[error("the store rejected the assignment: {0}")]
+    Store(String),
+
+    /// The project has no active plan, so no task is eligible for assignment.
+    /// In the running loop PLAN runs before ASSIGN, so this means the project
+    /// was never planned or its plan was archived without a successor.
+    #[error("no active plan for project {0}, so nothing can be assigned")]
+    NoActivePlan(ProjectId),
+
+    /// The plan is not authoritative — a draft or a superseded plan. Only an
+    /// active plan's tasks are Orqyn's current intention.
+    #[error("plan {0} is not active")]
+    PlanNotActive(PlanId),
+
+    /// The task is not one the active plan names, so handing it out would
+    /// restart or invent work the plan does not intend.
+    #[error("task {task} is not in plan {plan}")]
+    TaskNotInPlan {
+        /// The task the caller tried to assign.
+        task: TaskId,
+        /// The active plan for its project, which does not name it.
+        plan: PlanId,
+    },
+
+    /// Another agent already holds the task. [`crate::assign::assign`] refuses
+    /// rather than displacing them silently — a reassignment should be a
+    /// deliberate act, and the sitting tenure is named so the caller can see
+    /// what it would end.
+    #[error("task {task} is already assigned to agent {agent} in assignment {assignment}")]
+    TaskAlreadyAssigned {
+        /// The task that is held.
+        task: TaskId,
+        /// The agent holding it.
+        agent: AgentId,
+        /// The active assignment giving them the task.
+        assignment: AssignmentId,
+    },
+
+    /// The task is not `todo` — finished, blocked, in progress, or awaiting
+    /// verification. Only a waiting task can be handed out.
+    #[error("task {task} is {status:?}, not todo")]
+    TaskNotTodo {
+        /// The task the caller tried to assign.
+        task: TaskId,
+        /// The status it actually has.
+        status: TaskStatus,
+    },
+
+    /// The task depends on work that is not `done` yet. A `failed` or
+    /// `cancelled` dependency is not done either, and a dependency that no task
+    /// in the project satisfies is a premise nothing is going to fulfill — both
+    /// belong here rather than being silently assumed away.
+    #[error("task {task} is blocked: dependencies not done: {}",
+        unmet.iter().map(|id| id.as_str()).collect::<Vec<_>>().join(", ")) ]
+    DependenciesNotDone {
+        /// The task whose dependencies are unmet.
+        task: TaskId,
+        /// The dependencies that are not `done`, in the order the task lists
+        /// them.
+        unmet: Vec<TaskId>,
+    },
+
+    /// The agent cannot take work right now — busy, stale, disconnected, or
+    /// offline.
+    #[error("agent {agent} cannot accept work (status: {status:?})")]
+    AgentUnavailable {
+        /// The agent the caller named.
+        agent: AgentId,
+        /// Why it cannot take work, in the registry's own terms.
+        status: director_domain::agent::AgentStatus,
+    },
+
+    /// The task requires a capability the agent does not declare. Assigning it
+    /// anyway would be setting the agent up to fail; the verification engine is
+    /// what catches failure, but there is no reason to arrange for it.
+    #[error("agent {agent} is missing capabilities for task {task}: {}",
+        missing.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")) ]
+    AgentMissingCapabilities {
+        /// The agent that lacks the capabilities.
+        agent: AgentId,
+        /// The task requiring them.
+        task: TaskId,
+        /// The required capabilities the agent does not declare.
+        missing: Vec<Capability>,
+    },
+}
+
+impl From<director_domain::StoreError> for AssignError {
+    fn from(err: director_domain::StoreError) -> Self {
+        AssignError::Store(err.to_string())
     }
 }

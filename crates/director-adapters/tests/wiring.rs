@@ -1,5 +1,4 @@
-//! Module wiring test: every source file is compiled, and every declared
-//! module exists.
+//! Module wiring test: every source file is compiled.
 //!
 //! This test exists because of a real bug in this repo. The PLAN step was
 //! written to `crates/director-app/src/plan.rs` — 619 lines, with tests — and
@@ -21,9 +20,12 @@
 //!   declared as `mod foo;` in the module that owns it: the crate root for
 //!   top-level files, or the directory's `mod.rs` (or the same-named file
 //!   beside the directory) for nested ones.
-//! - Conversely, every `mod foo;` has a `foo.rs` or a `foo/` behind it, so a
-//!   typo in a declaration is caught rather than quietly compiling less than
-//!   the author intended.
+//!
+//! The reverse need not be checked here. A `mod foo;` with no `foo.rs` behind
+//! it is already a hard compile error, so the compiler catches that direction
+//! unaided. What no part of the toolchain catches is a file that *exists* and
+//! is never declared: that compiles fine, it just compiles less than the author
+//! intended — which is precisely how the bug above went unnoticed.
 //!
 //! ## What does not count
 //!
@@ -81,9 +83,11 @@ fn module_file_for(dir: &Path) -> Option<PathBuf> {
 /// The external modules declared in a module file: the identifiers in
 /// `mod foo;`, at any visibility.
 ///
-/// Only the semicolon form counts. `mod foo {` is an inline module with no file
-/// behind it, and counting it would make the inverse check below fail on every
-/// `#[cfg(test)] mod tests { ... }` block in the workspace.
+/// Only the semicolon form counts. `mod foo {` is an inline module: it has no
+/// file behind it, and it does not make a `foo.rs` compile — so counting it
+/// would let an undeclared file pass whenever some unrelated inline module
+/// happened to share its name. That is not hypothetical: this codebase has an
+/// inline `mod tests` in most of its files.
 fn declared_modules(source: &str) -> Vec<String> {
     let mut names = Vec::new();
     for line in source.lines() {
@@ -109,9 +113,9 @@ fn declared_modules(source: &str) -> Vec<String> {
     names
 }
 
-/// Check one directory: every file in it is declared, and every declaration has
-/// a file. Problems accumulate instead of short-circuiting, so a single run
-/// reports every gap at once.
+/// Check one directory: every source file in it is declared by its module file.
+/// Problems accumulate instead of short-circuiting, so a single run reports
+/// every gap at once.
 fn check_dir(dir: &Path, problems: &mut Vec<String>, files_checked: &mut usize) {
     // A directory with no module file is unreachable: nothing declares it, so
     // every file inside is dead code regardless of what else is true.
