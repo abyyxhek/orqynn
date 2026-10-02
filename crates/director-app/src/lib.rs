@@ -26,9 +26,15 @@
 //! the one before it, so writing OBSERVE first is what gave the rest something
 //! to be tested against. REPLAN is last because it reads the verdicts the steps
 //! before it produce: it answers for work the loop itself stopped. What does not
-//! exist yet is anything that drives the loop — the fuller ordering the README's
-//! diagram names, the process that runs it unattended, and the MCP surface a
-//! caller would reach it through.
+//! exist yet is the process that runs the loop unattended and the MCP surface a
+//! caller would reach it through. One decision does not wait for either:
+//! [`schedule`] picks which ready task goes to which available agent and applies
+//! each pairing through [`assign`], so a tick can hand out work without somebody
+//! naming every agent. The judgments that are genuinely reasoning — the
+//! decomposition, the remediations, the objective — still arrive from a caller.
+//!
+//! [`schedule`]: crate::schedule
+//! [`assign`]: crate::assign
 //!
 //! ## What this crate is not
 //!
@@ -42,6 +48,7 @@ pub mod monitor;
 pub mod observe;
 pub mod plan;
 pub mod replan;
+pub mod schedule;
 pub mod verify;
 
 use director_domain::capability::Capability;
@@ -197,7 +204,7 @@ impl From<director_domain::StoreError> for PlanError {
 /// - [`Self::Store`] means the store rejected the write. Because
 ///   [`crate::assign::assign`] does the whole handoff in one transaction, this
 ///   leaves the task unassigned and `todo`, so a retry is clean.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum AssignError {
     /// Orqyn could not read or write its own state.
     #[error("the store rejected the assignment: {0}")]
@@ -290,6 +297,52 @@ pub enum AssignError {
 impl From<director_domain::StoreError> for AssignError {
     fn from(err: director_domain::StoreError) -> Self {
         AssignError::Store(err.to_string())
+    }
+}
+
+/// Every way a SCHEDULE round can fail, in one place.
+///
+/// Like the other steps' error enums, this is flat with no source chains,
+/// because there are only two failure modes and a caller that wants to react
+/// has to know which one happened:
+///
+/// - [`Self::NoActivePlan`] means the project is not executing anything, so
+///   there is no work to schedule. PLAN has not run, or its plan was archived
+///   without a successor. It arrives from [`crate::assign::ready_tasks`].
+/// - [`Self::Store`] means Orqyn could not read the work, the registry, or a
+///   task's assignment history.
+///
+/// A pairing the store *refuses* is not an error — it is reported as
+/// [`crate::schedule::Refused`] in the round's result, because a refused
+/// proposal is a fact about the state the round read, not a failure of the
+/// round. That distinction is what keeps a world that changed mid-round from
+/// looking like a transient retryable fault.
+#[derive(Debug, Error)]
+pub enum ScheduleError {
+    /// Orqyn could not read or write its own state.
+    #[error("the store rejected the scheduling round: {0}")]
+    Store(String),
+
+    /// The project has no active plan, so no task is eligible for scheduling.
+    #[error("no active plan for project {0}, so nothing can be scheduled")]
+    NoActivePlan(ProjectId),
+}
+
+impl From<director_domain::StoreError> for ScheduleError {
+    fn from(err: director_domain::StoreError) -> Self {
+        ScheduleError::Store(err.to_string())
+    }
+}
+
+impl From<AssignError> for ScheduleError {
+    fn from(err: AssignError) -> Self {
+        match err {
+            AssignError::NoActivePlan(project) => ScheduleError::NoActivePlan(project),
+            // Any other failure is a store the round read or a write it asked
+            // for being rejected; `ready_tasks` raises none of the legality
+            // errors, so this arm is a guard rather than a path.
+            other => ScheduleError::Store(other.to_string()),
+        }
     }
 }
 
