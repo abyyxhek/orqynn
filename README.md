@@ -14,11 +14,13 @@ their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
-> **Status: Phases 1–3, 5 complete; Phase 6 complete — all six steps of the
-> control loop are landed (OBSERVE, PLAN, ASSIGN, MONITOR, VERIFY, REPLAN).**
+> **Status: Phases 1–3, 5, and 6 complete, and Phase 7's scheduler landed —
+> all six steps of the control loop are in place (OBSERVE, PLAN, ASSIGN,
+> MONITOR, VERIFY, REPLAN), and SCHEDULE decides which ready task goes to which
+> available agent.**
 > The canonical domain model, the provider trait boundary, both substrate
 > adapters, Orqyn's own persistent store, and the whole control loop are in
-> place, with zero substrate coupling and a passing test suite (448 tests).
+> place, with zero substrate coupling and a passing test suite (471 tests).
 >
 > - **Phase 1** — the domain model and the seven provider traits it depends on,
 >   plus an in-memory implementor of every one of them.
@@ -48,7 +50,7 @@ crates. A boundary test in this repo enforces that — see
 >   handed to a named agent — the handoff, the task's move to `in_progress`, and
 >   the status transition recording it are one transaction, so an assigned task
 >   is never left un-started. Which agent gets which task arrives from the
->   caller too; `ready_tasks` is the read a scheduler will drive off. MONITOR:
+>   caller too; `ready_tasks` is the read the SCHEDULE step now drives off. MONITOR:
 >   every task in flight is surveyed, its holder's lease is judged from
 >   heartbeat age, and a holder past the stale window loses the lease — the
 >   tenure is retained as `lease_expired`, its session is closed as `vanished`,
@@ -74,9 +76,22 @@ crates. A boundary test in this repo enforces that — see
 >   round that rejects one decision applies none, and cancelling a task reports
 >   the dependents it strands rather than writing them, because the scheduler
 >   will never hand out a task whose dependency is not `done`.
+> - **Phase 7** — the scheduler. SCHEDULE decides which ready task goes to which
+>   available agent, so a loop tick no longer needs somebody to name every
+>   assignment. It composes ASSIGN rather than bypassing it: the round picks a
+>   pairing from `ready_tasks` and the agent registry, and applies each one
+>   through ASSIGN, which still owns the handoff's legality. The policy is four
+>   rules — eligibility (can accept work, not already showing a current task,
+>   every required capability), fresh eyes (an agent who has never held the task
+>   outranks one who released it, with the prior holder as a fallback rather than
+>   a prohibition), specialist-first (fewest declared capabilities, so
+>   generalists stay free for the tasks only they can cover), and a deterministic
+>   id tie-break. One task per agent per round, and work no available agent can
+>   do is reported rather than silently left `todo` — the staffing signal that
+>   makes the step worth having over calling `assign` by hand.
 >
 > There is no MCP server of Orqyn's own yet and no process drives the loop
-> unattended — the six steps are library functions, and their caller is the
+> unattended — the steps are library functions, and their caller is the
 > tests. Those are later phases, and their absence here is deliberate.
 
 ---
@@ -133,7 +148,7 @@ orqyn/
 │   ├── director-store/      # SQLite store for Orqyn's own entities. Owns
 │   │                        # its schema; depends only on director-domain.
 │   └── director-app/        # The control loop. Composes the layers into
-│                            # steps; OBSERVE, PLAN, and ASSIGN are wired in.
+│                            # steps; all six wired in; SCHEDULE pairs them.
 ├── docs/
 │   ├── PHASE0-FORENSICS.md  # Read-only audit of both upstream repos:
 │   │                        # data models, ~30 vs ~80 MCP tools, feature
@@ -143,7 +158,8 @@ orqyn/
 │   ├── PHASE2-OBSERVATION.md # The git observation layer.
 │   ├── PHASE3-MEMORY.md     # The AiMemoryAdapter over ai-memory.
 │   ├── PHASE5-STORE.md      # The SQLite store and the invariants it holds.
-│   └── PHASE6-APP.md        # The control loop, and its first step.
+│   ├── PHASE6-APP.md        # The control loop, and its six steps.
+│   └── PHASE7-SCHEDULE.md  # The scheduler that pairs work with agents.
 ├── Cargo.toml               # Workspace manifest.
 ├── rust-toolchain.toml      # Pinned: stable-x86_64-pc-windows-gnu.
 └── THIRD_PARTY_LICENSES.md  # MIT notices for both substrates (© 2026 Fabio Akita).
@@ -337,11 +353,12 @@ built, and the fuller ordering's remaining steps are not):
 OBSERVE (git/fs/tests + substrate events + agent heartbeats) ✅
    → UNDERSTAND (project state vs last checkpoint; STATE_CHANGED?)
       → PLAN / REPLAN (grounded in observed state, never invented facts) ✅
-         → ASSIGN (capability match + claim lease via HandoffAdapter) ✅
-            → MONITOR (heartbeat TTL, lease expiry, progress reports) ✅
-               → VERIFY (runs the plan's named checks itself) ✅
-                  → UPDATE STATE (Orqyn store + substrate records)
-                     → loop back, or RECOVER on failure
+         → SCHEDULE (which ready task goes to which agent) ✅
+            → ASSIGN (claim lease via HandoffAdapter) ✅
+               → MONITOR (heartbeat TTL, lease expiry, progress reports) ✅
+                  → VERIFY (runs the plan's named checks itself) ✅
+                     → UPDATE STATE (Orqyn store + substrate records)
+                        → loop back, or RECOVER on failure
 ```
 
 Boundary rules, in full, are in [`docs/PHASE0-FORENSICS.md`](docs/PHASE0-FORENSICS.md)
@@ -409,6 +426,15 @@ than the plumbing:
   transaction, so a partially created plan is impossible; activating it
   supersedes the sitting plan in the same transaction, and a duplicate plan id
   or a task with no title is refused before anything is persisted.
+- A scheduler round hands every ready task to a distinct available agent, and
+  the same plan and registry always yield the same pairings: eligibility, then
+  a preference for an agent who has never held the task, then the most
+  specialized eligible agent, then an id tie-break. When two ready tasks both
+  want the same agent, the earlier one in the plan's order gets it and the
+  other is reported rather than silently dropped. Work no available agent can
+  do is reported rather than left `todo` with no explanation, and an agent that
+  went quiet between the plan and the round is not handed work it cannot
+  answer for.
 - No crate outside `director-adapters` references a substrate.
 - Every source file under `src/` is reachable from the module tree — an
   undeclared `.rs` file is invisible to `cargo`, so a file written but never
@@ -427,15 +453,17 @@ than the plumbing:
   middleware → tests is a reasoning step and arrives from the caller as
   `TaskSpec`s; PLAN makes it real, ordered, and durable rather than inventing
   it. A step that writes its own decomposition is a later phase.
-- **No scheduling.** The ASSIGN step is landed: it hands a task to a named agent
-  — refusing a task the active plan does not name, a task whose dependencies
-  are not finished, a task an agent already holds, and an agent that is
-  unavailable or lacks a required capability — and commits the handoff and the
-  task's start in one transaction. What it does not do is decide *which* agent
-  gets *which* task. Matching tasks to agents by capability and load is a
-  scheduling judgment and arrives from the caller; `ready_tasks` reports the
-  work that can be handed out right now, and a step that assigns on its own is
-  a later phase.
+- **Scheduling, but not load balancing.** The SCHEDULE step is landed: it picks
+  which ready task goes to which available agent — eligibility, then a
+  preference for an agent who has never held the task, then the most
+  specialized eligible agent, then a deterministic id tie-break — at most one
+  task per agent per round, and it applies each pairing through ASSIGN, which
+  still owns the handoff's legality. What it does not do is balance *load*: it
+  does not look at how much work an agent has done lately, where its machine
+  is, or a task's estimated effort. A task's `Priority` and `Complexity` exist
+  in the model and the scheduler does not read them, because the plan's order
+  is already the priority order and a second axis would disagree with it.
+  Load- and locality-aware matching is a later phase.
 - **No verification engine.** The loop's VERIFY step holds the invariant —
   nothing self-reports completion, and a task reaches `done` only because a
   check Orqyn ran itself passed — but the checks it runs are the machine-checkable
@@ -456,6 +484,7 @@ than the plumbing:
 | **3** ✅ | `AiMemoryAdapter` — ai-memory client implementing `MemoryProvider`. |
 | **5** ✅ | `director-store` — Orqyn's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
 | **6** ✅ | `director-app` — the control loop. All six steps landed and tested: OBSERVE (git layer composed with the store), PLAN (validation, ordering, and activation in one transaction, plus the dependency-graph validation it builds on in `director-domain`), ASSIGN (a task handed to an agent and started in one transaction), MONITOR (a lease reclaimed from an agent whose heartbeat went quiet, the session recorded when the agent acknowledged the work, a completion report ending the tenure and moving the task to `verification_pending`), VERIFY (a task judged `done` or `failed` by checks Orqyn runs itself), REPLAN (the states the loop's own verdicts left behind surveyed, and a caller's retry / rework / cancel decision applied to each — a refused round writes nothing, and a cancellation reports the dependents it strands). |
+| **7** ✅ | `director-app` — the scheduler. SCHEDULE decides which ready task goes to which available agent, so a loop tick no longer needs somebody to name every assignment: eligibility (can accept work, not already showing a current task, every required capability), then fresh eyes (an agent who has never held the task outranks one who released it, with the prior holder as a fallback rather than a prohibition), then specialist-first (fewest declared capabilities, so generalists stay free for the tasks only they can cover), then a deterministic id tie-break. One task per agent per round. Pairings are computed from a snapshot but applied through ASSIGN, which re-validates against live state, so a stale proposal is refused rather than applied illegally; work no available agent can do is reported rather than silently left `todo`, which is the staffing signal that makes the step worth having over calling `assign` by hand. |
 | 10 | The verification engine. |
 
 ---
