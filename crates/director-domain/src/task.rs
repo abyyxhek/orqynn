@@ -190,7 +190,7 @@ pub struct Task {
     #[serde(default)]
     pub description: Option<String>,
     /// Observable criteria for completion. Empty is legal but produces a task
-    /// that can never be verified — the planner (Phase 7) must fill this in.
+    /// that can never be verified — the planner must fill this in.
     pub expected_outputs: Vec<ExpectedOutput>,
     /// Lifecycle state.
     pub status: TaskStatus,

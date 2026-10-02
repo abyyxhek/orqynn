@@ -1,4 +1,5 @@
-//! [Blocker] — something standing between a task and its next step (Phase 7/11).
+//! [Blocker] — something standing between a task and its next step (a later
+//! phase).
 //!
 //! A blocker is a first-class entity rather than a string on a task for one
 //! reason: **a blocked task must not silently stay blocked**. Orqyn's loop
