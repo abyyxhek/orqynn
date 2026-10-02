@@ -14,11 +14,11 @@ their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
-> **Status: Phases 1–3, 5 complete; Phase 6 underway (OBSERVE, PLAN, and ASSIGN
-> landed).** The canonical domain model, the provider trait boundary, both
-> substrate adapters, Orqyn's own persistent store, and the first three steps
+> **Status: Phases 1–3, 5 complete; Phase 6 underway (OBSERVE, PLAN, ASSIGN, and
+> MONITOR landed).** The canonical domain model, the provider trait boundary, both
+> substrate adapters, Orqyn's own persistent store, and the first four steps
 > of the control loop are in place, with zero substrate coupling and a passing
-> test suite (325 tests).
+> test suite (366 tests).
 >
 > - **Phase 1** — the domain model and the seven provider traits it depends on,
 >   plus an in-memory implementor of every one of them.
