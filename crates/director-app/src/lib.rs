@@ -19,26 +19,29 @@
 //! tested before the next is written — the loop is built in the order it will
 //! run, so a step is never written against steps that do not exist yet.
 //!
-//! Five of the six steps are in place. OBSERVE is first for a structural
-//! reason: it is the only one whose inputs come entirely from outside Orqyn.
-//! PLAN reads the state OBSERVE produced; ASSIGN reads what PLAN decided;
-//! MONITOR and VERIFY read what ASSIGN started. Every step after the first
-//! consumes the output of the one before it, so writing OBSERVE first is what
-//! gave the rest something to be tested against. REPLAN is built last, with
-//! the remaining steps the README's fuller diagram names.
+//! All six steps are in place. OBSERVE is first for a structural reason: it is
+//! the only one whose inputs come entirely from outside Orqyn. PLAN reads the
+//! state OBSERVE produced; ASSIGN reads what PLAN decided; MONITOR and VERIFY
+//! read what ASSIGN started. Every step after the first consumes the output of
+//! the one before it, so writing OBSERVE first is what gave the rest something
+//! to be tested against. REPLAN is last because it reads the verdicts the steps
+//! before it produce: it answers for work the loop itself stopped. What does not
+//! exist yet is anything that drives the loop — the fuller ordering the README's
+//! diagram names, the process that runs it unattended, and the MCP surface a
+//! caller would reach it through.
 //!
 //! ## What this crate is not
 //!
 //! Not an MCP server, and not a binary yet. The loop's steps are library
-//! functions so they can be tested directly against real git repositories and
-//! a real store, without a process boundary in the way. When the loop is
-//! complete enough to run unattended, a thin binary will wrap it; until then,
-//! the tests are the caller.
+//! functions so they can be tested directly against real git repositories and a
+//! real store, without a process boundary in the way. All six are landed; what
+//! is missing is a driver. Until one exists, the tests are the caller.
 
 pub mod assign;
 pub mod monitor;
 pub mod observe;
 pub mod plan;
+pub mod replan;
 pub mod verify;
 
 use director_domain::capability::Capability;
@@ -361,5 +364,34 @@ pub enum VerifyError {
 impl From<director_domain::StoreError> for VerifyError {
     fn from(err: director_domain::StoreError) -> Self {
         VerifyError::Store(err.to_string())
+    }
+}
+
+/// Every way a REPLAN round can fail, in one place.
+///
+/// Like the other steps' error enums, this is flat with no source chains,
+/// because there is only one failure mode: the store. A decision the round
+/// *refuses* is not an error — it is reported as
+/// [`crate::replan::RemediationError`] in the round's result, because a bad
+/// decision is a fact about the caller's request, not a failure of the round.
+/// That distinction is what keeps a caller's mistake from looking like a
+/// transient retryable fault.
+///
+/// [`Self::Store`] means the round could not read the tasks it surveyed or could
+/// not persist a decision it applied. Every write is one task row plus, for a
+/// cancellation, the decision that records why, and a round validates all of its
+/// decisions before it writes any of them — so a round that failed midway
+/// either changed nothing or changed exactly one task, never half a caller's
+/// intent.
+#[derive(Debug, Error)]
+pub enum ReplanError {
+    /// Orqyn could not read or write its own state.
+    #[error("the store rejected the replanning round: {0}")]
+    Store(String),
+}
+
+impl From<director_domain::StoreError> for ReplanError {
+    fn from(err: director_domain::StoreError) -> Self {
+        ReplanError::Store(err.to_string())
     }
 }

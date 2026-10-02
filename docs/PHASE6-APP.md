@@ -1,8 +1,8 @@
-# Phase 6 — The Control Loop, and Its First Steps
+# Phase 6 — The Control Loop
 
-> **Status: underway.** The `director-app` crate exists and its first five
-> steps — OBSERVE, PLAN, ASSIGN, MONITOR, and VERIFY — are landed and tested.
-> REPLAN is the remaining step, built last.
+> **Status: complete.** The `director-app` crate exists and all six of its
+> steps — OBSERVE, PLAN, ASSIGN, MONITOR, VERIFY, and REPLAN — are landed and
+> tested.
 
 ## Goal
 
@@ -330,12 +330,107 @@ The round is idempotent, which is what makes it safe to run on every tick. A
 task it passed is `done` and a task it failed is `failed`, so the next round
 surveys neither; only the tasks it could not judge come around again.
 
+## REPLAN: the loop answers for what its own verdicts left behind
+
+Every other step exists to move work forward. REPLAN exists because moving work
+forward is not always right, and the earlier steps deliberately stop short of
+deciding that. MONITOR puts an expired lease back to `todo` and says the rest is
+REPLAN's job; VERIFY marks a task `failed` and says the same. Those are IOUs, and
+this step is where they are paid — without it a failed task stays failed forever
+and nothing in the system can say otherwise.
+
+The step surveys a project and finds every task whose state is a verdict the loop
+itself produced. Three conditions, and only three:
+
+- **Failed** — VERIFY judged the work and it did not pass.
+- **Orphaned** — `in_progress` with no active assignment. This is the state
+  MONITOR reports and writes nothing about: the handoff, not the work, is what
+  broke. A task someone is still sitting on is *not* this condition, because
+  MONITOR's liveness windows are what decide whether held work is a problem.
+- **PremiseBroken** — a dependency reached a dead end (`failed` or `cancelled`),
+  so this task can never become ready. Its own status may be a perfectly healthy
+  `todo`; the task is not broken, its situation is. `is_ready_given` requires
+  every dependency to be `Done`, and that is what makes the condition real rather
+  than nominal.
+
+Everything else is out of scope by the same reasoning: `verification_pending` is
+still being judged and second-guessing a pending verdict would race the step
+producing it; `blocked` has its own entity and its own lifecycle; `done` needs
+nothing.
+
+Three remediations answer those conditions, and only three: **retry** (back to
+`todo`, handable again), **rework** (back to `todo` with an amended objective or
+amended expected outputs — the remediation for a failure caused by the *criterion*
+being wrong, which a retry against an unchanged criterion cannot fix), and
+**cancel** (terminal, with the reason recorded as a decision that outlives the
+task).
+
+### Which remediation applies is not this step's to decide
+
+That judgment arrives from the caller, exactly as PLAN's decomposition arrives as
+`TaskSpec`s, because "this failure means the criterion was wrong, not the
+implementation" is a reasoning step. Keeping it outside the function is what keeps
+the function deterministic and testable; REPLAN's job is to make a stated decision
+durable and consistent, not to have the decision. It also does not create or
+supersede a plan, does not assign agents, and does not judge work — a caller that
+has decided the decomposition itself is wrong calls PLAN with a new plan id.
+
+Two rules constrain what a caller may decide, and both are extracted into a pure
+`validate_decision()` so their precedence is testable without a store:
+
+1. A retry of a broken premise is refused. It would put the task back to `todo`,
+   where it *looks* handable and `ready_in_plan` still will not hand it out —
+   worse than an honest refusal, because the store would promise work that can
+   never be assigned. Reworking or cancelling are the answers a broken premise
+   accepts.
+2. A rework that amends nothing is refused, because it is a retry wearing a
+   different name. (`Some(vec![])` is allowed — clearing the outputs is a real
+   change, and the caller meant it.)
+
+### A refused round writes nothing
+
+Every decision is validated against the survey before any of them is applied, so
+a round that rejects one decision applies none. An unknown task is an error
+rather than a silent skip — otherwise a caller's typo would pass as a decision
+that landed — and a task decided twice is refused rather than resolved by the
+round. All-or-nothing is what keeps a partially applied round, half the caller's
+intent durable and the other half lost, from being a state the store can hold.
+
+### The cascade is reported, not written
+
+Cancelling a task strands its dependents. REPLAN reports every stranded dependent
+and writes nothing about any of them, which is safe by construction rather than by
+trust: `ready_in_plan` applies `is_ready_given` over current task statuses before
+handing anything out, so a task whose dependency is not `Done` is never assigned
+no matter how ready its own row looks. Writing them — to `blocked`, with a
+persisted `Blocker` — would make REPLAN own a second entity's lifecycle and would
+record a conclusion the caller has not reached. A stranded dependent is a
+question, and this step puts the question where someone can see it.
+
+### The survey runs twice
+
+The round's own writes can change the survey, so it runs again over the world the
+round produced. Cancelling an *orphaned* task — not a dead end — is what strands a
+dependent that looked healthy when the round started, and the pre-apply survey
+alone would never see it. Re-surfacing it is the point, and so is the subtlety in
+it: a task the caller named and the survey found healthy is `NothingNeeded`, and
+if the round's own writes strand it, its outcome is flipped to `NotDecided`.
+Leaving it alone would have `is_settled` call the round settled over a task that
+needs an answer while `undecided` skipped it entirely — a report that hides the
+very thing the re-survey exists to find.
+
+Nothing is written for any of these; the report is where the caller learns it owes
+them an answer. A partial round is a legal, useful state, and so is an empty one —
+nothing stopped is not an error.
+
 ## What the crate is not
 
-Not an MCP server, and not a binary. The loop's steps are library functions,
-tested directly against real git repositories and a real store without a
-process boundary in the way. When the loop is complete enough to run
-unattended, a thin binary will wrap it; until then, the tests are the caller.
+Not an MCP server, and not a binary. The loop's six steps are library
+functions, tested directly against real git repositories and a real store
+without a process boundary in the way. All six are landed, but nothing yet
+*drives* them — no process runs the loop unattended and no caller exists
+outside the tests. That is the next phase's job; until then, the tests are the
+caller.
 
 ## What the tests prove
 
@@ -434,3 +529,36 @@ status being poked by hand:
 - A round that passes one task and fails another judges each on its own
   evidence, surveys only the tasks awaiting a verdict, and judges each task
   once — a second round after a pass or a fail has nothing to do.
+
+`tests/replan.rs` works against a real store, and its stopped states are produced
+by the loop's own steps rather than a status being poked by hand — a task is
+failed by a write, an orphan is stranded by ASSIGN handing work out and a tenure
+being released out from under it, and a broken premise arrives as a dependency
+edge in the plan. Every assertion reloads the record, because the point of a
+replan round is what the next loop tick sees:
+
+- A failed task retried is `todo` and handable again; a failed task reworked
+  carries the amended objective and expected outputs to the next agent that
+  works it; a cancelled task is terminal with the reason recorded as a decision
+  carrying the agent that authorized it, so "why did we stop pursuing this"
+  stays answerable after the task is done.
+- The remediation lands in the append-only history as a transition, so the trail
+  says the task went to `todo` from `failed`.
+- An orphaned task the loop produced is surveyed, and answering it puts the task
+  back in flight. A task a live tenant holds is not surveyed at all — that is
+  MONITOR's concern — and a task whose lease MONITOR already expired is back to
+  `todo` and not surveyed, which is the proof the two steps do not overlap.
+- Cancelling a task strands its dependents in the report and writes nothing
+  about them; the dependents stay `todo`, and `ready_tasks` still will not hand
+  one out. Cancelling a task that was merely *orphaned* strands a dependent the
+  pre-apply survey could not have seen, which is what the second survey is for.
+- A task the round itself strands after the caller named it is reopened as
+  `NotDecided`, so the report cannot call a round settled over a task it left
+  needing an answer.
+- A retry of a broken premise is refused, and because one decision was refused
+  the round applies none of them — including a retry that would have been fine
+  on its own. A decision for an unknown task and a task decided twice are
+  refused the same way, and in each case nothing was written.
+- A partial round answers what the caller had an answer for and leaves the rest
+  untouched and undecided; a round with nothing stopped reports nothing and is
+  settled, which is the healthy-tick state.

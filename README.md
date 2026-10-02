@@ -14,11 +14,11 @@ their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
-> **Status: Phases 1–3, 5 complete; Phase 6 underway (OBSERVE, PLAN, ASSIGN,
-> MONITOR, and VERIFY landed).** The canonical domain model, the provider trait
-> boundary, both substrate adapters, Orqyn's own persistent store, and the
-> first five steps of the control loop are in place, with zero substrate
-> coupling and a passing test suite (404 tests).
+> **Status: Phases 1–3, 5 complete; Phase 6 complete — all six steps of the
+> control loop are landed (OBSERVE, PLAN, ASSIGN, MONITOR, VERIFY, REPLAN).**
+> The canonical domain model, the provider trait boundary, both substrate
+> adapters, Orqyn's own persistent store, and the whole control loop are in
+> place, with zero substrate coupling and a passing test suite (443 tests).
 >
 > - **Phase 1** — the domain model and the seven provider traits it depends on,
 >   plus an in-memory implementor of every one of them.
@@ -37,8 +37,8 @@ crates. A boundary test in this repo enforces that — see
 >   index in the schema, not a convention. (There is no Phase 4; the roadmap
 >   skips it.)
 > - **Phase 6** — `director-app`, the crate that drives the loop
->   `OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN`. Its first five steps
->   are landed. OBSERVE: an observed repository becomes normalized belief in
+>   `OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN`. All six steps are
+>   landed. OBSERVE: an observed repository becomes normalized belief in
 >   Orqyn's store. PLAN: a stated objective and task decomposition are validated
 >   — no self-dependencies, no edges to tasks outside the plan, no cycles —
 >   ordered deterministically, and persisted as the project's active plan in one
@@ -63,11 +63,21 @@ crates. A boundary test in this repo enforces that — see
 >   — a task reaches `done` only because a check actually passed. A check that
 >   fails moves the task to `failed` for REPLAN to act on; a check that cannot run
 >   at all leaves the task awaiting verification, because a broken environment is
->   not a verdict on someone's work. REPLAN is the remaining step, built last.
+>   not a verdict on someone's work. REPLAN: the step that answers for the states
+>   the loop's own verdicts leave behind. It surveys the project for work nothing
+>   is progressing — a task VERIFY judged `failed`, a task `in_progress` with no
+>   tenant, a task whose dependency reached a dead end and so can never become
+>   ready — and applies a decision the caller supplies for each: retry it, rework
+>   it with an amended contract, or cancel it with the reason recorded as a
+>   decision that outlives the task. Which remediation applies is a reasoning
+>   step and arrives from the caller, exactly as PLAN's decomposition does; a
+>   round that rejects one decision applies none, and cancelling a task reports
+>   the dependents it strands rather than writing them, because the scheduler
+>   will never hand out a task whose dependency is not `done`.
 >
-> There is no MCP server of Orqyn's own yet and only the first five steps of
-> the loop are wired in — those are later phases, and their absence here is
-> deliberate.
+> There is no MCP server of Orqyn's own yet and no process drives the loop
+> unattended — the six steps are library functions, and their caller is the
+> tests. Those are later phases, and their absence here is deliberate.
 
 ---
 
@@ -313,14 +323,14 @@ rationale for avoiding it. That is the opposite of coupling.
                                  Git / Code → PROJECT
 ```
 
-Orqyn's control loop (the shape is fixed; OBSERVE, PLAN, ASSIGN, MONITOR, and
-VERIFY are built, the remaining steps are not):
+Orqyn's control loop (the shape is fixed; the six steps of the shorthand are
+built, and the fuller ordering's remaining steps are not):
 
 ```
-OBSERVE (git/fs/tests + substrate events + agent heartbeats)
+OBSERVE (git/fs/tests + substrate events + agent heartbeats) ✅
    → UNDERSTAND (project state vs last checkpoint; STATE_CHANGED?)
-      → PLAN / REPLAN (grounded in observed state, never invented facts)
-         → ASSIGN (capability match + claim lease via HandoffAdapter)
+      → PLAN / REPLAN (grounded in observed state, never invented facts) ✅
+         → ASSIGN (capability match + claim lease via HandoffAdapter) ✅
             → MONITOR (heartbeat TTL, lease expiry, progress reports) ✅
                → VERIFY (independent git/file/test inspection) ✅
                   → UPDATE STATE (Orqyn store + substrate records)
@@ -438,9 +448,8 @@ than the plumbing:
 | **2** ✅ | Git observation layer (observer, store, service, `ProjectStateSnapshot`) + `HandoffAdapter`: handoff-mcp client implementing `TaskProvider`/`AgentProvider`/`SessionProvider`. |
 | **3** ✅ | `AiMemoryAdapter` — ai-memory client implementing `MemoryProvider`. |
 | **5** ✅ | `director-store` — Orqyn's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
-| **6** ⧗ | `director-app` — the control loop. OBSERVE, PLAN, ASSIGN, MONITOR, and VERIFY are landed and tested (git layer composed with the store; plan, tasks, and activation in one transaction; a task handed to an agent and started in one transaction; a lease reclaimed from an agent whose heartbeat went quiet, and the session that held it recorded when the agent acknowledged the work; a completion report ending the tenure and moving the task to `verification_pending`; a task judged `done` or `failed` by checks Orqyn runs itself), and the dependency-graph validation PLAN builds on is landed in `director-domain`; REPLAN is built last. |
+| **6** ✅ | `director-app` — the control loop. All six steps landed and tested: OBSERVE (git layer composed with the store), PLAN (validation, ordering, and activation in one transaction, plus the dependency-graph validation it builds on in `director-domain`), ASSIGN (a task handed to an agent and started in one transaction), MONITOR (a lease reclaimed from an agent whose heartbeat went quiet, the session recorded when the agent acknowledged the work, a completion report ending the tenure and moving the task to `verification_pending`), VERIFY (a task judged `done` or `failed` by checks Orqyn runs itself), REPLAN (the states the loop's own verdicts left behind surveyed, and a caller's retry / rework / cancel decision applied to each — a refused round writes nothing, and a cancellation reports the dependents it strands). |
 | 10 | The verification engine. |
-| — | The loop's remaining step, built last: REPLAN. |
 
 ---
 
