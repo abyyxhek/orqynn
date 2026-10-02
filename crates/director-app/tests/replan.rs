@@ -20,7 +20,10 @@ use director_app::replan::{
 use director_domain::agent::{Agent, Harness};
 use director_domain::assignment::AssignmentStatus;
 use director_domain::capability::Capability;
-use director_domain::ids::{AgentId, AssignmentId, MachineId, PlanId, ProjectId, TaskId};
+use director_domain::decision::Decision;
+use director_domain::ids::{
+    AgentId, AssignmentId, DecisionId, MachineId, PlanId, ProjectId, TaskId,
+};
 use director_domain::plan::Plan;
 use director_domain::project::Project;
 use director_domain::task::{ExpectedOutput, Task, TaskStatus};
@@ -834,4 +837,113 @@ async fn a_round_with_nothing_stopped_is_empty_and_settled() {
 
     assert!(report.surveyed.is_empty());
     assert!(report.is_settled());
+}
+
+#[tokio::test]
+async fn a_cancellation_whose_decision_cannot_be_written_leaves_the_task_standing() {
+    // BUG-1 regression. The task's cancellation and the decision that records
+    // why are one store transaction, so a round that cannot record the reason
+    // cannot cancel the task either. Before the fix, the task write committed
+    // and the decision write failed, leaving a `cancelled` task with no record
+    // of why anyone abandoned it — a cancellation the store cannot explain.
+    let fixture = Fixture::new(&[plain("A")]).await;
+    let mut task = fixture.reload_task("A").await;
+    task.status = TaskStatus::Failed;
+    fixture
+        .store
+        .tasks()
+        .update_task(&task)
+        .await
+        .expect("task failed");
+
+    // Occupy the decision id the round will use. The task update would succeed
+    // on its own; this is the write that fails, and it is the one the atomicity
+    // guarantee has to protect.
+    fixture
+        .store
+        .decisions()
+        .create_decision(&Decision::new(
+            DecisionId::from_string("DEC-CANCEL-A"),
+            "an earlier decision",
+            "already holds this id",
+        ))
+        .await
+        .expect("the id is taken");
+
+    let round = replan(
+        &fixture.store,
+        ReplanRequest {
+            project_id: fixture.project.clone(),
+            decisions: vec![decide("A", Remediation::Cancel)],
+            decided_by: Some(fixture.agent.clone()),
+        },
+    )
+    .await;
+
+    assert!(round.is_err(), "the round fails rather than half-applying");
+    // The task is exactly where the round found it: not cancelled.
+    assert_eq!(
+        fixture.reload_task("A").await.status,
+        TaskStatus::Failed,
+        "the task was not cancelled without its reason"
+    );
+    // And nothing was partially persisted: the round's decision did not land.
+    let decisions = fixture
+        .store
+        .decisions()
+        .decisions_for_task(&TaskId::from_string("A"))
+        .await
+        .expect("decisions");
+    assert!(
+        decisions.is_empty(),
+        "the cancellation decision did not partially land"
+    );
+}
+
+#[tokio::test]
+async fn a_task_whose_premise_the_round_repaired_is_settled_not_undecided() {
+    // BUG-2 regression. A is the dead end that breaks B's premise, and the
+    // caller retries A in the same round. A goes back to `todo` — no longer a
+    // dead end — so the post-apply re-survey finds no condition on B at all.
+    //
+    // B was reported as `NotDecided` while its premise was broken, and leaving
+    // it that way makes the report contradict itself: `undecided` would skip it
+    // because there is no condition to answer, while `is_settled` refused to
+    // call the round settled over a task still marked undecided. A task the
+    // round repaired has to go back to needing nothing.
+    let fixture = Fixture::new(&[
+        plain("A"),
+        ("B".to_string(), vec![TaskId::from_string("A")], vec![]),
+    ])
+    .await;
+    let mut a = fixture.reload_task("A").await;
+    a.status = TaskStatus::Failed;
+    fixture
+        .store
+        .tasks()
+        .update_task(&a)
+        .await
+        .expect("A failed");
+
+    let report = fixture.replan(vec![decide("A", Remediation::Retry)]).await;
+
+    let b = report
+        .surveyed
+        .iter()
+        .find(|entry| entry.task == TaskId::from_string("B"))
+        .expect("B was surveyed while its premise was broken");
+
+    assert_eq!(
+        b.condition, None,
+        "A is todo again, so B's premise is intact"
+    );
+    assert!(
+        report.undecided().next().is_none(),
+        "B has nothing left undecided about it"
+    );
+    assert!(report.refused().next().is_none());
+    assert!(
+        report.is_settled(),
+        "a round that answered every condition it found is settled"
+    );
 }

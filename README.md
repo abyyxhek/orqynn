@@ -18,7 +18,7 @@ crates. A boundary test in this repo enforces that — see
 > control loop are landed (OBSERVE, PLAN, ASSIGN, MONITOR, VERIFY, REPLAN).**
 > The canonical domain model, the provider trait boundary, both substrate
 > adapters, Orqyn's own persistent store, and the whole control loop are in
-> place, with zero substrate coupling and a passing test suite (443 tests).
+> place, with zero substrate coupling and a passing test suite (448 tests).
 >
 > - **Phase 1** — the domain model and the seven provider traits it depends on,
 >   plus an in-memory implementor of every one of them.
@@ -101,8 +101,15 @@ before, during, and after — while the full tenure history remains recoverable.
 
 `TaskStatus::Done` is **not reachable** from an agent's report. There is no
 provider method an agent can call that completes a task. Only Orqyn's own
-verification engine — which inspects git, files, and test exit codes itself —
-can do that.
+VERIFY step can do that: it runs the machine-checkable commands a plan named
+for the task's expected outputs, and reads their exit codes and their output
+itself — the agent whose work is being judged never gets to report the outcome,
+and the provider that runs a command never gets to interpret it.
+
+What has *not* landed is the richer engine that gathers its own evidence —
+inspecting a git diff, asserting a file is present, orchestrating a test suite.
+VERIFY judges the checks the plan already named, and gathering more evidence
+than that is Phase 10.
 
 This is the guardrail behind the acceptance criterion: *"Agent claims 'Done.'
 Tests fail → must not become COMPLETED."* Both substrates were audited and
@@ -332,7 +339,7 @@ OBSERVE (git/fs/tests + substrate events + agent heartbeats) ✅
       → PLAN / REPLAN (grounded in observed state, never invented facts) ✅
          → ASSIGN (capability match + claim lease via HandoffAdapter) ✅
             → MONITOR (heartbeat TTL, lease expiry, progress reports) ✅
-               → VERIFY (independent git/file/test inspection) ✅
+               → VERIFY (runs the plan's named checks itself) ✅
                   → UPDATE STATE (Orqyn store + substrate records)
                      → loop back, or RECOVER on failure
 ```

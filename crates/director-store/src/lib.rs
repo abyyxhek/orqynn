@@ -74,6 +74,7 @@ mod tasks;
 use std::path::Path;
 
 use director_domain::assignment::AgentAssignment;
+use director_domain::decision::Decision;
 use director_domain::ids::{AgentId, AssignmentId, TaskId};
 use director_domain::plan::Plan;
 use director_domain::session::AgentSession;
@@ -270,6 +271,32 @@ impl Store {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<(AgentAssignment, Task, Option<AgentSession>)>, StoreError> {
         assignments::report_completion(&self.pool, assignment_id, now).await
+    }
+
+    /// Cancel a task and record the decision that ended it: the task's move to
+    /// `cancelled`, the status transition that records the move, and the
+    /// decision row carrying the reason — one transaction, all or nothing.
+    ///
+    /// This is the operation the loop's REPLAN step uses when a caller decides a
+    /// task is no longer worth pursuing. The cancellation and the reason for it
+    /// cannot be left in separate calls, because the window between them is
+    /// exactly the state a crash would strand: a task that reads `cancelled`
+    /// with no decision explaining why, so "why did we stop pursuing this" stops
+    /// being answerable the moment the task goes terminal. Folding them together
+    /// makes the reason part of the cancellation rather than a second write the
+    /// caller has to survive.
+    ///
+    /// The task is written keyed on the version the caller read, so a stale
+    /// cancellation is a [`StoreError::StateVersionConflict`] rather than an
+    /// overwrite. Returns the task and the decision as they now stand, read back
+    /// from the store.
+    pub async fn cancel_task(
+        &self,
+        task: &Task,
+        decision: &Decision,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(Task, Decision), StoreError> {
+        tasks::cancel_task(&self.pool, task, decision, now).await
     }
 
     /// Checkpoints: Orqyn's own resumption documents. Superseded ones are

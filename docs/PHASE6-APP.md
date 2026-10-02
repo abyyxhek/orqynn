@@ -417,7 +417,12 @@ it: a task the caller named and the survey found healthy is `NothingNeeded`, and
 if the round's own writes strand it, its outcome is flipped to `NotDecided`.
 Leaving it alone would have `is_settled` call the round settled over a task that
 needs an answer while `undecided` skipped it entirely — a report that hides the
-very thing the re-survey exists to find.
+very thing the re-survey exists to find. The mirror case is held by the same
+rule: a task the caller did *not* name, whose condition the round repaired — a
+retry of the dependency it was broken on — goes back to `NothingNeeded`, because
+a `NotDecided` entry with no condition is the same contradiction in the other
+direction. Both accessors agree about a task with no condition, in both
+directions the survey can move.
 
 Nothing is written for any of these; the report is where the caller learns it owes
 them an answer. A partial round is a legal, useful state, and so is an empty one —
@@ -541,7 +546,10 @@ replan round is what the next loop tick sees:
   carries the amended objective and expected outputs to the next agent that
   works it; a cancelled task is terminal with the reason recorded as a decision
   carrying the agent that authorized it, so "why did we stop pursuing this"
-  stays answerable after the task is done.
+  stays answerable after the task is done. The cancellation and its reason are
+  one transaction, so a cancellation whose decision could not be written leaves
+  the task exactly where the round found it — no terminal task without its
+  explanation.
 - The remediation lands in the append-only history as a transition, so the trail
   says the task went to `todo` from `failed`.
 - An orphaned task the loop produced is surveyed, and answering it puts the task

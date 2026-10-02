@@ -123,7 +123,7 @@ use std::collections::{HashMap, HashSet};
 use director_domain::decision::Decision as DecisionRecord;
 use director_domain::ids::{AgentId, DecisionId, ProjectId, TaskId};
 use director_domain::task::{ExpectedOutput, Task, TaskStatus};
-use director_domain::{AssignmentRepository, DecisionRepository, TaskRepository};
+use director_domain::{AssignmentRepository, TaskRepository};
 use director_store::Store;
 
 use crate::ReplanError;
@@ -280,7 +280,9 @@ impl ReplanReport {
     /// loop wants to see: nothing is stopped, and nothing stopped is still open.
     ///
     /// A task the caller named that turned out to be healthy counts as settled:
-    /// it needed no decision, and none was written. A task the caller did not
+    /// it needed no decision, and none was written. So does a task whose
+    /// condition disappeared over the course of the round — the question it was
+    /// reported under is no longer being asked. A task the caller did not
     /// answer, or a decision the round refused, does not — both leave an open
     /// question the caller has to come back to.
     pub fn is_settled(&self) -> bool {
@@ -327,7 +329,10 @@ pub enum Outcome {
     /// the round found it.
     NotDecided,
     /// The caller named a task the survey found healthy. There was nothing to
-    /// decide, and nothing was written.
+    /// decide, and nothing was written. This is also the outcome the post-apply
+    /// re-survey returns a task to when the condition it was reported under has
+    /// disappeared — a premise the round itself repaired, for instance — so an
+    /// entry never carries `NotDecided` without a condition to answer.
     NothingNeeded,
 }
 
@@ -491,8 +496,10 @@ pub async fn replan_at(
     }
 
     // Apply. Each decided task is one task write — status, amended contract, and
-    // the history transition the store records with it — and a cancellation
-    // additionally records the decision that ended it.
+    // the history transition the store records with it — and a cancellation is
+    // one *composite* write: the task and the decision that explains it land in
+    // a single transaction, so the store can never hold a cancelled task whose
+    // reason is missing.
     for entry in &mut surveyed {
         let Outcome::Applied {
             remediation,
@@ -524,9 +531,14 @@ pub async fn replan_at(
             }
         }
         task.touch();
-        store.tasks().update_task(&task).await?;
 
         if let Remediation::Cancel = remediation {
+            // One store operation, not two. The task's cancellation and the
+            // decision that records why are a single transaction, so the round
+            // can never leave a task terminal and unexplained — the reason a
+            // task was abandoned is what makes the cancellation meaningful, and
+            // a cancellation the store cannot explain is not a decision that
+            // landed.
             let id = DecisionId::from_string(format!("DEC-CANCEL-{}", entry.task.as_str()));
             let mut record = DecisionRecord::new(
                 id,
@@ -542,7 +554,9 @@ pub async fn replan_at(
             if let Some(agent) = &request.decided_by {
                 record = record.by(agent.clone());
             }
-            store.decisions().create_decision(&record).await?;
+            store.cancel_task(&task, &record, now).await?;
+        } else {
+            store.tasks().update_task(&task).await?;
         }
     }
 
@@ -564,6 +578,16 @@ pub async fn replan_at(
     // would hide the very thing the re-survey exists to find. So it becomes
     // `NotDecided`: the caller's request was not applied, and the task's new
     // condition is what it owes an answer to.
+    //
+    // The mirror case is why this loop reads both outcomes and both branches:
+    // an undecided task whose condition *disappeared* — the round retried the
+    // dependency it was broken on, so the premise the question was about is
+    // intact again. Leaving it `NotDecided` with no condition would be just as
+    // self-contradicting a report in the other direction: `undecided` would
+    // skip it because there is nothing to answer, while `is_settled` refused to
+    // call the round settled. So it goes back to `NothingNeeded`, which is what
+    // both accessors say about a task with no condition, and the report stays
+    // consistent in both directions the survey can move.
     let after = store.tasks().list_tasks(&request.project_id).await?;
     let conditions_after = survey(&after, &held);
     for entry in &mut surveyed {
@@ -571,8 +595,18 @@ pub async fn replan_at(
             continue;
         }
         entry.condition = conditions_after.get(&entry.task).cloned();
-        if entry.condition.is_some() && matches!(entry.outcome, Outcome::NothingNeeded) {
-            entry.outcome = Outcome::NotDecided;
+        match entry.condition {
+            // The condition the task was reported under is gone, so the question
+            // is gone with it. Nothing was written about the task either way.
+            None => entry.outcome = Outcome::NothingNeeded,
+            // The round's own writes stranded a task the caller had named as
+            // healthy, so the caller's decision is no longer an answer to the
+            // question the task is asking now.
+            Some(_) if matches!(entry.outcome, Outcome::NothingNeeded) => {
+                entry.outcome = Outcome::NotDecided;
+            }
+            // Still stopped, and still waiting on the same kind of answer.
+            Some(_) => {}
         }
     }
     for task in &after {

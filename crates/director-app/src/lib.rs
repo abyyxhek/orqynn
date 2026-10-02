@@ -379,8 +379,10 @@ impl From<director_domain::StoreError> for VerifyError {
 ///
 /// [`Self::Store`] means the round could not read the tasks it surveyed or could
 /// not persist a decision it applied. Every write is one task row plus, for a
-/// cancellation, the decision that records why, and a round validates all of its
-/// decisions before it writes any of them — so a round that failed midway
+/// cancellation, the decision that records why — and those two are one
+/// transaction, so a cancellation that could not record its reason leaves the
+/// task exactly where the round found it. A round validates all of its
+/// decisions before it writes any of them, so a round that failed midway
 /// either changed nothing or changed exactly one task, never half a caller's
 /// intent.
 #[derive(Debug, Error)]

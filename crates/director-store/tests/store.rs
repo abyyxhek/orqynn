@@ -2260,6 +2260,179 @@ async fn decisions_for_a_task_are_newest_first_and_taskless_stay_out() {
 }
 
 // ---------------------------------------------------------------------------
+// The atomic cancellation: the task and the reason it was abandoned land
+// together, or neither lands.
+// ---------------------------------------------------------------------------
+
+/// A project and a task in the store, ready to be cancelled.
+async fn cancellable_task(store: &Store) -> Task {
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    let mut task = task("TASK-1", "PROJ-1");
+    task.status = TaskStatus::InProgress;
+    let stored = store.tasks().create_task(&task).await.expect("task");
+    // The caller's read of the task, the way REPLAN reads it before applying a
+    // cancellation.
+    store.tasks().get_task(&stored.id).await.expect("reloaded")
+}
+
+/// The decision a cancellation records, linked to the task it ends.
+fn cancellation(id: &str, task: &Task) -> Decision {
+    Decision::new(
+        DecisionId::from_string(id),
+        "cancel the task",
+        "not worth it",
+    )
+    .in_task(task.id.clone())
+    .by(AgentId::from_string("AGENT-claude"))
+}
+
+#[tokio::test]
+async fn cancel_task_terminates_the_task_and_records_the_reason_together() {
+    let (store, _path) = store().await;
+    let task = cancellable_task(&store).await;
+
+    let now = chrono::Utc::now();
+    let (stored_task, stored_decision) = store
+        .cancel_task(&task, &cancellation("DEC-1", &task), now)
+        .await
+        .expect("the cancellation");
+
+    assert_eq!(stored_task.status, TaskStatus::Cancelled);
+    assert_eq!(stored_task.state_version, task.state_version + 1);
+    assert_eq!(stored_decision.task_id, Some(task.id.clone()));
+    assert_eq!(stored_decision.rationale, "not worth it");
+
+    // Both halves are readable from the store afterward, and the move to
+    // `cancelled` is in the history.
+    assert_eq!(
+        store.tasks().get_task(&task.id).await.expect("task").status,
+        TaskStatus::Cancelled
+    );
+    assert_eq!(
+        store
+            .decisions()
+            .decisions_for_task(&task.id)
+            .await
+            .expect("decisions")
+            .len(),
+        1
+    );
+    let history = store.tasks().task_history(&task.id).await.expect("history");
+    assert_eq!(
+        history.last().expect("there is a transition").to,
+        TaskStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn cancel_task_rolls_the_task_back_when_the_decision_cannot_be_written() {
+    // The atomicity guarantee, exercised: the decision write fails — its id is
+    // already taken — and the task must not be left `cancelled` without the
+    // reason for it. Both halves roll back, because they were one transaction.
+    let (store, _path) = store().await;
+    let task = cancellable_task(&store).await;
+
+    // Occupy the decision id the cancellation will use. This is the write that
+    // fails; it is the failure the composite operation exists to survive. The
+    // decision is deliberately taskless so that counting decisions for TASK-1
+    // is a clean signal that the cancellation wrote nothing.
+    store
+        .decisions()
+        .create_decision(&Decision::new(
+            DecisionId::from_string("DEC-1"),
+            "an earlier call",
+            "already holds this id",
+        ))
+        .await
+        .expect("the id is taken");
+
+    let err = store
+        .cancel_task(&task, &cancellation("DEC-1", &task), chrono::Utc::now())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintViolation(_)),
+        "the duplicate id is a constraint violation, got {err:?}"
+    );
+
+    // The task is exactly where it was: still in flight, not terminal.
+    assert_eq!(
+        store
+            .tasks()
+            .get_task(&task.id)
+            .await
+            .expect("task still exists")
+            .status,
+        TaskStatus::InProgress,
+        "the task was not cancelled without its reason"
+    );
+    // And the history records no move to `cancelled`.
+    let history = store.tasks().task_history(&task.id).await.expect("history");
+    assert!(
+        history
+            .iter()
+            .all(|transition| transition.to != TaskStatus::Cancelled),
+        "no cancellation transition was recorded"
+    );
+    // The only decision is the one that was already there.
+    assert_eq!(
+        store
+            .decisions()
+            .decisions_for_task(&task.id)
+            .await
+            .expect("decisions")
+            .len(),
+        0,
+        "the cancellation decision did not partially land"
+    );
+}
+
+#[tokio::test]
+async fn cancel_task_on_a_stale_read_is_a_conflict_not_an_overwrite() {
+    // The status move keeps the optimistic-concurrency key `update_task` uses,
+    // so a cancellation built from a stale read cannot clobber a newer write.
+    let (store, _path) = store().await;
+    let task = cancellable_task(&store).await;
+
+    // A newer write lands after the caller's read.
+    let mut moved_on = task.clone();
+    moved_on.status = TaskStatus::Failed;
+    store
+        .tasks()
+        .update_task(&moved_on)
+        .await
+        .expect("the newer write");
+
+    let err = store
+        .cancel_task(&task, &cancellation("DEC-1", &task), chrono::Utc::now())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::StateVersionConflict { .. }),
+        "got {err:?}"
+    );
+
+    // The newer write stands, and no cancellation decision was recorded.
+    assert_eq!(
+        store.tasks().get_task(&task.id).await.expect("task").status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        store
+            .decisions()
+            .decisions_for_task(&task.id)
+            .await
+            .expect("decisions")
+            .len(),
+        0
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Normalized project state.
 // ---------------------------------------------------------------------------
 

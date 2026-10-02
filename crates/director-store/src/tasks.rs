@@ -20,6 +20,7 @@
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
+use director_domain::decision::Decision;
 use director_domain::ids::{ProjectId, TaskId};
 use director_domain::task::{Task, TaskStatus};
 use director_domain::{StoreError, TaskStatusTransition};
@@ -195,6 +196,104 @@ impl director_domain::TaskRepository for SqliteTaskRepository {
         }
         Ok(all)
     }
+}
+
+/// Cancel a task and record the decision that ended it: the task's move to
+/// `cancelled`, the status transition that records the move, and the decision
+/// row carrying the reason — one transaction, all or nothing.
+///
+/// This is the operation the loop's REPLAN step uses when a caller decides a
+/// task is no longer worth pursuing. Splitting the cancellation from the
+/// decision across two store calls would leave a window in which the task was
+/// terminal but the reason for it was unwritten — precisely the state a crash
+/// between the two calls would leave behind: a cancelled task whose rationale
+/// is gone, with nothing in the store to say why the work was abandoned.
+/// Folding them together makes "a cancelled task is a cancelled task with a
+/// recorded reason" a property of the write rather than an ordering the caller
+/// has to get right, the same way [`assign_and_start`] makes an assigned task an
+/// in-progress task.
+///
+/// The status the task moves to is `cancelled` by fiat, not taken from the
+/// caller's `Task`: this operation *is* the cancellation, so the move is one the
+/// caller cannot get wrong. The write is still keyed on the version the caller
+/// read — so a stale cancellation is a [`StoreError::StateVersionConflict"]
+/// rather than an overwrite — and the transition is recorded only when the
+/// status genuinely changed, so the history never accumulates no-op entries.
+///
+/// Returns the task and the decision as they now stand, read back from the
+/// store rather than echoed from the input.
+///
+/// [`assign_and_start`]: crate::assignments::assign_and_start
+pub async fn cancel_task(
+    pool: &crate::connection::ConnectionPool,
+    task: &Task,
+    decision: &Decision,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(Task, Decision), StoreError> {
+    let mut conn = pool.get();
+
+    // The status the task is moving from, read inside the transaction so the
+    // transition history records what the store actually saw rather than what
+    // the caller believed when it decided to cancel.
+    let previous_status: Option<TaskStatus> = conn
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            [task.id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(translate_error)?
+        .map(|text| json::from_json::<TaskStatus>(&text))
+        .transpose()?;
+
+    let tx = conn.transaction().map_err(translate_error)?;
+
+    // The versioned move to `cancelled`. A cancellation changes nothing but the
+    // task's state, so this is the targeted write rather than the full-row one
+    // `update_task` makes when a caller may be amending the contract too.
+    let rows = tx
+        .execute(
+            "UPDATE tasks
+                SET status = ?2, state_version = state_version + 1, updated_at = ?3
+              WHERE id = ?1 AND state_version = ?4",
+            rusqlite::params![
+                task.id.as_str(),
+                json::to_json(&TaskStatus::Cancelled)?,
+                json::timestamp(now),
+                task.state_version as i64,
+            ],
+        )
+        .map_err(translate_error)?;
+    row_count_to_outcome(rows, "task", task.id.as_str(), task.state_version)?;
+
+    if let Some(from) = previous_status {
+        if from != TaskStatus::Cancelled {
+            tx.execute(
+                "INSERT INTO task_status_history
+                    (task_id, from_status, to_status, occurred_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    task.id.as_str(),
+                    json::to_json(&from)?,
+                    json::to_json(&TaskStatus::Cancelled)?,
+                    json::timestamp(now),
+                ],
+            )
+            .map_err(translate_error)?;
+        }
+    }
+
+    // The reason, in the same transaction. If this write fails, the task's
+    // cancellation fails with it — the task is not left terminal and
+    // unexplained.
+    crate::decisions::insert_decision(&tx, decision)?;
+
+    tx.commit().map_err(translate_error)?;
+
+    Ok((
+        load_task(&conn, &task.id)?,
+        crate::decisions::load_decision(&conn, &decision.id)?,
+    ))
 }
 
 /// Insert a task row together with its dependency edges.

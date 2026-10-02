@@ -40,26 +40,10 @@ impl director_domain::Store for SqliteDecisionRepository {
 impl director_domain::DecisionRepository for SqliteDecisionRepository {
     async fn create_decision(&self, decision: &Decision) -> Result<Decision, StoreError> {
         let decision = decision.clone();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO decisions (id, task_id, title, rationale, alternatives, status,
-                                    superseded_by, made_by, state_version, made_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            rusqlite::params![
-                decision.id.as_str(),
-                decision.task_id.as_ref().map(TaskId::as_str),
-                decision.title,
-                decision.rationale,
-                json::to_json(&decision.alternatives_considered)?,
-                json::to_json(&decision.status)?,
-                decision.superseded_by.as_ref().map(DecisionId::as_str),
-                decision.made_by.as_ref().map(AgentId::as_str),
-                decision.state_version as i64,
-                json::timestamp(decision.made_at),
-                json::timestamp(decision.updated_at),
-            ],
-        )
-        .map_err(translate_error)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(translate_error)?;
+        insert_decision(&tx, &decision)?;
+        tx.commit().map_err(translate_error)?;
 
         load_decision(&conn, &decision.id)
     }
@@ -147,6 +131,39 @@ pub(crate) fn load_decision(conn: &PooledConn, id: &DecisionId) -> Result<Decisi
         row_to_decision,
     )
     .map_err(translate_error)
+}
+
+/// Insert a decision row inside the caller's transaction.
+///
+/// Called from [`DecisionRepository::create_decision`] and from
+/// [`crate::tasks::cancel_task`], which is the reason it exists: a cancellation
+/// and the decision that records why it happened have to land in one
+/// transaction, so the decision write is a callable half rather than a method
+/// the composite operation has to reconstruct.
+pub(crate) fn insert_decision(
+    tx: &rusqlite::Transaction<'_>,
+    decision: &Decision,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO decisions (id, task_id, title, rationale, alternatives, status,
+                                superseded_by, made_by, state_version, made_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            decision.id.as_str(),
+            decision.task_id.as_ref().map(TaskId::as_str),
+            decision.title,
+            decision.rationale,
+            json::to_json(&decision.alternatives_considered)?,
+            json::to_json(&decision.status)?,
+            decision.superseded_by.as_ref().map(DecisionId::as_str),
+            decision.made_by.as_ref().map(AgentId::as_str),
+            decision.state_version as i64,
+            json::timestamp(decision.made_at),
+            json::timestamp(decision.updated_at),
+        ],
+    )
+    .map_err(translate_error)?;
+    Ok(())
 }
 
 /// Map a row into a [`Decision`]. A bad column is an error, not a default.
