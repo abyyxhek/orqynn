@@ -1,8 +1,8 @@
 # Phase 6 — The Control Loop, and Its First Steps
 
-> **Status: underway.** The `director-app` crate exists and its first three
-> steps — OBSERVE, PLAN, and ASSIGN — are landed and tested. The remaining
-> steps are built next, one at a time, in the order they run.
+> **Status: underway.** The `director-app` crate exists and its first four
+> steps — OBSERVE, PLAN, ASSIGN, and MONITOR — are landed and tested. The
+> remaining steps are built next, one at a time, in the order they run.
 
 ## Goal
 
@@ -132,7 +132,88 @@ assignment, no verification — a round changes what Orqyn *knows* and nothing
 else, and `ObserveError` is deliberately flat (`Store` versus `Git`, with no
 source chains) because a caller that wants to react has to know which of the
 two disjoint failures happened. PLAN does not invent tasks; ASSIGN does not
-choose agents. Each step's error enum is flat for the same reason.
+choose agents; MONITOR does not decide what happens to the work it reclaimed.
+Each step's error enum is flat for the same reason.
+
+## MONITOR: a lease is only as good as the evidence the holder is still there
+
+`monitor()` is the fourth step, and it is the first one that *revises* a
+decision an earlier step made: ASSIGN handed a task to an agent, and MONITOR
+takes it back when the agent stops being there to hold it. Every task in
+flight is a claim on an agent's attention, so a round looks at each one, asks
+what the holder's heartbeats say, and reclaims the leases that have run out.
+
+Liveness is derived, never stored. `Agent::liveness(now)` computes the lease
+question from `last_seen` through the same 30/60-minute windows
+`status_from_heartbeat` uses — the windows handoff-mcp's `AgentRecord` TTL
+design uses, so Orqyn and the substrate agree when both are running. There is
+no `alive` flag to fall out of step and no cached verdict to invalidate, which
+matters because the one thing a monitor must never do is reclaim a lease from
+an agent whose heartbeat it has not checked.
+
+A round reports four things and writes in one of them:
+
+- **`Working`** — the holder's heartbeat is fresh. The lease stands.
+- **`Stale`** — the holder has gone quiet, but not past the stale window. The
+  lease stands, deliberately: a quiet agent may be thinking, and a lease that
+  ends early is work that has to restart. `Stale` is a report, not an
+  intervention, and the round writes nothing about it.
+- **`Expired`** — the holder is past the stale window. The lease is reclaimed.
+- **`Orphaned`** — a task reading `in_progress` with no active assignment
+  behind it, the state a stranded handoff would leave behind. The store's
+  atomic handoff is what makes this rare; MONITOR reports it and writes
+  nothing, because deciding what to do with work no one holds is REPLAN's job.
+
+### One transaction, not five
+
+The store's `expire_lease` does not just release an assignment. In one
+transaction it releases the tenure as `LeaseExpired`, closes the session that
+held the work as `Vanished`, records the agent as `Disconnected`, clears its
+denormalized `current_task` view, and puts the task back to `todo` with a
+status transition recording the move. The alternative — a release followed by
+separate status and session writes — leaves a window in which the task reads
+`in_progress` with no one holding it, which is exactly the orphaned state
+MONITOR exists to *report* rather than to create. Folding them together makes
+"an expired lease is a `todo` task with a retained tenure" a property of the
+write rather than an ordering the caller has to get right.
+
+Two details are in that transaction for specific reasons. The agent is marked
+`Disconnected` because without it the loop would hand the vanished agent the
+work right back — but an operator's `Offline` is left standing, since that is
+a stronger statement than a heartbeat's absence. And the session is closed
+*only if it was still live*, so an expiry that races a clean close leaves the
+clean close's better evidence in place instead of overwriting it with a
+disappearance it inferred.
+
+### Acknowledgment: a handoff gains the invocation doing the work
+
+ASSIGN records a handoff; it does not record that the agent ever began. That
+is `acknowledge()`, and it is MONITOR's concern for the same reason the expiry
+is: a tenure with a session behind it is what a later lease expiry closes as
+`Vanished`, and what makes "which invocation of which agent did this task" an
+ordinary query rather than a reconstruction.
+
+The caller names the two ids — the tenure and the invocation — and Orqyn
+derives the session's project, task, agent, and machine from the records the
+assignment points at, so the session cannot disagree with the tenure it
+belongs to. The write is one transaction: the session row is inserted, the
+assignment's `session_id` is pointed at it, and the agent is marked `Busy`. A
+released tenure cannot acknowledge a session — that would give an ended
+assignment evidence of work it never did — and a tenure with a session cannot
+acknowledge a second.
+
+### Why a quiet round is not an empty report
+
+A round that found nothing to reclaim returns a report full of `Live` entries
+rather than an empty one. The distinction matters to a caller that polls: an
+empty report is ambiguous between "nothing is in flight" and "everything in
+flight is fine", and a loop that treats those the same will miss the day the
+plan finishes. `is_quiet()` is the predicate a polling loop wants, and it is
+true only when every task the round surveyed is still being worked.
+
+The round is also idempotent, which is what makes it safe to run on every tick.
+A task whose lease expired is `todo`, so the next round does not survey it; a
+task whose holder is quiet is reported every round and written never.
 
 Keeping each step that narrow is what makes them testable in isolation: each
 one consumes the state the previous one produced and needs nothing more.
@@ -188,3 +269,25 @@ is what the next loop tick reads:
   has nothing to assign at all.
 - `ready_tasks` reports exactly the handable work in plan order, excludes
   in-progress and blocked tasks, and recomputes as dependencies complete.
+
+`tests/monitor.rs` works against a real store with the clock pinned, because
+the difference between `Working`, `Stale`, and `Gone` is thirty and sixty
+minutes and the tests move the heartbeats rather than the clock:
+
+- A fresh heartbeat leaves the lease standing and the round quiet; a stale one
+  is reported while the task is still `in_progress` and the agent's own status
+  is untouched — a quiet agent is not a dead agent.
+- A heartbeat past the stale window loses the lease: the task is back to
+  `todo`, the tenure is retained as `lease_expired` rather than deleted, the
+  agent holds nothing and is disconnected, and the reclaimed task is handable
+  again on the next `ready_tasks` read — the cross-step property the expiry
+  exists for.
+- A second round after an expiry surveys nothing, which is what makes the step
+  safe to run on every tick.
+- A task reading `in_progress` with no assignment behind it is reported
+  orphaned and left exactly as it was.
+- Acknowledgment records a session that agrees with the tenure it belongs to
+  and marks the agent busy; the two halves of the step compose, so a session
+  the agent acknowledged is closed as `vanished` when its lease runs out.
+- Acknowledging an unknown assignment, a tenure twice, or a tenure whose lease
+  already expired is refused in each case with nothing written.

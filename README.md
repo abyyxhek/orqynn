@@ -37,7 +37,7 @@ crates. A boundary test in this repo enforces that — see
 >   index in the schema, not a convention. (There is no Phase 4; the roadmap
 >   skips it.)
 > - **Phase 6** — `director-app`, the crate that drives the loop
->   `OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN`. Its first three steps
+>   `OBSERVE → PLAN → ASSIGN → MONITOR → VERIFY → REPLAN`. Its first four steps
 >   are landed. OBSERVE: an observed repository becomes normalized belief in
 >   Orqyn's store. PLAN: a stated objective and task decomposition are validated
 >   — no self-dependencies, no edges to tasks outside the plan, no cycles —
@@ -48,10 +48,16 @@ crates. A boundary test in this repo enforces that — see
 >   handed to a named agent — the handoff, the task's move to `in_progress`, and
 >   the status transition recording it are one transaction, so an assigned task
 >   is never left un-started. Which agent gets which task arrives from the
->   caller too; `ready_tasks` is the read a scheduler will drive off. The
+>   caller too; `ready_tasks` is the read a scheduler will drive off. MONITOR:
+>   every task in flight is surveyed, its holder's lease is judged from
+>   heartbeat age, and a holder past the stale window loses the lease — the
+>   tenure is retained as `lease_expired`, its session is closed as `vanished`,
+>   the agent is recorded as disconnected, and the task goes back to `todo` where
+>   the next ASSIGN can hand it out again. A quiet agent is reported and left
+>   alone; a tenantless in-progress task is reported and left for REPLAN. The
 >   remaining steps are next.
 >
-> There is no MCP server of Orqyn's own yet and only the first three steps of
+> There is no MCP server of Orqyn's own yet and only the first four steps of
 > the loop are wired in — those are later phases, and their absence here is
 > deliberate.
 
@@ -307,7 +313,7 @@ OBSERVE (git/fs/tests + substrate events + agent heartbeats)
    → UNDERSTAND (project state vs last checkpoint; STATE_CHANGED?)
       → PLAN / REPLAN (grounded in observed state, never invented facts)
          → ASSIGN (capability match + claim lease via HandoffAdapter)
-            → MONITOR (heartbeat TTL, lease expiry, progress reports)
+            → MONITOR (heartbeat TTL, lease expiry, progress reports) ✅
                → VERIFY (independent git/file/test inspection)
                   → UPDATE STATE (Orqyn store + substrate records)
                      → loop back, or RECOVER on failure
@@ -421,9 +427,9 @@ than the plumbing:
 | **2** ✅ | Git observation layer (observer, store, service, `ProjectStateSnapshot`) + `HandoffAdapter`: handoff-mcp client implementing `TaskProvider`/`AgentProvider`/`SessionProvider`. |
 | **3** ✅ | `AiMemoryAdapter` — ai-memory client implementing `MemoryProvider`. |
 | **5** ✅ | `director-store` — Orqyn's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
-| **6** ⧗ | `director-app` — the control loop. OBSERVE, PLAN, and ASSIGN are landed and tested (git layer composed with the store; plan, tasks, and activation in one transaction; a task handed to an agent and started in one transaction), and the dependency-graph validation PLAN builds on is landed in `director-domain`; the remaining steps are built next. |
+| **6** ⧗ | `director-app` — the control loop. OBSERVE, PLAN, ASSIGN, and MONITOR are landed and tested (git layer composed with the store; plan, tasks, and activation in one transaction; a task handed to an agent and started in one transaction; a lease reclaimed from an agent whose heartbeat went quiet, and the session that held it recorded when the agent acknowledged the work), and the dependency-graph validation PLAN builds on is landed in `director-domain`; the remaining steps are built next. |
 | 10 | The verification engine. |
-| — | The loop's remaining steps, built one at a time in the order they run: MONITOR → VERIFY → REPLAN. |
+| — | The loop's remaining steps, built one at a time in the order they run: VERIFY → REPLAN. |
 
 ---
 

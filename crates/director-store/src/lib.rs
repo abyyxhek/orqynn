@@ -76,6 +76,7 @@ use std::path::Path;
 use director_domain::assignment::AgentAssignment;
 use director_domain::ids::{AgentId, AssignmentId, TaskId};
 use director_domain::plan::Plan;
+use director_domain::session::AgentSession;
 use director_domain::task::Task;
 use director_domain::StoreError;
 
@@ -212,6 +213,39 @@ impl Store {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(Plan, Vec<Task>), StoreError> {
         plans::create_active_plan(&self.pool, plan, tasks, authorized_by, now).await
+    }
+
+    /// Reclaim a task whose holder has gone quiet: release the assignment as
+    /// `LeaseExpired`, close the session that held it as `Vanished` if it was
+    /// still live, record the agent as `Disconnected`, clear its `current_task`
+    /// view, and put the task back to `todo` — one transaction, all or nothing.
+    ///
+    /// This is the operation the loop's MONITOR step uses once a heartbeat has
+    /// been quiet past the stale window. Returns `None` when no assignment holds
+    /// the task at write time, which is the race a concurrent release or
+    /// expiry wins: nothing is reclaimed.
+    pub async fn expire_lease(
+        &self,
+        task_id: &TaskId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<(AgentAssignment, Task, Option<AgentSession>)>, StoreError> {
+        assignments::expire_lease(&self.pool, task_id, now).await
+    }
+
+    /// Record that the agent holding an assignment began the session doing the
+    /// work: insert the session row, attach it to the assignment, and mark the
+    /// agent `Busy` — one transaction, all or nothing.
+    ///
+    /// This is the operation the loop's MONITOR step uses when an agent reports
+    /// it has started the work it was handed. The assignment must still be
+    /// active; a released assignment cannot acknowledge a session.
+    pub async fn acknowledge_assignment(
+        &self,
+        assignment_id: &AssignmentId,
+        session: &AgentSession,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(AgentAssignment, AgentSession), StoreError> {
+        assignments::acknowledge_assignment(&self.pool, assignment_id, session, now).await
     }
 
     /// Checkpoints: Orqyn's own resumption documents. Superseded ones are

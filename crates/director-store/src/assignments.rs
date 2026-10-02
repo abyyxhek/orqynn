@@ -32,8 +32,10 @@
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 
+use director_domain::agent::AgentStatus;
 use director_domain::assignment::{AgentAssignment, AssignmentStatus, ReleaseReason};
 use director_domain::ids::{AgentId, AssignmentId, SessionId, TaskId};
+use director_domain::session::{AgentSession, SessionEnd, SessionStatus};
 use director_domain::task::{Task, TaskStatus};
 use director_domain::StoreError;
 
@@ -399,6 +401,257 @@ pub async fn assign_and_start(
     let assignment = load_assignment(&conn, assignment_id)?;
     let task = crate::tasks::load_task(&conn, task_id)?;
     Ok((assignment, task, sitting))
+}
+
+/// Reclaim a task whose holder has gone quiet: release the assignment as
+/// `LeaseExpired`, close the session that held it as `Vanished` if it was still
+/// live, record the agent as `Disconnected`, clear its `current_task` view, and
+/// put the task back to `todo` so a later ASSIGN round can hand it out again —
+/// one transaction, all or nothing.
+///
+/// This is the operation the loop's MONITOR step uses once a heartbeat has been
+/// quiet past the stale window. Ending a lease is five separate facts that must
+/// land together, and the reason each one is in this transaction is the same as
+/// the reason the handoff and the status move are one write in
+/// [`assign_and_start`]: the states a partial write would strand are invisible
+/// to a reader. An assignment released but a task still `in_progress` looks
+/// like work in flight with no one on it; a task back to `todo` with the
+/// assignment still `active` looks handable and held at the same time. Folding
+/// them together makes "an expired lease is a `todo` task with a retained
+/// tenure" a property of the write rather than an ordering the caller has to
+/// get right.
+///
+/// Returns `None` when no assignment holds the task at write time. That is the
+/// race a concurrent release or expiry wins: nothing is reclaimed, because
+/// there was nothing to reclaim, and the caller reports the state it found
+/// rather than a write it did not make.
+pub async fn expire_lease(
+    pool: &crate::connection::ConnectionPool,
+    task_id: &TaskId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<(AgentAssignment, Task, Option<AgentSession>)>, StoreError> {
+    let mut conn = pool.get();
+    let tx = conn.transaction().map_err(translate_error)?;
+
+    // 1. The lease in force, read before anything is written because after the
+    //    release the row no longer carries the `active` status that identifies
+    //    it. A task with no active assignment has no lease to expire; the round
+    //    reports it as orphaned rather than inventing one.
+    let assignment: Option<AgentAssignment> = tx
+        .query_row(
+            "SELECT id, task_id, agent_id, session_id, status, assigned_at, released_at,
+                    release_reason, note, state_version
+             FROM agent_assignments WHERE task_id = ?1 AND status = ?2",
+            rusqlite::params![task_id.as_str(), json::to_json(&AssignmentStatus::Active)?],
+            row_to_assignment,
+        )
+        .optional()
+        .map_err(translate_error)?;
+    let Some(assignment) = assignment else {
+        // Commit the empty transaction so the connection comes back to the pool
+        // clean rather than dropped mid-transaction.
+        tx.commit().map_err(translate_error)?;
+        return Ok(None);
+    };
+
+    // 2. The status the task is moving from, read inside the transaction so the
+    //    history records what the store saw — not what the caller believed when
+    //    it decided to expire the lease.
+    let previous_status: Option<TaskStatus> = tx
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            [task_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(translate_error)?
+        .map(|text| json::from_json::<TaskStatus>(&text))
+        .transpose()?;
+
+    // 3. Release the assignment. The tenure is retained — the row is marked,
+    //    never deleted — and the reason says the lease ran out, which is what
+    //    distinguishes this from a deliberate reassignment further down the
+    //    task's history.
+    tx.execute(
+        "UPDATE agent_assignments
+            SET status = ?2, released_at = ?3, release_reason = ?4,
+                state_version = state_version + 1
+          WHERE id = ?1",
+        rusqlite::params![
+            assignment.id.as_str(),
+            json::to_json(&AssignmentStatus::Released)?,
+            json::timestamp(now),
+            json::to_json(&ReleaseReason::LeaseExpired)?,
+        ],
+    )
+    .map_err(translate_error)?;
+
+    // 4. The session, closed as `Vanished` if it was still live. A session that
+    //    already closed is left exactly as it was: its record says how it ended,
+    //    and a lease expiry that raced a clean close must not rewrite the
+    //    better evidence.
+    let mut session = None;
+    if let Some(session_id) = assignment.session_id.as_ref() {
+        let held: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT state_version, status FROM agent_sessions WHERE id = ?1",
+                [session_id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(translate_error)?;
+        if let Some((version, status)) = held {
+            if json::from_json::<SessionStatus>(&status)?.is_live() {
+                crate::sessions::close_session(
+                    &tx,
+                    session_id,
+                    SessionEnd::Vanished,
+                    now,
+                    version as u64,
+                )?;
+                session = Some(crate::sessions::load_session(&tx, session_id)?);
+            }
+        }
+    }
+
+    // 5. The agent no longer holds the task. The assignment row is the
+    //    authority; this clears the denormalized view it reflects, tolerating
+    //    an agent row that has since moved on to other work.
+    clear_current_task_if_still(&tx, &assignment.agent_id, task_id)?;
+
+    // 6. The agent is recorded as gone, so the loop does not hand it right back
+    //    the work it just lost. An operator's `Offline` is a stronger statement
+    //    than a heartbeat's absence, and it is left standing.
+    tx.execute(
+        "UPDATE agents
+            SET status = ?2, updated_at = ?3, state_version = state_version + 1
+          WHERE id = ?1 AND status <> ?4",
+        rusqlite::params![
+            assignment.agent_id.as_str(),
+            json::to_json(&AgentStatus::Disconnected)?,
+            json::timestamp(now),
+            json::to_json(&AgentStatus::Offline)?,
+        ],
+    )
+    .map_err(translate_error)?;
+
+    // 7. The task is handable again. An expired lease is not a verdict on the
+    //    work: the task is unfinished, not failed, so it goes back to `todo`
+    //    where the next round's `ready_tasks` can find it.
+    tx.execute(
+        "UPDATE tasks
+            SET status = ?2, state_version = state_version + 1, updated_at = ?3
+          WHERE id = ?1",
+        rusqlite::params![
+            task_id.as_str(),
+            json::to_json(&TaskStatus::Todo)?,
+            json::timestamp(now),
+        ],
+    )
+    .map_err(translate_error)?;
+
+    // 8. The transition, recorded the same way `assign_and_start` records one:
+    //    same transaction as the update, and only when the status genuinely
+    //    changed, so the history never accumulates no-op entries.
+    if previous_status != Some(TaskStatus::Todo) {
+        tx.execute(
+            "INSERT INTO task_status_history (task_id, from_status, to_status, occurred_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                task_id.as_str(),
+                json::to_json_or_null(previous_status.as_ref())?,
+                json::to_json(&TaskStatus::Todo)?,
+                json::timestamp(now),
+            ],
+        )
+        .map_err(translate_error)?;
+    }
+
+    tx.commit().map_err(translate_error)?;
+
+    let assignment = load_assignment(&conn, &assignment.id)?;
+    let task = crate::tasks::load_task(&conn, task_id)?;
+    Ok(Some((assignment, task, session)))
+}
+
+/// Record that the agent holding an assignment began the session doing the
+/// work: insert the session row and attach it to the assignment — one
+/// transaction, all or nothing.
+///
+/// This is the operation the loop's MONITOR step uses when an agent it assigned
+/// work to reports that it has started. Until it runs, the assignment is a hand
+/// Orqyn recorded but no evidence that the work ever began; after it runs, the
+/// tenure has a session behind it, which is what a later lease expiry closes as
+/// `Vanished` and what makes "which invocation of which agent did this task"
+/// answerable.
+///
+/// The assignment must still be active. Attaching a session to a released
+/// assignment would give a ended tenure evidence of work it never did, so the
+/// write is guarded on the status and refuses rather than repairing.
+pub async fn acknowledge_assignment(
+    pool: &crate::connection::ConnectionPool,
+    assignment_id: &AssignmentId,
+    session: &AgentSession,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(AgentAssignment, AgentSession), StoreError> {
+    let mut conn = pool.get();
+    let tx = conn.transaction().map_err(translate_error)?;
+
+    // The session row first: the assignment's `session_id` column references
+    // it, so the row has to exist before the reference can point at it, and a
+    // failure here leaves nothing behind.
+    crate::sessions::insert_session(&tx, session)?;
+
+    // The link, guarded on the assignment still being active. Zero rows means
+    // the assignment was released between the caller's read and this write, and
+    // the whole transaction rolls back rather than leaving an orphan session
+    // attached to nothing: the evidence trail is one unit with the tenure it
+    // describes.
+    let rows = tx
+        .execute(
+            "UPDATE agent_assignments
+                SET session_id = ?2, state_version = state_version + 1
+              WHERE id = ?1 AND status = ?3",
+            rusqlite::params![
+                assignment_id.as_str(),
+                session.id.as_str(),
+                json::to_json(&AssignmentStatus::Active)?,
+            ],
+        )
+        .map_err(translate_error)?;
+    if rows == 0 {
+        // The constraint is the assignment's own status, which the caller
+        // cannot have known was about to change; a version conflict would claim
+        // a version the caller never held.
+        return Err(StoreError::ConstraintViolation(format!(
+            "assignment {} is not active, so it cannot acknowledge a session",
+            assignment_id
+        )));
+    }
+
+    // The agent is working. Until this point its status said nothing about the
+    // handoff, because a handoff Orqyn recorded is not evidence the agent began;
+    // a session is. An operator's `Offline` is left standing, for the same
+    // reason an expiry leaves it standing: it is a stronger statement than the
+    // agent's own report.
+    tx.execute(
+        "UPDATE agents
+            SET status = ?2, updated_at = ?3, state_version = state_version + 1
+          WHERE id = ?1 AND status <> ?4",
+        rusqlite::params![
+            session.agent_id.as_str(),
+            json::to_json(&AgentStatus::Busy)?,
+            json::timestamp(now),
+            json::to_json(&AgentStatus::Offline)?,
+        ],
+    )
+    .map_err(translate_error)?;
+
+    tx.commit().map_err(translate_error)?;
+
+    let assignment = load_assignment(&conn, assignment_id)?;
+    let session = crate::sessions::load_session(&conn, &session.id)?;
+    Ok((assignment, session))
 }
 
 /// Insert an assignment row in whatever status it carries.

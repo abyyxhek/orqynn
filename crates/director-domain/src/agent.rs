@@ -96,6 +96,48 @@ impl AgentStatus {
     }
 }
 
+/// What the loop's MONITOR step derives about a *lease* from heartbeat age.
+///
+/// [`AgentStatus`] answers "what state is this agent in", for the registry.
+/// `Liveness` answers a narrower question that the loop acts on: "this agent
+/// was handed a task — is it still holding it, or has it been quiet long enough
+/// that the lease should be reclaimed and the work handed to someone else?" The
+/// two share the 30/60-minute windows, because Orqyn's notion of liveness has to
+/// agree with the substrate's when both are running, but they are not the same
+/// enumeration: an agent that is `Available` is alive and idle, and a lease it
+/// does not hold is not MONITOR's business either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Liveness {
+    /// Heartbeat is fresh. The agent is presumed to still be working.
+    Working,
+    /// Heartbeat is stale: the agent has gone quiet, but not long enough to
+    /// reclaim its work. Report it, and leave the lease alone.
+    Stale,
+    /// Past the stale window with no heartbeat. The lease is over and may be
+    /// reclaimed.
+    Gone,
+}
+
+impl Liveness {
+    /// The lease question, as the registry's heartbeat-derived status answers
+    /// it. A fresh heartbeat is `Working` whether the registry called it
+    /// `available` or `busy` — MONITOR asks this about an agent holding a task,
+    /// and either way the heartbeat says it is alive.
+    pub fn from_status(status: AgentStatus) -> Self {
+        match status {
+            AgentStatus::Available | AgentStatus::Busy => Liveness::Working,
+            AgentStatus::Stale => Liveness::Stale,
+            AgentStatus::Disconnected | AgentStatus::Offline => Liveness::Gone,
+        }
+    }
+
+    /// True if the lease this came from should be reclaimed.
+    pub fn is_gone(self) -> bool {
+        matches!(self, Liveness::Gone)
+    }
+}
+
 /// A worker: one harness running as one process on one machine.
 ///
 /// Deliberately thin. The rich state — what it is working on — lives in
@@ -218,6 +260,14 @@ impl Agent {
             AgentStatus::Disconnected
         }
     }
+
+    /// What MONITOR should believe about the lease this agent holds, derived
+    /// from heartbeat age through [`Liveness::from_status`] and
+    /// [`Agent::status_from_heartbeat`]. The one place the loop asks "is the
+    /// agent that took this task still there".
+    pub fn liveness(&self, now: chrono::DateTime<chrono::Utc>) -> Liveness {
+        Liveness::from_status(Self::status_from_heartbeat(now - self.last_seen))
+    }
 }
 
 /// A physical or virtual machine an agent runs on.
@@ -321,6 +371,52 @@ mod tests {
         assert!(AgentStatus::Stale.is_live());
         assert!(AgentStatus::Disconnected.is_gone());
         assert!(AgentStatus::Offline.is_gone());
+    }
+
+    #[test]
+    fn liveness_follows_the_same_windows_as_the_registry_status() {
+        // The two enumerations share the thresholds; the mapping is what MONITOR
+        // branches on, so a change to the windows has to move both.
+        assert_eq!(
+            Liveness::from_status(AgentStatus::Available),
+            Liveness::Working
+        );
+        assert_eq!(Liveness::from_status(AgentStatus::Busy), Liveness::Working);
+        assert_eq!(Liveness::from_status(AgentStatus::Stale), Liveness::Stale);
+        assert_eq!(
+            Liveness::from_status(AgentStatus::Disconnected),
+            Liveness::Gone
+        );
+        assert_eq!(Liveness::from_status(AgentStatus::Offline), Liveness::Gone);
+
+        // An operator's `Offline` is as gone as a disconnected agent: the lease
+        // is not coming back either way.
+        assert!(Liveness::from_status(AgentStatus::Offline).is_gone());
+        assert!(!Liveness::Stale.is_gone());
+    }
+
+    #[test]
+    fn liveness_is_derived_from_the_time_since_the_last_heartbeat() {
+        let mut a = agent(vec![]);
+        let now = chrono::Utc::now();
+
+        a.last_seen = now - chrono::Duration::minutes(5);
+        assert_eq!(a.liveness(now), Liveness::Working);
+
+        a.last_seen = now - chrono::Duration::minutes(45);
+        assert_eq!(a.liveness(now), Liveness::Stale);
+
+        a.last_seen = now - chrono::Duration::minutes(90);
+        assert_eq!(a.liveness(now), Liveness::Gone);
+    }
+
+    #[test]
+    fn a_clock_skew_that_looks_like_a_future_heartbeat_is_working() {
+        // `last_seen` later than `now` is nonsense, but it is the shape a clock
+        // skew produces, and it must not be read as "the agent went missing".
+        let mut a = agent(vec![]);
+        a.last_seen = chrono::Utc::now() + chrono::Duration::minutes(10);
+        assert_eq!(a.liveness(chrono::Utc::now()), Liveness::Working);
     }
 
     #[test]

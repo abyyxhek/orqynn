@@ -35,11 +35,12 @@
 //! the tests are the caller.
 
 pub mod assign;
+pub mod monitor;
 pub mod observe;
 pub mod plan;
 
 use director_domain::capability::Capability;
-use director_domain::ids::{AgentId, AssignmentId, PlanId, ProjectId, TaskId};
+use director_domain::ids::{AgentId, AssignmentId, PlanId, ProjectId, SessionId, TaskId};
 use director_domain::task::TaskStatus;
 use thiserror::Error;
 
@@ -284,5 +285,52 @@ pub enum AssignError {
 impl From<director_domain::StoreError> for AssignError {
     fn from(err: director_domain::StoreError) -> Self {
         AssignError::Store(err.to_string())
+    }
+}
+
+/// Every way a MONITOR round can fail, in one place.
+///
+/// Like the other steps' error enums, this is flat with no source chains,
+/// because the failure modes are disjoint and a caller that wants to react has
+/// to know which one happened. The split that matters here is between a
+/// monitoring request that is wrong and a store that would not take the write:
+///
+/// - The acknowledgment errors ([`Self::UnknownAssignment`],
+///   [`Self::AssignmentNotActive`], [`Self::AlreadyAcknowledged`]) are rejected
+///   before anything is written. Nothing was recorded; the caller fixes the
+///   request and tries again.
+/// - [`Self::Store`] means the store rejected the read or the write. A lease
+///   expiry is one transaction, so this leaves the task held and `in_progress`,
+///   which is exactly the state the next round will survey again.
+#[derive(Debug, Error)]
+pub enum MonitorError {
+    /// Orqyn could not read or write its own state.
+    #[error("the store rejected the monitoring round: {0}")]
+    Store(String),
+
+    /// The assignment the caller asked to acknowledge does not exist. Either it
+    /// was never made, or its id is wrong.
+    #[error("no assignment {0}")]
+    UnknownAssignment(AssignmentId),
+
+    /// The assignment is not in force — it was released, so no session can be
+    /// attached to it.
+    #[error("assignment {0} is not active")]
+    AssignmentNotActive(AssignmentId),
+
+    /// The assignment already records the session doing the work. A tenure has
+    /// one invocation; the first acknowledgment is the evidence trail.
+    #[error("assignment {assignment} was already acknowledged by session {session}")]
+    AlreadyAcknowledged {
+        /// The assignment that already has a session.
+        assignment: AssignmentId,
+        /// The session it already records.
+        session: SessionId,
+    },
+}
+
+impl From<director_domain::StoreError> for MonitorError {
+    fn from(err: director_domain::StoreError) -> Self {
+        MonitorError::Store(err.to_string())
     }
 }

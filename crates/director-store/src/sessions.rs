@@ -86,23 +86,7 @@ impl director_domain::SessionRepository for SqliteSessionRepository {
         caller_version: u64,
     ) -> Result<AgentSession, StoreError> {
         let conn = self.conn();
-        let rows = conn
-            .execute(
-                "UPDATE agent_sessions
-                    SET status = ?2, end = ?3, ended_at = ?4,
-                        last_seen = ?4, state_version = state_version + 1
-                  WHERE id = ?1 AND state_version = ?5",
-                rusqlite::params![
-                    id.as_str(),
-                    // Written as JSON, the same as insert and update do, so
-                    // the read path's from_json sees the shape it expects.
-                    json::to_json(&SessionStatus::Closed)?,
-                    json::to_json(&end)?,
-                    json::timestamp(chrono::Utc::now()),
-                    caller_version as i64,
-                ],
-            )
-            .map_err(translate_error)?;
+        let rows = close_session(&conn, id, end, chrono::Utc::now(), caller_version)?;
         row_count_to_outcome(rows, "session", id.as_str(), caller_version)?;
         load_session(&conn, id)
     }
@@ -128,9 +112,14 @@ impl director_domain::SessionRepository for SqliteSessionRepository {
     }
 }
 
-/// Insert a session row. Shared by `create_session` and by the assignment
-/// service, which starts a session in the same transaction as the assignment.
-pub(crate) fn insert_session(conn: &PooledConn, session: &AgentSession) -> Result<(), StoreError> {
+/// Insert a session row. Shared by `create_session` and by the lease
+/// acknowledgment path, which starts a session in the same transaction as the
+/// assignment it is attached to — the session and the link land together, or
+/// neither does.
+pub(crate) fn insert_session(
+    conn: &impl std::ops::Deref<Target = rusqlite::Connection>,
+    session: &AgentSession,
+) -> Result<(), StoreError> {
     conn.execute(
         "INSERT INTO agent_sessions (id, project_id, agent_id, machine_id, task_id, status,
                                      parent_session_id, branch, commit_sha, started_at,
@@ -166,7 +155,14 @@ pub(crate) fn insert_session(conn: &PooledConn, session: &AgentSession) -> Resul
 }
 
 /// Load one session by id, or [`StoreError::NotFound`].
-pub(crate) fn load_session(conn: &PooledConn, id: &SessionId) -> Result<AgentSession, StoreError> {
+///
+/// Takes anything that derefs to a [`rusqlite::Connection`] so a caller can
+/// reload a session inside the transaction it just wrote it in — a lease
+/// expiry closes a session and reads the result back before it commits.
+pub(crate) fn load_session(
+    conn: &impl std::ops::Deref<Target = rusqlite::Connection>,
+    id: &SessionId,
+) -> Result<AgentSession, StoreError> {
     conn.query_row(
         "SELECT id, project_id, agent_id, machine_id, task_id, status,
                 parent_session_id, branch, commit_sha, started_at, ended_at, end,
@@ -176,6 +172,52 @@ pub(crate) fn load_session(conn: &PooledConn, id: &SessionId) -> Result<AgentSes
         row_to_session,
     )
     .map_err(translate_error)
+}
+
+/// Close a session, recording how it ended and stamping the version that closed
+/// it. Returns how many rows it closed.
+///
+/// The row count is returned rather than interpreted because the two callers
+/// mean different things by a session that did not close:
+///
+/// - [`SessionRepository::end_session`](director_domain::SessionRepository::end_session)
+///   turns zero rows into a [`StoreError::StateVersionConflict`], because a
+///   caller who asked to close a session is owed the news that it is closed
+///   already.
+/// - A lease expiry checks the session's status before it calls this, and only
+///   calls it for a session that is still live, so a session that closed on its
+///   own is never reopened as a disappearance. Its record says how it ended,
+///   and a clean close the agent managed to send is better evidence than the
+///   one MONITOR inferred.
+///
+/// Takes anything that derefs to a [`rusqlite::Connection`] so a lease expiry
+/// can close the session inside the transaction that releases the assignment it
+/// belonged to — the two are one write, or neither happens.
+pub(crate) fn close_session(
+    conn: &impl std::ops::Deref<Target = rusqlite::Connection>,
+    id: &SessionId,
+    end: SessionEnd,
+    now: chrono::DateTime<chrono::Utc>,
+    expected_version: u64,
+) -> Result<usize, StoreError> {
+    let rows = conn
+        .execute(
+            "UPDATE agent_sessions
+                SET status = ?2, end = ?3, ended_at = ?4,
+                    last_seen = ?4, state_version = state_version + 1
+              WHERE id = ?1 AND state_version = ?5",
+            rusqlite::params![
+                id.as_str(),
+                // Written as JSON, the same as insert and update do, so the
+                // read path's from_json sees the shape it expects.
+                json::to_json(&SessionStatus::Closed)?,
+                json::to_json(&end)?,
+                json::timestamp(now),
+                expected_version as i64,
+            ],
+        )
+        .map_err(translate_error)?;
+    Ok(rows)
 }
 
 /// Load a session if it exists, without failing when it does not.

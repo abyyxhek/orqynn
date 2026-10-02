@@ -1016,9 +1016,397 @@ async fn assign_task_to_the_same_agent_keeps_the_view_pointing_at_the_task() {
 }
 
 // ---------------------------------------------------------------------------
-// Checkpoints: superseded, never deleted.
+// The atomic lease operation: the thing the loop's MONITOR step will call.
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn expire_lease_releases_the_assignment_and_puts_the_task_back_to_todo() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+
+    let now = chrono::Utc::now();
+    let (assignment, task, session) = store
+        .expire_lease(&TaskId::from_string("TASK-1"), now)
+        .await
+        .expect("the lease expired")
+        .expect("there was a lease to expire");
+
+    // The tenure is retained, and its reason says the lease ran out.
+    assert_eq!(assignment.status, AssignmentStatus::Released);
+    assert_eq!(assignment.release_reason, Some(ReleaseReason::LeaseExpired));
+    assert_eq!(assignment.released_at, Some(now));
+    assert!(session.is_none(), "no session was ever attached");
+
+    // The task is handable again, and its history records the move back.
+    assert_eq!(task.status, TaskStatus::Todo);
+    assert_eq!(
+        store
+            .tasks()
+            .get_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("task")
+            .status,
+        TaskStatus::Todo
+    );
+    let history = store
+        .tasks()
+        .task_history(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("history");
+    assert_eq!(history.len(), 2, "started, then returned to todo");
+    assert_eq!(history[0].to, TaskStatus::InProgress);
+    assert_eq!(history[1].from, TaskStatus::InProgress);
+    assert_eq!(history[1].to, TaskStatus::Todo);
+
+    // The agent holds nothing and is recorded as gone.
+    let agent = store
+        .agents()
+        .get_agent(&AgentId::from_string("AGENT-1"))
+        .await
+        .expect("agent");
+    assert_eq!(agent.current_task, None);
+    assert_eq!(agent.status, AgentStatus::Disconnected);
+
+    // And no assignment is in force for the task, so it can be handed out again.
+    assert!(
+        store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("the query")
+            .is_none(),
+        "the lease is over"
+    );
+}
+
+#[tokio::test]
+async fn expire_lease_closes_the_session_that_held_the_work_as_vanished() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+    store
+        .acknowledge_assignment(
+            &AssignmentId::from_string("ASG-1"),
+            &session("SESS-1", "AGENT-1", "TASK-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the agent started a session");
+
+    let (_, _, session) = store
+        .expire_lease(&TaskId::from_string("TASK-1"), chrono::Utc::now())
+        .await
+        .expect("the lease expired")
+        .expect("there was a lease");
+
+    // The session is closed, and its end says Orqyn noticed the heartbeat stop
+    // rather than that the agent closed out properly.
+    let session = session.expect("the lease had a session");
+    assert_eq!(session.status, SessionStatus::Closed);
+    assert_eq!(session.end, Some(SessionEnd::Vanished));
+
+    let reloaded = store
+        .sessions()
+        .get_session(&SessionId::from_string("SESS-1"))
+        .await
+        .expect("session");
+    assert_eq!(reloaded.end, Some(SessionEnd::Vanished));
+    assert!(reloaded.ended_uncleanly());
+}
+
+#[tokio::test]
+async fn expire_lease_leaves_a_session_the_agent_already_closed_alone() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+    store
+        .acknowledge_assignment(
+            &AssignmentId::from_string("ASG-1"),
+            &session("SESS-1", "AGENT-1", "TASK-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the agent started a session");
+    // The agent closed out properly before the lease was reclaimed.
+    store
+        .sessions()
+        .end_session(&SessionId::from_string("SESS-1"), SessionEnd::Clean, 1)
+        .await
+        .expect("session closed cleanly");
+
+    store
+        .expire_lease(&TaskId::from_string("TASK-1"), chrono::Utc::now())
+        .await
+        .expect("the lease expired");
+
+    // A clean close is better evidence than the disappearance MONITOR inferred,
+    // so it stands.
+    let session = store
+        .sessions()
+        .get_session(&SessionId::from_string("SESS-1"))
+        .await
+        .expect("session");
+    assert_eq!(session.end, Some(SessionEnd::Clean));
+    assert!(!session.ended_uncleanly());
+}
+
+#[tokio::test]
+async fn expire_lease_on_a_task_no_one_holds_is_a_noop() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+
+    // A task that was never assigned has no lease to expire.
+    assert!(
+        store
+            .expire_lease(&TaskId::from_string("TASK-1"), chrono::Utc::now())
+            .await
+            .expect("the operation")
+            .is_none(),
+        "nothing was reclaimed"
+    );
+    assert_eq!(
+        store
+            .tasks()
+            .get_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("task")
+            .status,
+        TaskStatus::Backlog,
+        "the task was untouched"
+    );
+}
+
+#[tokio::test]
+async fn expire_lease_leaves_an_operators_offline_standing() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+
+    // An operator took the agent offline deliberately, before its lease ran out.
+    let mut agent = store
+        .agents()
+        .get_agent(&AgentId::from_string("AGENT-1"))
+        .await
+        .expect("agent");
+    agent.status = AgentStatus::Offline;
+    store.agents().update_agent(&agent).await.expect("offline");
+
+    store
+        .expire_lease(&TaskId::from_string("TASK-1"), chrono::Utc::now())
+        .await
+        .expect("the lease expired");
+
+    // `Offline` is a stronger statement than a heartbeat's absence, so the
+    // expiry does not soften it to `Disconnected`.
+    assert_eq!(
+        store
+            .agents()
+            .get_agent(&AgentId::from_string("AGENT-1"))
+            .await
+            .expect("agent")
+            .status,
+        AgentStatus::Offline
+    );
+}
+
+#[tokio::test]
+async fn acknowledge_assignment_attaches_the_session_and_marks_the_agent_busy() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+
+    let (assignment, session) = store
+        .acknowledge_assignment(
+            &AssignmentId::from_string("ASG-1"),
+            &session("SESS-1", "AGENT-1", "TASK-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("acknowledged");
+
+    // The tenure now has the invocation doing the work behind it.
+    assert_eq!(
+        assignment.session_id,
+        Some(SessionId::from_string("SESS-1"))
+    );
+    assert_eq!(session.task_id, Some(TaskId::from_string("TASK-1")));
+    assert_eq!(session.status, SessionStatus::Active);
+
+    // Both records agree after a reload, which is what the next loop tick reads.
+    assert_eq!(
+        store
+            .assignments()
+            .get_assignment(&AssignmentId::from_string("ASG-1"))
+            .await
+            .expect("assignment")
+            .session_id,
+        Some(SessionId::from_string("SESS-1"))
+    );
+    assert!(store
+        .sessions()
+        .get_session(&SessionId::from_string("SESS-1"))
+        .await
+        .is_ok());
+
+    // The agent is working, so it cannot be handed more work.
+    assert_eq!(
+        store
+            .agents()
+            .get_agent(&AgentId::from_string("AGENT-1"))
+            .await
+            .expect("agent")
+            .status,
+        AgentStatus::Busy
+    );
+}
+
+#[tokio::test]
+async fn acknowledge_assignment_on_a_released_tenure_is_refused() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+    store
+        .assignments()
+        .release_assignment(
+            &AssignmentId::from_string("ASG-1"),
+            ReleaseReason::ReleasedByOperator,
+            1,
+        )
+        .await
+        .expect("released");
+
+    // Attaching a session to a tenure that has ended would give it evidence of
+    // work it never did.
+    let err = store
+        .acknowledge_assignment(
+            &AssignmentId::from_string("ASG-1"),
+            &session("SESS-1", "AGENT-1", "TASK-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintViolation(_)),
+        "got {err:?}"
+    );
+
+    // The whole transaction rolled back: the session row the agent claims it
+    // started is not stored against an ended tenure.
+    assert!(
+        store
+            .sessions()
+            .get_session(&SessionId::from_string("SESS-1"))
+            .await
+            .is_err(),
+        "no session was recorded"
+    );
+}
+
+#[tokio::test]
+async fn acknowledge_assignment_leaves_an_operators_offline_standing() {
+    let (store, _path) = store().await;
+    assignment_prereqs(&store).await;
+    store
+        .assign_and_start(
+            &TaskId::from_string("TASK-1"),
+            &AgentId::from_string("AGENT-1"),
+            &AssignmentId::from_string("ASG-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("assigned and started");
+
+    // An operator took the agent offline, and it reported starting anyway. The
+    // session is recorded — the agent did start — but the operator's status is
+    // not softened to `Busy`.
+    let mut agent = store
+        .agents()
+        .get_agent(&AgentId::from_string("AGENT-1"))
+        .await
+        .expect("agent");
+    agent.status = AgentStatus::Offline;
+    store.agents().update_agent(&agent).await.expect("offline");
+
+    store
+        .acknowledge_assignment(
+            &AssignmentId::from_string("ASG-1"),
+            &session("SESS-1", "AGENT-1", "TASK-1"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("acknowledged");
+
+    assert_eq!(
+        store
+            .agents()
+            .get_agent(&AgentId::from_string("AGENT-1"))
+            .await
+            .expect("agent")
+            .status,
+        AgentStatus::Offline
+    );
+    assert!(
+        store
+            .sessions()
+            .get_session(&SessionId::from_string("SESS-1"))
+            .await
+            .is_ok(),
+        "the session was still recorded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoints: superseded, never deleted.
+// ---------------------------------------------------------------------------
 fn checkpoint(id: &str, task: &str, next: &str) -> Checkpoint {
     Checkpoint::new(
         CheckpointId::from_string(id),
