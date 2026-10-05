@@ -78,6 +78,14 @@ pub fn migrations() -> BTreeMap<u32, Migration> {
             sql: include_str!("../migrations/0002_plans_decisions.sql"),
         },
     );
+    all.insert(
+        3,
+        Migration {
+            version: 3,
+            name: "verifications",
+            sql: include_str!("../migrations/0003_verifications.sql"),
+        },
+    );
     all
 }
 

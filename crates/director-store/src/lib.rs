@@ -70,6 +70,7 @@ mod projects;
 mod sessions;
 mod state_sync;
 mod tasks;
+mod verifications;
 
 use std::path::Path;
 
@@ -79,6 +80,7 @@ use director_domain::ids::{AgentId, AssignmentId, TaskId};
 use director_domain::plan::Plan;
 use director_domain::session::AgentSession;
 use director_domain::task::Task;
+use director_domain::verification::Verification;
 use director_domain::StoreError;
 
 pub use migrations::{latest_version, migrations, Migration};
@@ -97,6 +99,7 @@ pub use plans::SqlitePlanRepository;
 pub use projects::SqliteProjectRepository;
 pub use sessions::SqliteSessionRepository;
 pub use tasks::SqliteTaskRepository;
+pub use verifications::SqliteVerificationRepository;
 
 /// The store, and the only way to reach any repository in it.
 ///
@@ -327,5 +330,36 @@ impl Store {
     /// provider.
     pub fn provider_sync(&self) -> SqliteProviderSyncRepository {
         SqliteProviderSyncRepository::new(self.pool.clone())
+    }
+
+    /// Verifications: the durable record of Orqyn judging a task's work. Each
+    /// judgment is its own row; history accumulates and is never overwritten.
+    pub fn verifications(&self) -> SqliteVerificationRepository {
+        SqliteVerificationRepository::new(self.pool.clone())
+    }
+
+    /// Record a verification and apply its verdict to the task: the verification
+    /// row, the task's status move, and the transition that records the move —
+    /// one transaction, all or nothing.
+    ///
+    /// This is the operation the verification engine uses to land a judgment,
+    /// and folding the three writes together is what keeps the model's central
+    /// invariant honest: a task that reads `done` with no verification row is a
+    /// task that reached `done` without independent evidence, which is exactly
+    /// the state nothing self-reports completion exists to prevent. An
+    /// `Unverifiable` verdict writes the verification and moves nothing, so a
+    /// round that could not gather evidence leaves the task exactly as it was —
+    /// safe to survey again next tick, and with a record that Orqyn looked.
+    ///
+    /// The task's destination is derived from the verdict rather than taken from
+    /// the caller, so the store and the step cannot disagree about what a
+    /// `Passed` verdict means. Returns the verification and the task as they now
+    /// stand, read back from the store.
+    pub async fn apply_verification(
+        &self,
+        verification: &Verification,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(Verification, Task), StoreError> {
+        verifications::apply_verification(&self.pool, verification, now).await
     }
 }

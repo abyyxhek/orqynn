@@ -66,6 +66,7 @@ pub mod session;
 pub mod state;
 pub mod store;
 pub mod task;
+pub mod verification;
 
 // Flat re-exports: callers write `director_domain::Task`, not
 // `director_domain::task::Task`. The module split is for organization; the
@@ -85,6 +86,7 @@ pub use handoff::{Handoff, HandoffError, HandoffState};
 pub use ids::{
     ActionId, AgentId, AssignmentId, BlockerId, CheckpointId, DecisionId, EventId, HandoffId, Id,
     IdGenerator, MachineId, PlanId, ProjectId, RepositoryId, SessionId, SubtaskId, TaskId,
+    VerificationId,
 };
 pub use plan::{Plan, PlanStatus};
 pub use project::{DefaultBranch, Project};
@@ -99,6 +101,9 @@ pub use state::{
     TestResults,
 };
 pub use task::{Complexity, ExpectedOutput, Priority, Subtask, Task, TaskStatus};
+pub use verification::{
+    Evidence, EvidenceStatus, Probe, ProbeKind, Verification, VerificationStatus,
+};
 
 // Orqyn's own store boundary: the repository traits and their vocabulary.
 // Flat for the same reason as everything else — callers say `TaskRepository`,
@@ -107,7 +112,7 @@ pub use store::{
     AgentRepository, AssignmentRepository, CheckpointRepository, DecisionRepository,
     PlanRepository, ProjectRepository, ProjectStateRepository, ProviderSync,
     ProviderSyncRepository, SessionRepository, Store, StoreError, StoredProjectState,
-    TaskRepository, TaskStatusTransition,
+    TaskRepository, TaskStatusTransition, VerificationRepository,
 };
 
 #[cfg(test)]

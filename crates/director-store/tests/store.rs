@@ -24,7 +24,7 @@ use director_domain::checkpoint::{Checkpoint, CheckpointStatus};
 use director_domain::decision::{Decision, DecisionStatus};
 use director_domain::ids::{
     AgentId, AssignmentId, CheckpointId, DecisionId, MachineId, PlanId, ProjectId, RepositoryId,
-    SessionId, TaskId,
+    SessionId, TaskId, VerificationId,
 };
 use director_domain::plan::{Plan, PlanStatus};
 use director_domain::project::{DefaultBranch, Project};
@@ -32,10 +32,13 @@ use director_domain::session::{AgentSession, SessionEnd, SessionStatus};
 use director_domain::state::TestResults;
 use director_domain::store::{ProviderSync, StoredProjectState};
 use director_domain::task::{Task, TaskStatus};
+use director_domain::verification::{
+    Evidence, EvidenceStatus, ProbeKind, Verification, VerificationStatus,
+};
 use director_domain::{
     AgentRepository, AssignmentRepository, CheckpointRepository, DecisionRepository,
     PlanRepository, ProjectRepository, ProjectStateRepository, ProviderSyncRepository,
-    SessionRepository, StoreError, TaskRepository,
+    SessionRepository, StoreError, TaskRepository, VerificationRepository,
 };
 
 use director_store::Store;
@@ -2548,4 +2551,255 @@ async fn provider_sync_records_the_last_attempt_and_its_outcome() {
         .expect("there is one");
     assert!(after.last_error.is_none());
     assert_eq!(after.external_version, Some("0.35.1".into()));
+}
+
+// ---------------------------------------------------------------------------
+// Verifications: the durable record of Orqyn judging a task's work.
+// ---------------------------------------------------------------------------
+
+/// A task awaiting verification, in a store with a project to hang it off.
+async fn task_awaiting_verification(store: &Store) -> Task {
+    let project = ProjectId::from_string("PROJ-1");
+    store
+        .projects()
+        .create_project(&Project::new(project.clone(), project.as_str(), "/nowhere"))
+        .await
+        .expect("project created");
+
+    let mut task = Task::for_project(
+        project,
+        TaskId::from_string("AUTH-42"),
+        "Auth",
+        "POST /login returns a session cookie",
+    );
+    task.status = TaskStatus::VerificationPending;
+    store
+        .tasks()
+        .create_task(&task)
+        .await
+        .expect("task created");
+    task
+}
+
+/// One verification of the given task, carrying the given decisive evidence.
+fn verification_of(id: &str, task: &Task, status: VerificationStatus) -> Verification {
+    Verification::new(
+        VerificationId::from_string(id),
+        task.id.clone(),
+        task.project_id.clone().expect("the task has a project"),
+        None,
+        status,
+        vec![Evidence {
+            kind: ProbeKind::TestSuite,
+            criterion: "the suite passes".into(),
+            status: if status == VerificationStatus::Failed {
+                EvidenceStatus::Failed
+            } else {
+                EvidenceStatus::Passed
+            },
+            detail: "14 passed, 0 failed".into(),
+        }],
+        None,
+        chrono::Utc::now(),
+    )
+}
+
+#[tokio::test]
+async fn a_passing_verification_moves_the_task_to_done() {
+    let (store, _path) = store().await;
+    let task = task_awaiting_verification(&store).await;
+
+    let (verification, after) = store
+        .apply_verification(
+            &verification_of("VER-1", &task, VerificationStatus::Passed),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the verification lands");
+
+    // The verdict is recorded, and the task moved where the verdict says.
+    assert_eq!(verification.status, VerificationStatus::Passed);
+    assert_eq!(after.status, TaskStatus::Done);
+    assert_eq!(after.id, task.id);
+
+    // And the move is in the history, so "how did this become done" is
+    // answerable from the store alone.
+    let history = store.tasks().task_history(&task.id).await.expect("history");
+    assert!(history
+        .iter()
+        .any(|t| t.from == TaskStatus::VerificationPending && t.to == TaskStatus::Done));
+}
+
+#[tokio::test]
+async fn a_failing_verification_moves_the_task_to_failed() {
+    let (store, _path) = store().await;
+    let task = task_awaiting_verification(&store).await;
+
+    let (_verification, after) = store
+        .apply_verification(
+            &verification_of("VER-1", &task, VerificationStatus::Failed),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the verification lands");
+
+    assert_eq!(after.status, TaskStatus::Failed);
+    let history = store.tasks().task_history(&task.id).await.expect("history");
+    assert!(history
+        .iter()
+        .any(|t| t.from == TaskStatus::VerificationPending && t.to == TaskStatus::Failed));
+}
+
+#[tokio::test]
+async fn an_unverifiable_round_records_itself_and_moves_nothing() {
+    // The design point this test holds: an unverifiable round *writes* — the
+    // evidence trail that Orqyn looked is worth keeping — but it moves the task
+    // nowhere, which is what makes resurveying it next tick safe.
+    let (store, _path) = store().await;
+    let task = task_awaiting_verification(&store).await;
+
+    let (verification, after) = store
+        .apply_verification(
+            &verification_of("VER-1", &task, VerificationStatus::Unverifiable),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the verification lands");
+
+    assert_eq!(verification.status, VerificationStatus::Unverifiable);
+    assert_eq!(after.status, TaskStatus::VerificationPending);
+
+    // No transition was recorded, because nothing moved.
+    let history = store.tasks().task_history(&task.id).await.expect("history");
+    assert!(history
+        .iter()
+        .all(|t| t.to != TaskStatus::Done && t.to != TaskStatus::Failed));
+
+    // But the round is in the history of judgments.
+    assert!(store
+        .verifications()
+        .latest_verification(&task.id)
+        .await
+        .expect("there is a latest")
+        .is_some());
+}
+
+#[tokio::test]
+async fn a_task_reaching_done_always_has_a_verification_behind_it() {
+    // The invariant the whole model exists to express, stated as a query: no
+    // task reaches `done` except through a verification. Reading the two tables
+    // together is what makes it checkable rather than something to believe.
+    let (store, _path) = store().await;
+    let task = task_awaiting_verification(&store).await;
+
+    store
+        .apply_verification(
+            &verification_of("VER-1", &task, VerificationStatus::Passed),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the verification lands");
+
+    let after = store
+        .tasks()
+        .get_task(&task.id)
+        .await
+        .expect("task reloaded");
+    assert_eq!(after.status, TaskStatus::Done);
+
+    let verification = store
+        .verifications()
+        .latest_verification(&task.id)
+        .await
+        .expect("history readable")
+        .expect("there is a verification for a done task");
+    assert_eq!(verification.status, VerificationStatus::Passed);
+    // The evidence trail is attached to the record, not to the task — so the
+    // judgment survives even if the task is later cancelled or reworked.
+    assert_eq!(verification.evidence.len(), 1);
+}
+
+#[tokio::test]
+async fn rejudging_a_task_accumulates_history_instead_of_overwriting() {
+    // A task that failed and was reworked passes on the second attempt: both
+    // judgments stand, and a reader can see the whole story.
+    let (store, _path) = store().await;
+    let task = task_awaiting_verification(&store).await;
+
+    store
+        .apply_verification(
+            &verification_of("VER-1", &task, VerificationStatus::Failed),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("first judgment lands");
+
+    // The rework puts the task back in front of verification.
+    let mut reworked = store
+        .tasks()
+        .get_task(&task.id)
+        .await
+        .expect("task reloaded");
+    reworked.status = TaskStatus::VerificationPending;
+    store
+        .tasks()
+        .update_task(&reworked)
+        .await
+        .expect("task requeued");
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    store
+        .apply_verification(
+            &verification_of("VER-2", &reworked, VerificationStatus::Passed),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("second judgment lands");
+
+    let history = store
+        .verifications()
+        .verifications_for_task(&task.id)
+        .await
+        .expect("history loaded");
+    assert_eq!(history.len(), 2);
+    // Newest first: the pass is what Orqyn currently believes.
+    assert_eq!(history[0].status, VerificationStatus::Passed);
+    assert_eq!(history[1].status, VerificationStatus::Failed);
+    // The failed judgment was not deleted or rewritten — the evidence that the
+    // first attempt did not pass is still readable.
+    assert_eq!(history[1].id, VerificationId::from_string("VER-1"));
+}
+
+#[tokio::test]
+async fn apply_verification_rolls_back_when_the_task_does_not_exist() {
+    // The atomicity promise: a verification that cannot attach to a task writes
+    // nothing. The foreign key is what makes the judgment-and-move pair
+    // all-or-nothing at the store level.
+    let (store, _path) = store().await;
+    let task = task_awaiting_verification(&store).await;
+
+    let mut orphan = verification_of("VER-1", &task, VerificationStatus::Passed);
+    orphan.task_id = TaskId::from_string("NOPE-99");
+
+    let err = store
+        .apply_verification(&orphan, chrono::Utc::now())
+        .await
+        .expect_err("an orphan verification is refused");
+    assert!(matches!(err, StoreError::ConstraintViolation(_)));
+
+    // Nothing was written for the orphan, and the real task was untouched.
+    assert!(store
+        .verifications()
+        .get_verification(&VerificationId::from_string("VER-1"))
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .tasks()
+            .get_task(&task.id)
+            .await
+            .expect("task intact")
+            .status,
+        TaskStatus::VerificationPending
+    );
 }

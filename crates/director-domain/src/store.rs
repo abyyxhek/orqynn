@@ -62,12 +62,13 @@ use crate::checkpoint::Checkpoint;
 use crate::decision::Decision;
 use crate::ids::{
     AgentId, AssignmentId, CheckpointId, DecisionId, PlanId, ProjectId, RepositoryId, SessionId,
-    TaskId,
+    TaskId, VerificationId,
 };
 use crate::plan::Plan;
 use crate::project::Project;
 use crate::session::AgentSession;
 use crate::task::{Task, TaskStatus};
+use crate::verification::Verification;
 
 /// The error vocabulary for Orqyn's own store.
 ///
@@ -454,6 +455,40 @@ pub trait ProjectStateRepository: Store {
         &self,
         project: &ProjectId,
     ) -> Result<Option<StoredProjectState>, Self::Error>;
+}
+
+/// Persistence for verifications — the durable record of Orqyn judging a task's
+/// work (Phase 10).
+///
+/// A verification is append-only history, not a mutable record: re-judging a
+/// task writes a new row with its own id, so "what did Orqyn believe about this
+/// task, and what changed its mind" stays answerable. Nothing in this trait
+/// updates or deletes a verification, by design — the store preserves the
+/// judgment history the way it preserves assignment and checkpoint history.
+#[async_trait]
+pub trait VerificationRepository: Store {
+    /// Record one act of verification. The verification is new by construction:
+    /// a duplicate id is a constraint violation, because two verifications with
+    /// one id is a judgment history that has lost a row.
+    async fn create_verification(
+        &self,
+        verification: &Verification,
+    ) -> Result<Verification, Self::Error>;
+
+    /// Load a verification by id, or [`StoreError::NotFound`].
+    async fn get_verification(&self, id: &VerificationId) -> Result<Verification, Self::Error>;
+
+    /// The most recent verification of a task, or `None` when Orqyn has never
+    /// judged it. This is the record a caller reads to answer "what does Orqyn
+    /// currently believe about this task's work, and on what evidence".
+    async fn latest_verification(&self, task: &TaskId)
+        -> Result<Option<Verification>, Self::Error>;
+
+    /// Every verification of a task, newest first. Judgments accumulate rather
+    /// than being overwritten, so a task that failed twice and passed on the
+    /// third attempt returns all three.
+    async fn verifications_for_task(&self, task: &TaskId)
+        -> Result<Vec<Verification>, Self::Error>;
 }
 
 /// Persistence for provider synchronization metadata.

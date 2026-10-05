@@ -211,6 +211,15 @@ define_id!(
     "EVT"
 );
 
+define_id!(
+    /// Unique identifier for a [Verification](crate::verification::Verification) —
+    /// one act of judging a task's work against evidence Orqyn gathered itself.
+    ///
+    /// Example: `VER-1`
+    VerificationId,
+    "VER"
+);
+
 /// Generates ids with a monotonic per-generator counter.
 ///
 /// Orqyn never relies on an external id service: a new machine with no
