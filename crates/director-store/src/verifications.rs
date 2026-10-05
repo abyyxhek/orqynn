@@ -72,10 +72,10 @@ impl VerificationRepository for SqliteVerificationRepository {
         // the same ordering `verifications_for_task` uses.
         let mut stmt = conn
             .prepare(&format!(
-            "SELECT {VERIFICATION_COLUMNS}
+                "SELECT {VERIFICATION_COLUMNS}
                  FROM verifications WHERE task_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1"
-        ))
-        .map_err(translate_error)?;
+            ))
+            .map_err(translate_error)?;
         let mut rows = stmt
             .query_map([task.as_str()], row_to_verification)
             .map_err(translate_error)?;
@@ -89,10 +89,10 @@ impl VerificationRepository for SqliteVerificationRepository {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(&format!(
-            "SELECT {VERIFICATION_COLUMNS}
+                "SELECT {VERIFICATION_COLUMNS}
                  FROM verifications WHERE task_id = ?1 ORDER BY created_at DESC, id DESC"
-        ))
-        .map_err(translate_error)?;
+            ))
+            .map_err(translate_error)?;
         let rows = stmt
             .query_map([task.as_str()], row_to_verification)
             .map_err(translate_error)?;
@@ -142,9 +142,7 @@ pub(crate) fn load_verification(
     id: &VerificationId,
 ) -> Result<Verification, StoreError> {
     conn.query_row(
-        "SELECT id, task_id, project_id, repository_id, status, evidence, head_commit,
-                state_version, created_at
-         FROM verifications WHERE id = ?1",
+        &format!("SELECT {VERIFICATION_COLUMNS} FROM verifications WHERE id = ?1"),
         [id.as_str()],
         row_to_verification,
     )
