@@ -326,9 +326,18 @@ mod tests {
     use director_domain::ids::ProjectId;
     use director_domain::repository::{FileChangeRecord, WorktreeState};
 
-    fn store() -> RepositoryStore {
-        let dir = std::env::temp_dir().join(format!("director-store-test-{}", std::process::id()));
-        RepositoryStore::new(dir).expect("a store")
+    /// A store in a temp directory that is removed when the test ends.
+    ///
+    /// A pid-keyed directory that is never cleaned up collides with the
+    /// leftovers of a previous run the next time the operating system hands out
+    /// that pid, and `initialize` then fails with "already registered" before
+    /// the test's first assertion — a failure that looks like a store bug and
+    /// is really the test suite reusing its own garbage. A fresh `TempDir`
+    /// gives each test a directory nothing else has written to.
+    fn store() -> (RepositoryStore, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the store");
+        let store = RepositoryStore::new(dir.path()).expect("a store");
+        (store, dir)
     }
 
     fn baseline(store: &RepositoryStore, id: &str, version: u64) -> StoredRepository {
@@ -359,7 +368,7 @@ mod tests {
 
     #[test]
     fn an_unsafe_repository_id_is_rejected_as_a_filename() {
-        let store = store();
+        let (store, _dir) = store();
         assert!(store
             .file_for(&RepositoryId::from_string("../escape"))
             .is_err());
@@ -368,7 +377,7 @@ mod tests {
 
     #[test]
     fn a_registered_repository_can_be_loaded_and_listed() {
-        let store = store();
+        let (store, _dir) = store();
         baseline(&store, "REPO-load", 1);
         assert!(store.exists(&RepositoryId::from_string("REPO-load")));
         assert!(store.load(&RepositoryId::from_string("REPO-load")).is_ok());
@@ -380,7 +389,7 @@ mod tests {
 
     #[test]
     fn an_unregistered_repository_is_not_registered_not_missing_data() {
-        let store = store();
+        let (store, _dir) = store();
         let err = store
             .load(&RepositoryId::from_string("REPO-none"))
             .unwrap_err();
@@ -389,7 +398,7 @@ mod tests {
 
     #[test]
     fn initializing_the_same_id_twice_is_rejected() {
-        let store = store();
+        let (store, _dir) = store();
         baseline(&store, "REPO-dupe", 1);
         assert!(store
             .initialize(
@@ -419,7 +428,8 @@ mod tests {
 
     #[test]
     fn duplicate_events_are_dropped_not_duplicated() {
-        let mut record = baseline(&store(), "REPO-dupes", 1);
+        let (store, _dir) = store();
+        let mut record = baseline(&store, "REPO-dupes", 1);
         let event = ObservationEvent::commit(
             &record.repository.id,
             &record.repository.project_id,
@@ -442,7 +452,8 @@ mod tests {
 
     #[test]
     fn duplicate_file_changes_are_dropped() {
-        let mut record = baseline(&store(), "REPO-files", 1);
+        let (store, _dir) = store();
+        let mut record = baseline(&store, "REPO-files", 1);
         let change = FileChangeRecord::new(
             record.repository.id.clone(),
             "src/lib.rs",
@@ -459,7 +470,8 @@ mod tests {
 
     #[test]
     fn duplicate_commits_are_dropped() {
-        let mut record = baseline(&store(), "REPO-commits", 1);
+        let (store, _dir) = store();
+        let mut record = baseline(&store, "REPO-commits", 1);
         let commit = director_domain::state::CommitInfo {
             sha: "abc".into(),
             summary: "one".into(),
@@ -475,7 +487,7 @@ mod tests {
 
     #[test]
     fn a_locked_cycle_sees_its_own_write() {
-        let store = store();
+        let (store, _dir) = store();
         baseline(&store, "REPO-locked", 1);
         let seen = store
             .with_locked(&RepositoryId::from_string("REPO-locked"), |record| {
@@ -496,7 +508,7 @@ mod tests {
 
     #[test]
     fn an_external_write_between_read_and_write_is_detected() {
-        let store = store();
+        let (store, _dir) = store();
         baseline(&store, "REPO-race", 1);
         let id = RepositoryId::from_string("REPO-race");
 
@@ -522,7 +534,7 @@ mod tests {
 
     #[test]
     fn a_unchanged_file_passes_the_version_check() {
-        let store = store();
+        let (store, _dir) = store();
         baseline(&store, "REPO-stable", 1);
         let id = RepositoryId::from_string("REPO-stable");
         let observed = store.load(&id).unwrap().snapshot.state_version;
