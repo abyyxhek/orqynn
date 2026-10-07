@@ -353,13 +353,20 @@ impl Store {
     ///
     /// The task's destination is derived from the verdict rather than taken from
     /// the caller, so the store and the step cannot disagree about what a
-    /// `Passed` verdict means. Returns the verification and the task as they now
+    /// `Passed` verdict means. `expected_task_version` is the version the round
+    /// read before it gathered its evidence; if the task has moved on since,
+    /// the update matches no row and the whole transaction becomes a
+    /// [`StateVersionConflict`](director_domain::StoreError::StateVersionConflict)
+    /// rather than a silent overwrite — the same guard `update_task` and
+    /// `cancel_task` carry. Returns the verification and the task as they now
     /// stand, read back from the store.
     pub async fn apply_verification(
         &self,
         verification: &Verification,
+        expected_task_version: u64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(Verification, Task), StoreError> {
-        verifications::apply_verification(&self.pool, verification, now).await
+        verifications::apply_verification(&self.pool, verification, expected_task_version, now)
+            .await
     }
 }

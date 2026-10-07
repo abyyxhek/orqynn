@@ -199,6 +199,19 @@ fn row_to_verification(row: &rusqlite::Row<'_>) -> rusqlite::Result<Verification
 /// which is the same problem [`crate::tasks`] already solved by writing both in
 /// one transaction.
 ///
+/// `expected_task_version` is the optimistic-concurrency guard, and it is the
+/// version of the task the round *read* before it gathered its evidence — not a
+/// version the caller re-reads just before calling. A verdict is a statement
+/// about the work the task held at a specific version; if the task has moved on
+/// since the round looked at it, the evidence no longer describes the work, and
+/// the update matches no row and becomes a [`StoreError::StateVersionConflict`]
+/// rather than a silent overwrite. This is the same guard `update_task`,
+/// `cancel_task`, and `update_agent` carry, and for the same reason: two writers
+/// who both read version *n* cannot both write *n+1*. A verdict that moves
+/// nothing (an `Unverifiable` round) does not touch the task row, so it cannot
+/// conflict — the evidence trail lands regardless, which is what makes "Orqyn
+/// looked, and could not yet tell" history worth keeping.
+///
 /// The task's destination is *derived from the verdict*, not taken from the
 /// caller's task: [`VerificationStatus::task_status`] is the single place the
 /// mapping lives, so the store and the loop's step cannot disagree about what a
@@ -212,6 +225,7 @@ fn row_to_verification(row: &rusqlite::Row<'_>) -> rusqlite::Result<Verification
 pub async fn apply_verification(
     pool: &crate::connection::ConnectionPool,
     verification: &Verification,
+    expected_task_version: u64,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(Verification, Task), StoreError> {
     let mut conn = pool.get();
@@ -240,17 +254,30 @@ pub async fn apply_verification(
     // verdict and the task is left exactly as it was — which is what makes a
     // round that could not gather evidence safe to run again next tick.
     if let Some(destination) = verification.status.task_status() {
-        tx.execute(
-            "UPDATE tasks
-                SET status = ?2, state_version = state_version + 1, updated_at = ?3
-              WHERE id = ?1",
-            rusqlite::params![
-                verification.task_id.as_str(),
-                json::to_json(&destination)?,
-                json::timestamp(now),
-            ],
-        )
-        .map_err(translate_error)?;
+        // The version the round read when it gathered its evidence. A zero-row
+        // update means the task moved after that read, so the evidence no longer
+        // describes the work and the whole transaction is refused — including
+        // the verification row above, which is what keeps a stale round from
+        // landing a judgment against a task somebody else already moved.
+        let rows = tx
+            .execute(
+                "UPDATE tasks
+                    SET status = ?2, state_version = state_version + 1, updated_at = ?3
+                  WHERE id = ?1 AND state_version = ?4",
+                rusqlite::params![
+                    verification.task_id.as_str(),
+                    json::to_json(&destination)?,
+                    json::timestamp(now),
+                    expected_task_version as i64,
+                ],
+            )
+            .map_err(translate_error)?;
+        crate::connection::row_count_to_outcome(
+            rows,
+            "task",
+            verification.task_id.as_str(),
+            expected_task_version,
+        )?;
 
         if let Some(from) = previous_status {
             if from != destination {
@@ -616,5 +643,44 @@ mod tests {
         assert_eq!(columns, expected);
         // The insert writes the same nine, in the same order.
         assert_eq!(expected.len(), 9);
+    }
+
+    #[test]
+    fn malformed_evidence_is_a_hard_error_not_an_empty_trail() {
+        // `row_to_verification` reconstructs the status and the evidence from
+        // their columns rather than trusting them. A column holding something
+        // the model no longer recognizes is a [`StoreError::Serialization`],
+        // never a silent default — an evidence array that deserialized to `[]`
+        // would present a judgment Orqyn reached as one it reached on no
+        // evidence at all, and a status that fell back to a default would
+        // present a verdict the round never reached.
+        let err = json::from_json::<Vec<Evidence>>("this is not an evidence array")
+            .expect_err("garbage is refused");
+        assert!(matches!(err, StoreError::Serialization(_)));
+
+        let err = json::from_json::<VerificationStatus>("\"speculative\"")
+            .expect_err("an unknown status is refused");
+        assert!(matches!(err, StoreError::Serialization(_)));
+
+        // The round trip the store actually performs still works, so a failure
+        // here means the column drifted rather than that the reader is broken.
+        let evidence = vec![Evidence {
+            kind: ProbeKind::Command,
+            criterion: "login works".into(),
+            status: EvidenceStatus::Failed,
+            detail: "exit 3".into(),
+        }];
+        let text = json::to_json(&evidence).expect("serializes");
+        assert_eq!(
+            json::from_json::<Vec<Evidence>>(&text).expect("deserializes"),
+            evidence
+        );
+        assert_eq!(
+            json::from_json::<VerificationStatus>(
+                &json::to_json(&VerificationStatus::Passed).unwrap()
+            )
+            .expect("a known status round trips"),
+            VerificationStatus::Passed
+        );
     }
 }

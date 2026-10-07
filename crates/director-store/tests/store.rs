@@ -2612,6 +2612,7 @@ async fn a_passing_verification_moves_the_task_to_done() {
     let (verification, after) = store
         .apply_verification(
             &verification_of("VER-1", &task, VerificationStatus::Passed),
+            task.state_version,
             chrono::Utc::now(),
         )
         .await
@@ -2621,6 +2622,7 @@ async fn a_passing_verification_moves_the_task_to_done() {
     assert_eq!(verification.status, VerificationStatus::Passed);
     assert_eq!(after.status, TaskStatus::Done);
     assert_eq!(after.id, task.id);
+    assert_eq!(after.state_version, task.state_version + 1);
 
     // And the move is in the history, so "how did this become done" is
     // answerable from the store alone.
@@ -2638,6 +2640,7 @@ async fn a_failing_verification_moves_the_task_to_failed() {
     let (_verification, after) = store
         .apply_verification(
             &verification_of("VER-1", &task, VerificationStatus::Failed),
+            task.state_version,
             chrono::Utc::now(),
         )
         .await
@@ -2661,6 +2664,7 @@ async fn an_unverifiable_round_records_itself_and_moves_nothing() {
     let (verification, after) = store
         .apply_verification(
             &verification_of("VER-1", &task, VerificationStatus::Unverifiable),
+            task.state_version,
             chrono::Utc::now(),
         )
         .await
@@ -2695,6 +2699,7 @@ async fn a_task_reaching_done_always_has_a_verification_behind_it() {
     store
         .apply_verification(
             &verification_of("VER-1", &task, VerificationStatus::Passed),
+            task.state_version,
             chrono::Utc::now(),
         )
         .await
@@ -2729,19 +2734,23 @@ async fn rejudging_a_task_accumulates_history_instead_of_overwriting() {
     store
         .apply_verification(
             &verification_of("VER-1", &task, VerificationStatus::Failed),
+            task.state_version,
             chrono::Utc::now(),
         )
         .await
         .expect("first judgment lands");
 
-    // The rework puts the task back in front of verification.
+    // The rework puts the task back in front of verification. `update_task`
+    // returns the task as stored, with the version the write bumped to — that
+    // is the version the next round must present, since its evidence describes
+    // the reworked task rather than the one the first round judged.
     let mut reworked = store
         .tasks()
         .get_task(&task.id)
         .await
         .expect("task reloaded");
     reworked.status = TaskStatus::VerificationPending;
-    store
+    let requeued = store
         .tasks()
         .update_task(&reworked)
         .await
@@ -2750,7 +2759,8 @@ async fn rejudging_a_task_accumulates_history_instead_of_overwriting() {
     std::thread::sleep(std::time::Duration::from_millis(10));
     store
         .apply_verification(
-            &verification_of("VER-2", &reworked, VerificationStatus::Passed),
+            &verification_of("VER-2", &requeued, VerificationStatus::Passed),
+            requeued.state_version,
             chrono::Utc::now(),
         )
         .await
@@ -2782,7 +2792,7 @@ async fn apply_verification_rolls_back_when_the_task_does_not_exist() {
     orphan.task_id = TaskId::from_string("NOPE-99");
 
     let err = store
-        .apply_verification(&orphan, chrono::Utc::now())
+        .apply_verification(&orphan, task.state_version, chrono::Utc::now())
         .await
         .expect_err("an orphan verification is refused");
     assert!(matches!(err, StoreError::ConstraintViolation(_)));
@@ -2802,4 +2812,127 @@ async fn apply_verification_rolls_back_when_the_task_does_not_exist() {
             .status,
         TaskStatus::VerificationPending
     );
+}
+
+#[tokio::test]
+async fn a_stale_verification_cannot_move_a_task_that_already_moved() {
+    // F2's regression test. A round read the task at version N, gathered its
+    // evidence, and then somebody else moved the task (here: the first
+    // verification landing, which bumps the version). The stale round must not
+    // also move it — and must not land its judgment either, because a verdict
+    // about the work at version N says nothing about the work at N+1.
+    let (store, _path) = store().await;
+    let task = task_awaiting_verification(&store).await;
+    let stale_version = task.state_version;
+
+    // The round that lands first, moving the task to `done` at version N+1.
+    store
+        .apply_verification(
+            &verification_of("VER-1", &task, VerificationStatus::Passed),
+            stale_version,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the first round lands");
+    let current = store
+        .tasks()
+        .get_task(&task.id)
+        .await
+        .expect("task reloaded");
+    assert_eq!(current.status, TaskStatus::Done);
+    assert_eq!(current.state_version, stale_version + 1);
+
+    // The stale round, still holding the version it read before the first one
+    // landed. Its update matches no row, so the whole transaction is refused.
+    let mut stale = verification_of("VER-2", &task, VerificationStatus::Failed);
+    stale.status = VerificationStatus::Failed;
+    let err = store
+        .apply_verification(&stale, stale_version, chrono::Utc::now())
+        .await
+        .expect_err("a stale round is refused");
+    assert!(matches!(err, StoreError::StateVersionConflict { .. }));
+
+    // Nothing from the stale round survived: no second judgment, and the task
+    // still reads what the *first* round decided.
+    assert!(store
+        .verifications()
+        .get_verification(&VerificationId::from_string("VER-2"))
+        .await
+        .is_err());
+    let after = store
+        .tasks()
+        .get_task(&task.id)
+        .await
+        .expect("task reloaded");
+    assert_eq!(after.status, TaskStatus::Done);
+    assert_eq!(after.state_version, stale_version + 1);
+
+    // The judgment history holds only the round that earned the right to move
+    // the task.
+    let history = store
+        .verifications()
+        .verifications_for_task(&task.id)
+        .await
+        .expect("history");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, VerificationId::from_string("VER-1"));
+}
+
+#[tokio::test]
+async fn a_fresh_verification_lands_after_re_reading_the_task() {
+    // The counterpart to the stale test, and the reason the guard is a version
+    // check rather than a lock: a round that re-reads the task after an earlier
+    // round moved it lands normally, because its evidence describes the work at
+    // the version the task is actually on.
+    let (store, _path) = store().await;
+    let task = task_awaiting_verification(&store).await;
+
+    store
+        .apply_verification(
+            &verification_of("VER-1", &task, VerificationStatus::Failed),
+            task.state_version,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the first round fails the task");
+
+    // The rework re-reads, so it sees the bumped version.
+    let mut reworked = store
+        .tasks()
+        .get_task(&task.id)
+        .await
+        .expect("task reloaded");
+    reworked.status = TaskStatus::VerificationPending;
+    store
+        .tasks()
+        .update_task(&reworked)
+        .await
+        .expect("task requeued");
+    let reloaded = store
+        .tasks()
+        .get_task(&task.id)
+        .await
+        .expect("re-read after requeue");
+
+    store
+        .apply_verification(
+            &verification_of("VER-2", &reloaded, VerificationStatus::Passed),
+            reloaded.state_version,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("a fresh round lands");
+
+    let after = store
+        .tasks()
+        .get_task(&task.id)
+        .await
+        .expect("task reloaded");
+    assert_eq!(after.status, TaskStatus::Done);
+    let history = store
+        .verifications()
+        .verifications_for_task(&task.id)
+        .await
+        .expect("history");
+    assert_eq!(history.len(), 2);
 }

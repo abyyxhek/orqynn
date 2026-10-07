@@ -44,6 +44,7 @@
 //! is missing is a driver. Until one exists, the tests are the caller.
 
 pub mod assign;
+pub mod engine;
 pub mod monitor;
 pub mod observe;
 pub mod plan;
@@ -404,9 +405,12 @@ impl From<director_domain::StoreError> for MonitorError {
 /// recorded as a verdict on someone's work.
 ///
 /// [`Self::Store`] means the round could not read the tasks awaiting a verdict
-/// or could not persist one. A verdict is one task write with its history row,
-/// so this leaves the task awaiting verification exactly as the round found it
-/// — which is also why an unverifiable task is safe to survey again next tick.
+/// or could not persist one. A verdict is written by
+/// [`Store::apply_verification`](director_store::Store::apply_verification) —
+/// the verification row, the task's status move, and the history row in one
+/// transaction — so a failure leaves the task awaiting verification exactly as
+/// the round found it, with no judgment half-landed. That is also why an
+/// unverifiable task is safe to survey again next tick.
 #[derive(Debug, Error)]
 pub enum VerifyError {
     /// Orqyn could not read or write its own state.
@@ -416,6 +420,12 @@ pub enum VerifyError {
 
 impl From<director_domain::StoreError> for VerifyError {
     fn from(err: director_domain::StoreError) -> Self {
+        VerifyError::Store(err.to_string())
+    }
+}
+
+impl From<crate::engine::VerifyTaskError> for VerifyError {
+    fn from(err: crate::engine::VerifyTaskError) -> Self {
         VerifyError::Store(err.to_string())
     }
 }

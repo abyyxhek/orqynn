@@ -23,63 +23,89 @@
 //! half of the bargain: it turns a claim into a verdict by looking at the work
 //! rather than at the claim.
 //!
-//! The check it runs is the machine-checkable form a plan attached to the
-//! task's [`ExpectedOutput`]s — a test command, a build, a script. Orqyn runs
-//! it through an [`ExecutionProvider`] and reads the exit code itself. The
-//! agent whose work is being judged never gets to report the outcome, and the
-//! provider that runs the command never gets to interpret it. That separation
-//! is the acceptance criterion "agent claims done, tests fail → must not
-//! become completed", made mechanical.
+//! ## What this step is now, and what it was
+//!
+//! Phase 6 landed this step as the judgment itself: it ran the checks, read the
+//! exit codes, and wrote the verdict as one [`TaskRepository::update_task`].
+//! That was correct about the judgment and silent about the reasoning — a task
+//! that reached `done` through it carried no durable record of what was checked
+//! or what the checks saw. Phase 10 moves the judgment into the
+//! [verification engine](crate::engine) and leaves this step as the loop's
+//! *report* on it:
+//!
+//! ```text
+//! expected outputs ──▶ engine ──▶ probes ──▶ executor ──▶ evidence
+//!                        │                                  │
+//!                        ▼                                  ▼
+//!                   judge(evidence) ──▶ Verification ──▶ Store::apply_verification
+//!                        │                                  │
+//!                        ▼                                  ▼
+//!                    this step's report              task status + history
+//! ```
+//!
+//! The engine owns the verdict and the write. It lands both through
+//! [`Store::apply_verification`] in one transaction — the verification row, the
+//! task's status move, and the transition history row that records the move —
+//! which is what makes "a `done` task always has a verification behind it" a
+//! property of the store rather than a habit of the caller. This step no longer
+//! calls `update_task` at all; the [`Judged`] entries it returns are a read of
+//! what the engine and the store decided.
+//!
+//! The checks it reports are still the machine-checkable form a plan attached to
+//! the task's [`ExpectedOutput`]s — a test command, a build, a script. Orqyn
+//! runs them through an [`ExecutionProvider`] and reads the exit code itself.
+//! The agent whose work is being judged never gets to report the outcome, and
+//! the provider that runs the command never gets to interpret it. That
+//! separation is the acceptance criterion "agent claims done, tests fail → must
+//! not become completed", made mechanical.
 //!
 //! ## What VERIFY is responsible for, and what it is not
 //!
-//! VERIFY owns the *verdict*. Three are possible, and only two of them write:
+//! VERIFY reports three verdicts, and only two of them move anything:
 //!
 //! - **Pass** — every check ran and exited zero. The task becomes
-//!   [`TaskStatus::Done`].
+//!   [`TaskStatus::Done`], and a [`Verification`] record says why.
 //! - **Fail** — a check ran and did not exit zero, or it hung past the
 //!   executor's timeout. The task becomes [`TaskStatus::Failed`], and deciding
 //!   what happens to failed work is REPLAN's job.
 //! - **Unverifiable** — the round could not gather the evidence it needed, so
-//!   it writes nothing and leaves the task awaiting verification. Either the
+//!   it moves nothing and leaves the task awaiting verification. Either the
 //!   task names no check at all ([`UnverifiableReason::NoChecks`]), or a check
 //!   exists but the round could not run it
 //!   ([`UnverifiableReason::EvidenceMissing`]) — the executor refused, or the
 //!   command would not parse. An unrunnable check is *not* a failure: broken
-//!   evidence is a problem with the environment, not with the work, and
-//!   marking work failed because the harness could not run a test would make
-//!   every environment hiccup a false verdict.
+//!   evidence is a problem with the environment, not with the work, and marking
+//!   work failed because the harness could not run a test would make every
+//!   environment hiccup a false verdict. The record is still written — "Orqyn
+//!   looked, and could not yet tell" is history worth keeping.
 //!
 //! A task whose criteria are partly prose — an [`ExpectedOutput`] with a
 //! criterion but no `check` — is reported as [`CheckResult::Unchecked`], and it
-//! never blocks a pass. Orqyn verifies what it can check; a criterion it has
-//! no machine check for is reported to the caller, not silently satisfied.
+//! never blocks a pass. Orqyn verifies what it can check; a criterion it has no
+//! machine check for is reported to the caller, not silently satisfied.
 //!
 //! VERIFY does not decide what a failed task should do next, does not choose
 //! who reworks it, and does not inspect git or files directly. The richer
 //! evidence-gathering the README describes — git diff inspection, file
-//! presence, test suite orchestration — is the verification engine's later
-//! work; this step is the loop's judgment, and the checks it runs are the ones
-//! the plan already named.
+//! presence, test suite orchestration — is the engine's later work through the
+//! [`Probe`](director_domain::verification::Probe) model; this step is the
+//! loop's judgment, and the checks it names are the ones the plan already
+//! named.
 //!
-//! ## Why the write is the task row
-//!
-//! The verdict is one [`TaskRepository::update_task`], which moves the status
-//! and appends the transition to the history in the same transaction. There is
-//! no second fact that has to land with it — MONITOR's report already ended the
-//! tenure, closed the session, and freed the agent, so a task awaiting
-//! verification has no tenant and no session left to clean up. That is why the
-//! report ends the tenure when it does rather than when the verdict lands: it
-//! keeps this step's write to a single row.
+//! [`Store::apply_verification`]: director_store::Store::apply_verification
+//! [`Verification`]: director_domain::verification::Verification
+//! [`ExpectedOutput`]: director_domain::task::ExpectedOutput
 
 use std::path::Path;
 
 use director_domain::ids::{ProjectId, TaskId};
-use director_domain::providers::{CommandSpec, ExecutionProvider};
+use director_domain::providers::ExecutionProvider;
 use director_domain::task::{Task, TaskStatus};
+use director_domain::verification::{Evidence, EvidenceStatus, ProbeKind, VerificationStatus};
 use director_domain::TaskRepository;
 use director_store::Store;
 
+use crate::engine::{self, ProbeOutcome};
 use crate::VerifyError;
 
 /// One round of VERIFY: every task awaiting a verdict, and what the round
@@ -228,13 +254,15 @@ pub struct FailedCheck {
 ///
 /// Each check runs in `working_dir` through `executor`, and the round reads
 /// only the exit codes and output it observes — never anything the agent
-/// reported. A task is done after this round only if a check actually passed.
+/// reported. A task is done after this round only if a check actually passed,
+/// and only through a [`Verification`] the engine persisted alongside the move.
 ///
 /// The round is idempotent. A task it passed is `done`, so the next round does
 /// not survey it; a task it failed is `failed` and likewise out of scope. A
 /// task it could not judge stays `verification_pending` and is surveyed again
 /// next round, which is safe precisely because the round wrote nothing about
-/// it.
+/// it that would have to be unwritten — the engine still records the attempt as
+/// history, and history is append-only.
 pub async fn verify<E>(
     store: &Store,
     executor: &E,
@@ -251,33 +279,167 @@ where
         .iter()
         .filter(|task| task.status == TaskStatus::VerificationPending)
     {
-        let checks = run_checks(executor, task, working_dir).await;
-        let verdict = judge(&checks);
-        let outcome = verdict_destination(&verdict);
-
-        // The verdict is one task write, status and history together. A task
-        // the round could not judge is left exactly as it was.
-        if let Some(status) = outcome {
-            let mut updated = task.clone();
-            updated.status = status;
-            store.tasks().update_task(&updated).await?;
-        }
+        // The engine owns the judgment and the write. It resolves this task's
+        // checks into probes, gathers the evidence through the executor,
+        // reaches a verdict, and lands it — record, status move, and history
+        // row — in one transaction. This step reports what came back.
+        let round =
+            engine::verify_task(store, executor, task, working_dir, chrono::Utc::now()).await?;
 
         judged.push(Judged {
             task: task.id.clone(),
-            verdict,
-            checks,
-            outcome,
+            verdict: verdict_from(
+                &round.verification.status,
+                round
+                    .outcomes
+                    .iter()
+                    .any(|outcome| outcome.status == EvidenceStatus::Unverifiable),
+            ),
+            checks: checks_for(task, &round.outcomes),
+            // The destination is derived from the verdict by the model itself,
+            // so the report and the store cannot disagree about what a `Passed`
+            // verdict means.
+            outcome: round.verification.status.task_status(),
         });
     }
 
     Ok(VerifyReport { judged })
 }
 
+/// The [`Verdict`] the engine's status implies, with the reason an
+/// unverifiable round gives a caller.
+///
+/// The model keeps [`VerificationStatus::Unverifiable`] as one status because
+/// the reason moves nothing — it is for the caller's report, not the task's
+/// state. The distinction is re-derived here, from the evidence the round
+/// gathered: an empty evidence list means the plan named nothing checkable, and
+/// a list holding an unrunnable check means Orqyn knew what to run and could
+/// not run it.
+fn verdict_from(status: &VerificationStatus, evidence_missing: bool) -> Verdict {
+    match status {
+        VerificationStatus::Passed => Verdict::Passed,
+        VerificationStatus::Failed => Verdict::Failed,
+        VerificationStatus::Unverifiable if evidence_missing => {
+            Verdict::Unverifiable(UnverifiableReason::EvidenceMissing)
+        }
+        VerificationStatus::Unverifiable => Verdict::Unverifiable(UnverifiableReason::NoChecks),
+    }
+}
+
+/// Every expected output with what the engine did about it, in the task's own
+/// order.
+///
+/// [`engine::probes_for`] walks these same expected outputs in this same order
+/// and keeps exactly the checkable ones, so the outcomes arrive as an ordered
+/// subsequence of the task's criteria: the next outcome is this output's
+/// whenever this output named a check, and a criterion with no check is
+/// [`CheckResult::Unchecked`] — reported, never blocking. The round reports the
+/// task's full contract, not only the parts Orqyn could run.
+fn checks_for(task: &Task, outcomes: &[ProbeOutcome]) -> Vec<CheckResult> {
+    let mut results = Vec::with_capacity(task.expected_outputs.len());
+    let mut outcomes = outcomes.iter();
+    for output in &task.expected_outputs {
+        let check = match outcomes.next() {
+            Some(outcome) if outcome.criterion == output.criterion => check_from(outcome),
+            _ => CheckResult::Unchecked {
+                criterion: output.criterion.clone(),
+            },
+        };
+        results.push(check);
+    }
+    results
+}
+
+/// One engine outcome as the loop's report shape. [`CheckResult`] is what a
+/// caller reads, and it carries the command's streams and exit code — the
+/// detail too rich and too report-shaped to persist, which the caller already
+/// has in the task it asked about.
+fn check_from(outcome: &ProbeOutcome) -> CheckResult {
+    let command = outcome.command.clone().unwrap_or_default();
+    match outcome.status {
+        EvidenceStatus::Passed => CheckResult::Passed {
+            criterion: outcome.criterion.clone(),
+            command,
+        },
+        EvidenceStatus::Failed => CheckResult::Failed(Box::new(FailedCheck {
+            criterion: outcome.criterion.clone(),
+            command,
+            exit_code: outcome.exit_code,
+            timed_out: outcome.timed_out,
+            stdout: outcome.stdout.clone(),
+            stderr: outcome.stderr.clone(),
+        })),
+        EvidenceStatus::Unverifiable => CheckResult::Unrunnable {
+            criterion: outcome.criterion.clone(),
+            command,
+            error: if outcome.note.is_empty() {
+                "the probe gathered no evidence".to_string()
+            } else {
+                outcome.note.clone()
+            },
+        },
+        // Advisory evidence decides nothing, so it is reported as a criterion
+        // Orqyn did not check rather than as a pass or a failure.
+        EvidenceStatus::Observed => CheckResult::Unchecked {
+            criterion: outcome.criterion.clone(),
+        },
+    }
+}
+
+/// The pure half of the step, kept for callers that already hold
+/// [`CheckResult`]s: given what a round observed, what is the verdict?
+///
+/// Delegates to [`engine::judge`] so the precedence rules live in one place —
+/// this is the loop's view of the same rules, over the loop's own report types
+/// rather than the engine's evidence. Prose criteria contribute no evidence at
+/// all, which is what keeps them from blocking a pass or manufacturing one.
+pub fn judge(checks: &[CheckResult]) -> Verdict {
+    let evidence: Vec<Evidence> = checks.iter().filter_map(evidence_for_check).collect();
+    let evidence_missing = evidence
+        .iter()
+        .any(|evidence| evidence.status == EvidenceStatus::Unverifiable);
+    verdict_from(&engine::judge(&evidence), evidence_missing)
+}
+
+/// The evidence one [`CheckResult`] contributes, if any. [`CheckResult::Unchecked`]
+/// is prose and contributes nothing: Orqyn did not ask about it, so the record
+/// does not pretend it did.
+fn evidence_for_check(check: &CheckResult) -> Option<Evidence> {
+    match check {
+        CheckResult::Passed { criterion, command } => Some(Evidence {
+            kind: ProbeKind::Command,
+            criterion: criterion.clone(),
+            status: EvidenceStatus::Passed,
+            detail: format!("the check passed: {command}"),
+        }),
+        CheckResult::Failed(failed) => Some(Evidence {
+            kind: ProbeKind::Command,
+            criterion: failed.criterion.clone(),
+            status: EvidenceStatus::Failed,
+            detail: format!(
+                "the check failed ({}) — exit {}, stderr: {}",
+                failed.command, failed.exit_code, failed.stderr
+            ),
+        }),
+        CheckResult::Unrunnable {
+            criterion,
+            command,
+            error,
+        } => Some(Evidence {
+            kind: ProbeKind::Command,
+            criterion: criterion.clone(),
+            status: EvidenceStatus::Unverifiable,
+            detail: format!("the check could not be run ({command}): {error}"),
+        }),
+        CheckResult::Unchecked { .. } => None,
+    }
+}
+
 /// The status a verdict moves a task to, or `None` when the verdict writes
-/// nothing. Kept beside [`judge`] so the mapping from a verdict to a write is
-/// visible in one place.
-fn verdict_destination(verdict: &Verdict) -> Option<TaskStatus> {
+/// nothing. The mapping lives on the model —
+/// [`VerificationStatus::task_status`] — and is surfaced here so a caller
+/// reading this step sees the same destination the store wrote.
+pub fn verdict_destination(verdict: &Verdict) -> Option<TaskStatus> {
     match verdict {
         Verdict::Passed => Some(TaskStatus::Done),
         Verdict::Failed => Some(TaskStatus::Failed),
@@ -285,144 +447,10 @@ fn verdict_destination(verdict: &Verdict) -> Option<TaskStatus> {
     }
 }
 
-/// Run every check a task names, in the task's order, and collect what
-/// happened.
-///
-/// A criterion with no `check` is [`CheckResult::Unchecked`] — reported, never
-/// blocking. A check the executor cannot run is [`CheckResult::Unrunnable`],
-/// which is evidence missing rather than work failing. Everything else is the
-/// outcome the executor observed.
-async fn run_checks<E>(executor: &E, task: &Task, working_dir: &Path) -> Vec<CheckResult>
-where
-    E: ExecutionProvider,
-{
-    let mut results = Vec::with_capacity(task.expected_outputs.len());
-    for output in &task.expected_outputs {
-        // The check as written, trimmed: a blank one is no check at all, and
-        // becomes a criterion Orqyn has no machine form for.
-        let Some(check) = output
-            .check
-            .as_deref()
-            .map(str::trim)
-            .filter(|check| !check.is_empty())
-        else {
-            results.push(CheckResult::Unchecked {
-                criterion: output.criterion.clone(),
-            });
-            continue;
-        };
-
-        let Some(spec) = parse_check(check, working_dir) else {
-            // A check that is not a program and arguments cannot be run, and
-            // guessing a program would be executing something the plan did not
-            // name.
-            results.push(CheckResult::Unrunnable {
-                criterion: output.criterion.clone(),
-                command: check.to_string(),
-                error: "the check does not name a program to run".to_string(),
-            });
-            continue;
-        };
-
-        match executor.run_command(&spec).await {
-            Ok(outcome) => {
-                if outcome.succeeded() {
-                    results.push(CheckResult::Passed {
-                        criterion: output.criterion.clone(),
-                        command: check.to_string(),
-                    });
-                } else {
-                    results.push(CheckResult::Failed(Box::new(FailedCheck {
-                        criterion: output.criterion.clone(),
-                        command: check.to_string(),
-                        exit_code: outcome.exit_code,
-                        timed_out: outcome.timed_out,
-                        stdout: outcome.stdout,
-                        stderr: outcome.stderr,
-                    })));
-                }
-            }
-            // The executor could not run the command at all — no program by
-            // that name, or the substrate refuses to execute. This is not a
-            // verdict on the work; the round reports the task unverifiable
-            // and the caller fixes the environment.
-            Err(error) => {
-                results.push(CheckResult::Unrunnable {
-                    criterion: output.criterion.clone(),
-                    command: check.to_string(),
-                    error: error.to_string(),
-                });
-            }
-        }
-    }
-    results
-}
-
-/// The pure half of verification: given what the round observed, what is the
-/// verdict?
-///
-/// No store, no I/O, no executor — everything about the world has already been
-/// gathered by [`run_checks`]. Extracted so the rules can be tested directly,
-/// because the order of precedence between them is the whole design:
-///
-/// 1. A check that ran and failed decides. Nothing else the round saw undoes
-///    an observed failure, so `Failed` comes first.
-/// 2. A check the round could not run leaves the evidence incomplete, so the
-///    task is `Unverifiable` — but only if nothing failed, because a task with
-///    one failing check and one unrunnable one has been judged.
-/// 3. Otherwise, at least one check must have passed. A task whose criteria
-///    are all prose has nothing Orqyn verified, and Orqyn does not complete
-///    work it did not check.
-pub fn judge(checks: &[CheckResult]) -> Verdict {
-    if checks
-        .iter()
-        .any(|check| matches!(check, CheckResult::Failed(_)))
-    {
-        return Verdict::Failed;
-    }
-
-    if checks
-        .iter()
-        .any(|check| matches!(check, CheckResult::Unrunnable { .. }))
-    {
-        return Verdict::Unverifiable(UnverifiableReason::EvidenceMissing);
-    }
-
-    if checks
-        .iter()
-        .any(|check| matches!(check, CheckResult::Passed { .. }))
-    {
-        return Verdict::Passed;
-    }
-
-    Verdict::Unverifiable(UnverifiableReason::NoChecks)
-}
-
-/// Turn an expected output's check into a command to run, in `working_dir`.
-///
-/// The check is one command line: program first, arguments after, split on
-/// whitespace. There is no shell — no quoting, no globs, no substitution — and
-/// that is deliberate at this stage. Anything an agent could hide inside a
-/// shell expansion is something Orqyn would execute without looking at it, so
-/// a check too elaborate for this shape is expected to name a script file the
-/// caller wrote, not to become a shell expression.
-///
-/// Returns `None` for a check that names no program, which the round treats as
-/// unrunnable rather than choosing a program itself.
-fn parse_check(check: &str, working_dir: &Path) -> Option<CommandSpec> {
-    let mut parts = check.split_whitespace();
-    let program = parts.next()?.to_string();
-    let args = parts.map(str::to_string).collect();
-    Some(CommandSpec {
-        program,
-        args,
-        working_dir: Some(working_dir.to_string_lossy().into_owned()),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use director_domain::ids::TaskId;
     use director_domain::task::ExpectedOutput;
 
     /// An expected output with a machine check.
@@ -430,6 +458,14 @@ mod tests {
         ExpectedOutput {
             criterion: criterion.to_string(),
             check: Some(check.to_string()),
+        }
+    }
+
+    /// A criterion the planner wrote as prose only.
+    fn prose(criterion: &str) -> ExpectedOutput {
+        ExpectedOutput {
+            criterion: criterion.to_string(),
+            check: None,
         }
     }
 
@@ -585,25 +621,100 @@ mod tests {
     }
 
     #[test]
-    fn a_check_splits_into_program_and_arguments() {
-        let spec =
-            parse_check("  git   log --oneline  ", Path::new("/repo")).expect("a parseable check");
-        assert_eq!(spec.program, "git");
-        assert_eq!(spec.args, vec!["log", "--oneline"]);
-        assert_eq!(spec.working_dir.as_deref(), Some("/repo"));
+    fn the_report_renders_prose_where_the_engine_ran_nothing() {
+        // `checks_for` walks the task's whole contract, so a criterion with no
+        // check is reported as unchecked even when the outcomes hold a pass for
+        // the criterion before it.
+        let task = task_with(&[
+            checked("login works", "git --version"),
+            prose("the error messages read well"),
+        ]);
+        let outcomes = vec![ProbeOutcome {
+            kind: ProbeKind::Command,
+            criterion: "login works".into(),
+            command: Some("git --version".into()),
+            status: EvidenceStatus::Passed,
+            exit_code: 0,
+            timed_out: false,
+            stdout: "git version".into(),
+            stderr: String::new(),
+            note: String::new(),
+        }];
+
+        let checks = checks_for(&task, &outcomes);
+        assert_eq!(checks.len(), 2);
+        assert!(matches!(
+            checks[0],
+            CheckResult::Passed { ref criterion, .. } if criterion == "login works"
+        ));
+        assert!(matches!(
+            checks[1],
+            CheckResult::Unchecked { ref criterion } if criterion == "the error messages read well"
+        ));
     }
 
     #[test]
-    fn a_check_with_no_program_is_not_a_command() {
-        assert!(parse_check("", Path::new("/repo")).is_none());
-        assert!(parse_check("   ", Path::new("/repo")).is_none());
+    fn the_report_carries_what_a_failed_command_printed() {
+        // The detail that makes a failure actionable survives the mapping from
+        // the engine's outcome to the loop's report.
+        let task = task_with(&[checked("the endpoint answers", "git --nope")]);
+        let outcomes = vec![ProbeOutcome {
+            kind: ProbeKind::Command,
+            criterion: "the endpoint answers".into(),
+            command: Some("git --nope".into()),
+            status: EvidenceStatus::Failed,
+            exit_code: 129,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: "unknown option".into(),
+            note: String::new(),
+        }];
+
+        let checks = checks_for(&task, &outcomes);
+        let failed = match &checks[0] {
+            CheckResult::Failed(failed) => failed,
+            other => panic!("expected a failed check, got {other:?}"),
+        };
+        assert_eq!(failed.command, "git --nope");
+        assert_eq!(failed.exit_code, 129);
+        assert_eq!(failed.stderr, "unknown option");
+
+        assert_eq!(
+            verdict_from(&VerificationStatus::Failed, false),
+            Verdict::Failed
+        );
     }
 
     #[test]
-    fn a_program_with_no_arguments_is_still_a_command() {
-        let spec = parse_check("git", Path::new("/repo")).expect("a bare program");
-        assert_eq!(spec.program, "git");
-        assert!(spec.args.is_empty());
+    fn an_unverifiable_round_reports_why_in_terms_a_caller_can_act_on() {
+        // A round that knew what to run and could not run it is evidence
+        // missing; a round with nothing to run at all is no checks. The two
+        // are reported differently because a caller fixes different things.
+        let unrunnable = ProbeOutcome {
+            kind: ProbeKind::Command,
+            criterion: "the endpoint answers".into(),
+            command: Some("nope".into()),
+            status: EvidenceStatus::Unverifiable,
+            exit_code: 0,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            note: "spawn failed".into(),
+        };
+        // The evidence-missing signal is read off the outcomes the engine
+        // gathered, the same way `verify` reads it for the round's report.
+        let evidence_missing = [unrunnable]
+            .iter()
+            .any(|outcome| outcome.status == EvidenceStatus::Unverifiable);
+        assert!(evidence_missing);
+        assert_eq!(
+            verdict_from(&VerificationStatus::Unverifiable, evidence_missing),
+            Verdict::Unverifiable(UnverifiableReason::EvidenceMissing)
+        );
+        assert_eq!(
+            verdict_from(&VerificationStatus::Unverifiable, false),
+            Verdict::Unverifiable(UnverifiableReason::NoChecks)
+        );
     }
 
     #[test]
@@ -653,6 +764,47 @@ mod tests {
                 .map(|id| id.as_str())
                 .collect::<Vec<_>>(),
             vec!["C"]
+        );
+    }
+
+    /// The engine is the only writer of a verdict, so this step never has to
+    /// translate a status the model does not already know how to map.
+    #[test]
+    fn the_steps_verdict_mapping_agrees_with_the_model() {
+        assert_eq!(
+            engine::destination(VerificationStatus::Passed),
+            verdict_destination(&Verdict::Passed)
+        );
+        assert_eq!(
+            engine::destination(VerificationStatus::Failed),
+            verdict_destination(&Verdict::Failed)
+        );
+        assert_eq!(
+            engine::destination(VerificationStatus::Unverifiable),
+            verdict_destination(&Verdict::Unverifiable(UnverifiableReason::NoChecks))
+        );
+    }
+
+    /// An engine round arrives with the same destination the model derives, so
+    /// a caller reading `Judged::outcome` sees what the store actually wrote.
+    #[test]
+    fn an_engine_rounds_outcome_is_the_models_mapping() {
+        let round = crate::engine::EngineRound {
+            verification: director_domain::verification::Verification::new(
+                director_domain::ids::VerificationId::from_string("VER-1"),
+                TaskId::from_string("A"),
+                ProjectId::from_string("PROJ-1"),
+                None,
+                VerificationStatus::Passed,
+                vec![],
+                None,
+                chrono::Utc::now(),
+            ),
+            outcomes: vec![],
+        };
+        assert_eq!(
+            round.verification.status.task_status(),
+            Some(TaskStatus::Done)
         );
     }
 }
