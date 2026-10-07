@@ -15,12 +15,13 @@ crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
 > **Status: Phases 1–3, 5, and 6 complete, Phase 7's scheduler landed, and
-> Phase 10's verification record layer in place — all six steps of the control
+> Phase 10's verification engine in place — all six steps of the control
 > loop (OBSERVE, PLAN, ASSIGN, MONITOR, VERIFY, REPLAN) plus the SCHEDULE step,
-> and every judgment Orqyn passes is now a durable, append-only record.**
+> and every judgment Orqyn passes is now gathered, reached, and held as a
+> durable, append-only record.**
 > The canonical domain model, the provider trait boundary, both substrate
 > adapters, Orqyn's own persistent store, and the whole control loop are in
-> place, with zero substrate coupling and a passing test suite (494 tests).
+> place, with zero substrate coupling and a passing test suite (532 tests).
 >
 > - **Phase 1** — the domain model and the seven provider traits it depends on,
 >   plus an in-memory implementor of every one of them.
@@ -62,7 +63,9 @@ crates. A boundary test in this repo enforces that — see
 >   left alone; a tenantless in-progress task is reported and left for REPLAN.
 >   VERIFY: every task awaiting a verdict is judged by checks Orqyn runs itself
 >   through its execution provider, reading exit codes the agent cannot influence
->   — a task reaches `done` only because a check actually passed. A check that
+>   — a task reaches `done` only because a check actually passed, and the
+>   judgment is persisted as append-only history alongside the evidence that
+>   reached it. A check that
 >   fails moves the task to `failed` for REPLAN to act on; a check that cannot run
 >   at all leaves the task awaiting verification, because a broken environment is
 >   not a verdict on someone's work. REPLAN: the step that answers for the states
@@ -89,7 +92,7 @@ crates. A boundary test in this repo enforces that — see
 >   id tie-break. One task per agent per round, and work no available agent can
 >   do is reported rather than silently left `todo` — the staffing signal that
 >   makes the step worth having over calling `assign` by hand.
-> - **Phase 10 (record layer)** — the durable half of the verification engine.
+> - **Phase 10 (verification engine)** — the judgment and the record, together.
 >   A judgment Orqyn passes is no longer ephemeral: `Verification` records one
 >   act of judging a task — the probes it asked, the evidence each gathered, the
 >   verdict it reached, and the commit the evidence was gathered against — and
@@ -106,10 +109,15 @@ crates. A boundary test in this repo enforces that — see
 >   and `EvidenceStatus` keeps the asymmetry that makes the model honest: only
 >   `Passed` and `Failed` decide, `Unverifiable` is a property of the
 >   environment rather than of the work, and `Observed` evidence is reported and
->   then deliberately ignored, because a diff is circumstantial. What is *not*
->   here yet is the engine that runs the probes — no `director-app` code gathers
->   evidence yet, so Phase 6's check-based `verify` step still holds the
->   invariant on its own.
+>   then deliberately ignored, because a diff is circumstantial. The engine that
+>   runs them is now in `director-app`: `engine::verify_task` resolves a task's
+>   checkable criteria into probes, gathers their evidence through the execution
+>   provider, and lands the verdict — record, status move, and history row — in
+>   one transaction, so Phase 6's VERIFY step is now a report on the engine
+>   rather than the judgment itself, and it no longer calls `update_task`. Only
+>   `Probe::Command` is implemented; the other three kinds are modelled and
+>   answered as `Unverifiable` until they are, which keeps an unimplemented probe
+>   from being mistaken for a pass or a failure.
 >
 > There is no MCP server of Orqyn's own yet and no process drives the loop
 > unattended — the steps are library functions, and their caller is the
@@ -142,11 +150,14 @@ for the task's expected outputs, and reads their exit codes and their output
 itself — the agent whose work is being judged never gets to report the outcome,
 and the provider that runs a command never gets to interpret it.
 
-What has *not* landed is the engine that gathers its own evidence —
-inspecting a git diff, asserting a file is present, orchestrating a test suite.
-VERIFY judges the checks the plan already named. The record those judgments are
-written into has landed — `Verification`, persisted as append-only history —
-but the engine that runs the probes is the rest of Phase 10.
+What has landed is the engine that gathers this evidence: it resolves a task's
+checkable criteria into probes, runs the commands a plan named, and persists
+what they saw as append-only history alongside the verdict — so Phase 6's VERIFY
+step is now the report on that engine rather than the judgment itself. What has
+*not* landed is the richer probe kinds: inspecting a git diff, asserting a file
+is present, orchestrating a test suite. They are modelled as `Probe` variants
+and answered as `Unverifiable` until they are implemented, so an unasked
+question is reported rather than quietly counted as satisfied.
 
 This is the guardrail behind the acceptance criterion: *"Agent claims 'Done.'
 Tests fail → must not become COMPLETED."* Both substrates were audited and
@@ -181,7 +192,8 @@ orqyn/
 │   ├── PHASE3-MEMORY.md     # The AiMemoryAdapter over ai-memory.
 │   ├── PHASE5-STORE.md      # The SQLite store and the invariants it holds.
 │   ├── PHASE6-APP.md        # The control loop, and its six steps.
-│   └── PHASE7-SCHEDULE.md  # The scheduler that pairs work with agents.
+│   ├── PHASE7-SCHEDULE.md   # The scheduler that pairs work with agents.
+│   └── PHASE10-ENGINE.md    # The verification engine and its evidence.
 ├── Cargo.toml               # Workspace manifest.
 ├── rust-toolchain.toml      # Pinned: stable-x86_64-pc-windows-gnu.
 └── THIRD_PARTY_LICENSES.md  # MIT notices for both substrates (© 2026 Fabio Akita).
@@ -379,7 +391,7 @@ OBSERVE (git/fs/tests + substrate events + agent heartbeats) ✅
          → SCHEDULE (which ready task goes to which agent) ✅
             → ASSIGN (claim lease via HandoffAdapter) ✅
                → MONITOR (heartbeat TTL, lease expiry, progress reports) ✅
-                  → VERIFY (runs the plan's named checks itself) ✅
+                  → VERIFY (the engine runs the plan's named checks itself) ✅
                      → UPDATE STATE (Orqyn store + substrate records)
                         → loop back, or RECOVER on failure
 ```
@@ -497,16 +509,15 @@ than the plumbing:
   in the model and the scheduler does not read them, because the plan's order
   is already the priority order and a second axis would disagree with it.
   Load- and locality-aware matching is a later phase.
-- **No verification engine, only its record layer.** The loop's VERIFY step
-  holds the invariant — nothing self-reports completion, and a task reaches
-  `done` only because a check Orqyn ran itself passed — but the checks it runs
-  are the machine-checkable forms a plan already named. What has landed is the
-  *record* those judgments are written into: `Verification` is modelled and
-  persisted as append-only history, so a verdict and its evidence trail survive
-  the process that made them. What is *not* here is the engine that *gathers*
-  its own evidence — inspecting a git diff, asserting a file is present,
-  orchestrating a test suite — and writes those records itself. That is the
-  rest of Phase 10.
+- **Only command probes.** The loop's VERIFY step holds the invariant — nothing
+  self-reports completion, and a task reaches `done` only because a check Orqyn
+  ran itself passed — and the engine that gathers the evidence now runs those
+  checks and writes the record: `Verification` with its evidence trail, persisted
+  as append-only history, landed alongside the verdict in one transaction. What
+  the engine does *not* do yet is ask the richer questions: inspecting a git
+  diff, asserting a file is present, orchestrating a test suite. Those are
+  modelled as `Probe` kinds and answered as `Unverifiable` until a later phase
+  implements them.
 - **No MCP server, no binary.** Orqyn's own tool surface and the process that
   runs the loop unattended are later phases. Until then, the library's tests
   are its caller.
@@ -522,7 +533,7 @@ than the plumbing:
 | **5** ✅ | `director-store` — Orqyn's own SQLite: checkpoints, plans, verifications, decisions, recent context, recovery packages. |
 | **6** ✅ | `director-app` — the control loop. All six steps landed and tested: OBSERVE (git layer composed with the store), PLAN (validation, ordering, and activation in one transaction, plus the dependency-graph validation it builds on in `director-domain`), ASSIGN (a task handed to an agent and started in one transaction), MONITOR (a lease reclaimed from an agent whose heartbeat went quiet, the session recorded when the agent acknowledged the work, a completion report ending the tenure and moving the task to `verification_pending`), VERIFY (a task judged `done` or `failed` by checks Orqyn runs itself), REPLAN (the states the loop's own verdicts left behind surveyed, and a caller's retry / rework / cancel decision applied to each — a refused round writes nothing, and a cancellation reports the dependents it strands). |
 | **7** ✅ | `director-app` — the scheduler. SCHEDULE decides which ready task goes to which available agent, so a loop tick no longer needs somebody to name every assignment: eligibility (can accept work, not already showing a current task, every required capability), then fresh eyes (an agent who has never held the task outranks one who released it, with the prior holder as a fallback rather than a prohibition), then specialist-first (fewest declared capabilities, so generalists stay free for the tasks only they can cover), then a deterministic id tie-break. One task per agent per round. Pairings are computed from a snapshot but applied through ASSIGN, which re-validates against live state, so a stale proposal is refused rather than applied illegally; work no available agent can do is reported rather than silently left `todo`, which is the staffing signal that makes the step worth having over calling `assign` by hand. |
-| **10** 🚧 | The verification engine. **Record layer landed:** `Verification` / `Probe` / `Evidence` in `director-domain`, migration `0003_verifications.sql`, `SqliteVerificationRepository`, and `Store::apply_verification` — the verification row, the task's status move, and the transition history in one transaction, with append-only history that survives re-judgment. 23 tests. **Not yet:** the engine that runs the probes — no `director-app` step gathers evidence, so Phase 6's check-based `verify` still holds the invariant. |
+| **10** ✅ | The verification engine. **Record layer:** `Verification` / `Probe` / `Evidence` in `director-domain`, migration `0003_verifications.sql`, `SqliteVerificationRepository`, and `Store::apply_verification` — the verification row, the task's status move, and the transition history in one transaction, with append-only history that survives re-judgment. **Engine:** `director-app::engine` resolves a task's checkable criteria into probes, gathers their evidence through the execution provider, applies the precedence rules (`Failed` beats `Unverifiable` beats `Passed`; `Observed` decides nothing), and lands the verdict as one transaction — so Phase 6's VERIFY step is now a report on the engine rather than the judgment itself. The verdict carries the `state_version` the round read before gathering evidence, so a task that moved under the round is refused rather than re-judged on stale evidence. Only `Probe::Command` is implemented; `TestSuite`, `Diff`, and `File` are modelled and answered `Unverifiable` until a later phase implements them. |
 
 ---
 
