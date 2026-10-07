@@ -430,6 +430,8 @@ verification are its own because neither substrate has them.
 ## Building and testing
 
 ```sh
+git clone https://github.com/abyyxhek/orqynn.git
+cd orqynn
 cargo build
 cargo test --workspace
 ```
@@ -560,6 +562,9 @@ Orqyn communicates with
 [ai-memory](https://github.com/akitaonrails/ai-memory) as separate works over
 MCP. No source is copied from either. Both are MIT (© 2026 Fabio Akita); their
 notices are reproduced in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
+
+> This repository is the canonical home of Orqyn, published at
+> [github.com/abyyxhek/orqynn](https://github.com/abyyxhek/orqynn).
 
 ## License
 
