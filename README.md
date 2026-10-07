@@ -14,14 +14,16 @@ their internal structs, never forks their source, and never depends on their
 crates. A boundary test in this repo enforces that — see
 [The boundary is a test, not a convention](#the-boundary-is-a-test-not-a-convention).
 
-> **Status: Phases 1–3, 5, and 6 complete, Phase 7's scheduler landed, and
-> Phase 10's verification engine in place — all six steps of the control
+> **Status: Phases 1–3, 5, and 6 complete, Phase 7's scheduler landed, Phase
+> 10's verification engine in place, and Phase 11's runtime and recovery
+> validation complete — all six steps of the control
 > loop (OBSERVE, PLAN, ASSIGN, MONITOR, VERIFY, REPLAN) plus the SCHEDULE step,
 > and every judgment Orqyn passes is now gathered, reached, and held as a
-> durable, append-only record.**
+> durable, append-only record, and the whole loop is proven to survive a
+> restart and an agent's disappearance.**
 > The canonical domain model, the provider trait boundary, both substrate
 > adapters, Orqyn's own persistent store, and the whole control loop are in
-> place, with zero substrate coupling and a passing test suite (532 tests).
+> place, with zero substrate coupling and a passing test suite (537 tests).
 >
 > - **Phase 1** — the domain model and the seven provider traits it depends on,
 >   plus an in-memory implementor of every one of them.
@@ -118,6 +120,20 @@ crates. A boundary test in this repo enforces that — see
 >   `Probe::Command` is implemented; the other three kinds are modelled and
 >   answered as `Unverifiable` until they are, which keeps an unimplemented probe
 >   from being mistaken for a pass or a failure.
+> - **Phase 11 (runtime and recovery validation)** — the proof that Orqyn is a
+>   persistent orchestration system rather than an in-memory one that happens to
+>   write to disk. Five integration tests drive the real loop against a real
+>   SQLite file: state survives a store closed and reopened on the same file and
+>   the loop continues the work it left; a store *abandoned* rather than closed
+>   cleanly still yields committed, internally consistent state; an agent that
+>   vanishes past the lease window loses the tenure, keeps it in history as the
+>   named holder, and a replacement takes the same task to `done`; a task judged
+>   `failed` can be reworked for a replacement who then passes, with both
+>   judgments on record; and everything a replacement agent needs to be briefed
+>   — contract, state and version, tenure history, prior verdicts and their
+>   evidence, the checkpoint, the latest transition — is recoverable from the
+>   store. No test pokes a status by hand or constructs the rows it then asserts
+>   on. See [`docs/PHASE11-RUNTIME-RECOVERY.md`](docs/PHASE11-RUNTIME-RECOVERY.md).
 >
 > There is no MCP server of Orqyn's own yet and no process drives the loop
 > unattended — the steps are library functions, and their caller is the
