@@ -1,6 +1,8 @@
-# 🧠 Orqyn
-
 <div align="center">
+
+![Orqyn - Orchestration Brain](docs/assets/banner.png)
+
+# 🧠 Orqyn
 
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
