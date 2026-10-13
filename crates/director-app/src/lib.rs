@@ -44,10 +44,12 @@
 //! is missing is a driver. Until one exists, the tests are the caller.
 
 pub mod assign;
+pub mod checkpoint;
 pub mod engine;
 pub mod monitor;
 pub mod observe;
 pub mod plan;
+pub mod recovery;
 pub mod replan;
 pub mod schedule;
 pub mod verify;
@@ -80,6 +82,14 @@ pub enum ObserveError {
     /// git repository, or git itself failed.
     #[error("could not observe the repository: {0}")]
     Git(String),
+
+    /// The observation landed but the checkpointing half did not. Another
+    /// writer advanced a task's checkpoint lineage after this round read it, so
+    /// the newer checkpoint stands and this round wrote none. The normalized
+    /// state the observation recorded is intact; retrying checkpoints against
+    /// the version now in the store is the recovery path.
+    #[error("the checkpointing half of the round failed: {0}")]
+    Checkpointing(String),
 }
 
 impl From<director_domain::StoreError> for ObserveError {
@@ -91,6 +101,20 @@ impl From<director_domain::StoreError> for ObserveError {
 impl From<director_domain::RepositoryError> for ObserveError {
     fn from(err: director_domain::RepositoryError) -> Self {
         ObserveError::Git(err.to_string())
+    }
+}
+
+impl From<CheckpointError> for ObserveError {
+    fn from(err: CheckpointError) -> Self {
+        match err {
+            // A conflict is not a git failure and not a store failure: another
+            // writer moved the lineage. The observation itself succeeded — the
+            // normalized state was recorded — so this is reported as a
+            // checkpointing failure the caller can retry, leaving the state the
+            // observation wrote intact.
+            CheckpointError::Conflict { .. } => ObserveError::Checkpointing(err.to_string()),
+            CheckpointError::Store(inner) => ObserveError::Store(inner),
+        }
     }
 }
 
@@ -347,6 +371,16 @@ impl From<AssignError> for ScheduleError {
     }
 }
 
+impl From<CheckpointError> for ScheduleError {
+    fn from(err: CheckpointError) -> Self {
+        // The round builds a replacement's briefing after the assignment has
+        // already landed, so the only failures left are store reads. A conflict
+        // on a checkpoint read is a store-level fact the caller re-reads on,
+        // so it is reported the same way as any other read the store refused.
+        ScheduleError::Store(err.to_string())
+    }
+}
+
 /// Every way a MONITOR round can fail, in one place.
 ///
 /// Like the other steps' error enums, this is flat with no source chains,
@@ -458,5 +492,55 @@ pub enum ReplanError {
 impl From<director_domain::StoreError> for ReplanError {
     fn from(err: director_domain::StoreError) -> Self {
         ReplanError::Store(err.to_string())
+    }
+}
+
+/// Every way a checkpointing round can fail, in one place.
+///
+/// The failure modes are disjoint, and the split that matters is the same one
+/// the other steps draw: a conflict is a fact about the world, and a store
+/// failure is a fact about Orqyn's own persistence.
+///
+/// - [`Self::Conflict`] means another writer landed a checkpoint for this task
+///   between the round's read and its write. The newer checkpoint is still
+///   current and nothing was superseded; the caller re-reads and retries, or
+///   accepts the checkpoint that is already there.
+/// - [`Self::Store`] means Orqyn could not read the project's tasks or could not
+///   persist a checkpoint it derived. Each checkpoint is its own transaction,
+///   so a round that failed midway checkpointed every task before the failing
+///   one and none after.
+#[derive(Debug, Error)]
+pub enum CheckpointError {
+    /// Another writer advanced the task's checkpoint lineage after this round
+    /// read it. The stored checkpoint is the newer one; nothing was superseded.
+    #[error(
+        "checkpoint conflict on task {task}: the stored lineage is at version {stored}, this round read {caller}"
+    )]
+    Conflict {
+        /// The task whose checkpoint could not be written.
+        task: String,
+        /// The version the store now holds.
+        stored: u64,
+        /// The version this round read before writing.
+        caller: u64,
+    },
+
+    /// Orqyn could not read or write its own state.
+    #[error("the store rejected the checkpointing round: {0}")]
+    Store(String),
+}
+
+impl From<director_domain::StoreError> for CheckpointError {
+    fn from(err: director_domain::StoreError) -> Self {
+        match err {
+            director_domain::StoreError::StateVersionConflict {
+                id, stored, caller, ..
+            } => CheckpointError::Conflict {
+                task: id,
+                stored,
+                caller,
+            },
+            other => CheckpointError::Store(other.to_string()),
+        }
     }
 }

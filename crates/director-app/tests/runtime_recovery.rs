@@ -32,8 +32,13 @@
 //! produced by the steps that produce it in production, and every assertion
 //! reloads from the store a fresh tick — or a fresh process — would read.
 
+use std::process::Command;
+
 use director_adapters::executor::LocalExecutor;
+use director_adapters::git::GitService;
+use director_adapters::InMemoryProvider;
 use director_app::monitor::{monitor_at, report_done, ReportRequest};
+use director_app::observe::{observe_at, Observed};
 use director_app::plan::{plan, PlanRequest, TaskSpec};
 use director_app::replan::{replan, Remediation, ReplanRequest, TaskDecision};
 use director_app::schedule::schedule;
@@ -41,12 +46,12 @@ use director_app::verify::verify;
 use director_domain::agent::{Agent, AgentStatus, Harness};
 use director_domain::assignment::{AssignmentStatus, ReleaseReason};
 use director_domain::capability::Capability;
-use director_domain::checkpoint::Checkpoint;
 use director_domain::ids::IdGenerator;
 use director_domain::ids::{
-    AgentId, AssignmentId, CheckpointId, MachineId, PlanId, ProjectId, TaskId,
+    AgentId, AssignmentId, MachineId, PlanId, ProjectId, RepositoryId, TaskId,
 };
 use director_domain::project::Project;
+use director_domain::providers::MemoryProvider;
 use director_domain::task::{ExpectedOutput, TaskStatus};
 use director_domain::verification::VerificationStatus;
 use director_domain::{
@@ -67,6 +72,11 @@ struct Runtime {
     store: Store,
     project: ProjectId,
     working_dir: std::path::PathBuf,
+    /// The git service for the working directory, so an OBSERVE round can be
+    /// run against the same repository the loop would observe.
+    git: GitService,
+    /// The repository id the working directory is registered under.
+    repository: RepositoryId,
     /// The pinned clock the failure tests move heartbeats against rather than
     /// waiting out a real lease window.
     now: chrono::DateTime<chrono::Utc>,
@@ -85,6 +95,11 @@ impl Runtime {
         now: chrono::DateTime<chrono::Utc>,
         agent_count: usize,
     ) -> Self {
+        // The git repository is created before anything else, because the
+        // project's own record points at it: a project whose local path was
+        // not a repository would be one OBSERVE could never observe.
+        let repo = git_repo(dir);
+
         let store = Store::open(dir.join(Self::DB))
             .await
             .expect("the store opens on a fresh file");
@@ -95,7 +110,7 @@ impl Runtime {
             .create_project(&Project::new(
                 project.clone(),
                 project.as_str(),
-                dir.to_str().unwrap_or("/nowhere"),
+                repo.to_str().unwrap_or("/nowhere"),
             ))
             .await
             .expect("project created");
@@ -118,7 +133,9 @@ impl Runtime {
         Runtime {
             store,
             project,
-            working_dir: dir.to_path_buf(),
+            working_dir: repo,
+            git: GitService::new(dir.join(GIT_STATE_DIR)).expect("the git service"),
+            repository: RepositoryId::from_string(REPO),
             now,
         }
     }
@@ -156,7 +173,9 @@ impl Runtime {
         Runtime {
             store,
             project,
-            working_dir: dir.to_path_buf(),
+            working_dir: git_repo(dir),
+            git: GitService::new(dir.join(GIT_STATE_DIR)).expect("the git service reopens"),
+            repository: RepositoryId::from_string(REPO),
             now,
         }
     }
@@ -224,6 +243,114 @@ impl Runtime {
             .await
             .expect("heartbeat moved");
     }
+
+    /// Run one OBSERVE round against the working directory, the way a loop tick
+    /// would, and return what it saw — including any checkpoints it wrote. This
+    /// is the production path: nothing here writes a checkpoint by hand, and a
+    /// test that wants one arrives at it by observing real change.
+    async fn observe_round(&self, ids: &mut IdGenerator) -> Observed {
+        self.observe_round_with(ids, &InMemoryProvider::new(), self.now)
+            .await
+    }
+
+    /// [`Self::observe_round`], with the memory substrate the round publishes
+    /// checkpoints to supplied by the caller — so a test can hand it one that
+    /// fails, and prove the checkpoint landed anyway.
+    async fn observe_round_with<M: MemoryProvider>(
+        &self,
+        ids: &mut IdGenerator,
+        memory: &M,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Observed {
+        observe_at(
+            &self.store,
+            &self.git,
+            ids,
+            memory,
+            &self.project,
+            &self.repository,
+            &self.working_dir.to_string_lossy().replace('\\', "/"),
+            now,
+        )
+        .await
+        .expect("the observation round")
+    }
+
+    /// Write a file into the working directory and commit it, returning the
+    // commit's sha. This is the real, durable project change an OBSERVE round
+    /// then observes — the evidence a checkpoint is derived from.
+    fn commit(&self, path: &str, contents: &str, message: &str) -> String {
+        commit_file(&self.working_dir, path, contents, message)
+    }
+}
+
+/// Write `path` inside `repo` and commit it, returning the new `HEAD` sha.
+fn commit_file(repo: &std::path::Path, path: &str, contents: &str, message: &str) -> String {
+    let file = repo.join(path);
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).expect("parent dir");
+    }
+    std::fs::write(&file, contents).expect("write file");
+    let status = Command::new("git")
+        .current_dir(repo)
+        .args(["add", path])
+        .status()
+        .expect("git add");
+    assert!(status.success(), "git add should succeed");
+    let status = Command::new("git")
+        .current_dir(repo)
+        .args(["commit", "-q", "-m", message])
+        .status()
+        .expect("git commit");
+    assert!(status.success(), "git commit should succeed");
+    let sha = Command::new("git")
+        .current_dir(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("rev-parse HEAD");
+    assert!(sha.status.success(), "rev-parse HEAD");
+    String::from_utf8(sha.stdout)
+        .expect("sha is utf-8")
+        .trim()
+        .to_string()
+}
+
+/// A git repository in `dir` with one commit, created if it does not already
+/// exist. [`Runtime::boot`] makes one the first time and [`Runtime::restart`]
+/// finds it again — the repository is part of the state that survives, so a
+/// restart that re-created it would be proof nothing was durable.
+fn git_repo(dir: &std::path::Path) -> std::path::PathBuf {
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).expect("the repo directory");
+
+    // A repository that already exists is left exactly as it is: its history is
+    // the project's history.
+    if repo.join(".git").exists() {
+        return repo;
+    }
+
+    let git = || {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&repo);
+        cmd
+    };
+    // A standalone commit needs an identity; the test environment has none.
+    git().args(["init", "-q"]).status().expect("git init");
+    git()
+        .args(["config", "user.name", "Orqyn Tests"])
+        .status()
+        .expect("set name");
+    git()
+        .args(["config", "user.email", "tests@orqyn.invalid"])
+        .status()
+        .expect("set email");
+    git()
+        .args(["config", "commit.gpgsign", "false"])
+        .status()
+        .expect("disable signing");
+
+    commit_file(&repo, "README.md", "# the project\n", "the project begins");
+    repo
 }
 
 /// One expected output with the machine check Orqyn will run itself.
@@ -240,6 +367,13 @@ fn spec(id: &str, criterion: &str, check: &str) -> TaskSpec {
     spec.expected_outputs = vec![checked(criterion, check)];
     spec
 }
+
+/// The repository id the working directory is registered under.
+const REPO: &str = "REPO-1";
+
+/// Where the git service keeps its own observation state, outside the
+/// repository it observes.
+const GIT_STATE_DIR: &str = "orqyn-state";
 
 /// A pinned clock an hour before the epoch-free present, far enough from `now`
 /// that a heartbeat moved 90 minutes into the past is unambiguously gone and a
@@ -884,14 +1018,19 @@ async fn a_failed_task_can_be_reworked_for_a_replacement_agent_who_then_passes()
 
 #[tokio::test]
 async fn a_replacement_agent_can_be_given_everything_the_prior_agent_left_behind() {
-    // Context continuity. The loop has no "hand a replacement agent its
-    // context" step, and Phase 11 does not invent one: what it has is the
-    // store, and this test proves the store alone is enough to reconstruct the
-    // picture a replacement agent needs — and marks the one piece that is
-    // missing.
+    // Context continuity, Phase 12 edition. The loop has no "hand a replacement
+    // agent its context" step; what it has is the store plus a checkpoint that
+    // the OBSERVE round writes automatically. Phase 11 proved the store alone
+    // was enough to reconstruct the picture, but it had to write the checkpoint
+    // by hand to do it — "the loop has no step that writes checkpoints yet" was
+    // the caveat the test itself recorded.
     //
-    // The scenario stops mid-flight on purpose: AGENT-1 has failed and been
-    // reworked, AGENT-2 holds the work but has not reported, and the driver
+    // That caveat is gone. The checkpoint below is produced by the production
+    // path: an OBSERVE round sees real change on an in-flight task and writes
+    // one. No test in this function calls `create_checkpoint`.
+    //
+    // The scenario still stops mid-flight on purpose: AGENT-1 has failed and
+    // been reworked, AGENT-2 holds the work but has not reported, and the driver
     // must brief AGENT-2 from Orqyn's state alone.
     let dir = tempfile::TempDir::new().expect("a temp dir for the store");
     let now = pinned_now();
@@ -918,23 +1057,63 @@ async fn a_replacement_agent_can_be_given_everything_the_prior_agent_left_behind
     .await
     .expect("the plan lands");
 
-    // AGENT-1 takes the work and records a checkpoint of where it got to — the
-    // progress narrative a replacement resumes from. The loop has no step that
-    // writes checkpoints yet, so the driver writes one through the repository,
-    // which is the seam a future step will call.
+    // The first observation registers the repository and takes its baseline.
+    // The task is still `todo`, so even a change here would checkpoint nothing:
+    // only work that is actually out is worth a resumption document.
+    let baseline = runtime.observe_round(&mut ids).await;
+    assert!(
+        baseline.checkpoints.is_empty(),
+        "nothing is in flight to checkpoint"
+    );
+
+    // AGENT-1 takes the work and gets partway through it: one change committed,
+    // one left uncommitted. Both are real, durable project state — and neither
+    // is a completion claim.
     let first = runtime.schedule_one(&mut ids).await;
-    runtime
-        .store
-        .checkpoints()
-        .create_checkpoint(&Checkpoint::new(
-            CheckpointId::from_string("CP-1"),
-            TaskId::from_string("WORK"),
-            "ship the feature",
-            "auth endpoints scaffolded; middleware not yet wired",
-            "wire the middleware into the router",
-        ))
-        .await
-        .expect("the checkpoint lands");
+    assert_eq!(first.agent_id, AgentId::from_string("AGENT-1"));
+    let sha = runtime.commit(
+        "src/auth.rs",
+        "pub fn authenticate() -> bool { true }\n",
+        "scaffold the auth endpoint",
+    );
+
+    // The next observation sees the change and writes the checkpoint — derived
+    // from the git evidence the round just collected, not from anything an
+    // agent reported. This is the Phase 12 activation, and the assertions below
+    // are what prove it fired.
+    std::fs::write(
+        runtime.working_dir.join("src/middleware.rs"),
+        "// not wired into the router yet\n",
+    )
+    .expect("an uncommitted change");
+    let observed = runtime.observe_round(&mut ids).await;
+    assert_eq!(
+        observed.checkpoints.len(),
+        1,
+        "one in-flight task with real change produces one checkpoint"
+    );
+    let written = observed.checkpoints[0].clone();
+    assert_eq!(written.task_id, TaskId::from_string("WORK"));
+    assert_eq!(
+        written.created_by_agent,
+        Some(AgentId::from_string("AGENT-1"))
+    );
+
+    // The checkpoint carries the evidence it was derived from rather than a
+    // narrative somebody typed: the commit the round observed, and the
+    // uncommitted file it found in the tree.
+    assert_eq!(written.commit_sha.as_deref(), Some(sha.as_str()));
+    assert!(written
+        .changed_files
+        .iter()
+        .any(|path| path == "src/middleware.rs"));
+    assert!(
+        written.progress.contains("src/middleware.rs"),
+        "the narrative describes the observed tree"
+    );
+    // And it is a description of state, not a claim the work is finished —
+    // nothing here can make the task done.
+    assert!(!written.progress.to_lowercase().contains("done"));
 
     // AGENT-1 fails the check, the caller reworks the contract, and AGENT-2
     // inherits the task.
@@ -958,8 +1137,16 @@ async fn a_replacement_agent_can_be_given_everything_the_prior_agent_left_behind
     )
     .await
     .expect("the rework lands");
+
+    // The replacement is scheduled, and the scheduler hands it the recovery
+    // context it just became responsible for — built from the persisted state,
+    // not by the replacement asking six unrelated repository questions.
     let replacement = runtime.schedule_one(&mut ids).await;
     assert_eq!(replacement.agent_id, AgentId::from_string("AGENT-2"));
+    let recovery = replacement
+        .recovery
+        .as_ref()
+        .expect("a replacement inheriting checkpointed work gets a recovery context");
 
     // --- Everything a driver can brief the replacement on, read out of the
     // store the way a caller would. ---
@@ -977,6 +1164,16 @@ async fn a_replacement_agent_can_be_given_everything_the_prior_agent_left_behind
     // the work is in flight and present the right version when it writes back.
     assert_eq!(task.status, TaskStatus::InProgress);
     let read_version = task.state_version;
+    // The package is built *before* the assignment that hands out the tenure,
+    // so it describes the work as the replacement inherits it: the assignment
+    // is the write that moves the task to `in_progress`, and it bumps the
+    // version by exactly one. A package that matched the post-assignment read
+    // would be describing a version that did not exist when it was built.
+    assert_eq!(
+        recovery.package.task_state_version,
+        read_version - 1,
+        "the package reports the pre-tenure version it was built against"
+    );
 
     // Who held it before, and why they are not holding it now.
     let tenures = runtime
@@ -991,6 +1188,21 @@ async fn a_replacement_agent_can_be_given_everything_the_prior_agent_left_behind
         .expect("the prior tenure is retained");
     assert_eq!(prior.agent_id, AgentId::from_string("AGENT-1"));
     assert_eq!(prior.release_reason, Some(ReleaseReason::WorkComplete));
+    // The package carries the tenure history as it stood when the replacement
+    // was briefed — which is every tenure but its own. The replacement's
+    // assignment is the write that created it, and the package is built before
+    // that write lands, so the history it carries answers "what happened to
+    // the previous agent" without including a tenure that had not started.
+    assert_eq!(
+        recovery.package.tenures,
+        tenures
+            .iter()
+            .filter(|tenure| tenure.agent_id != AgentId::from_string("AGENT-2"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        "the package carries the history it was built against"
+    );
+    assert_eq!(recovery.package.tenures.len(), 1);
 
     // What was judged, and what the evidence said — so the replacement knows
     // what already failed and why, rather than repeating it.
@@ -1007,9 +1219,11 @@ async fn a_replacement_agent_can_be_given_everything_the_prior_agent_left_behind
     assert!(failed_judgment.evidence[0]
         .detail
         .contains("git --no-such-flag"));
+    assert_eq!(recovery.package.verifications, judgments);
 
-    // Where the prior agent got to, and what the next action was — the
-    // checkpoint a resumption continues from.
+    // Where the prior agent got to, and what the next action is — the
+    // checkpoint a resumption continues from, written by the observation round
+    // rather than by this test.
     let checkpoint = runtime
         .store
         .checkpoints()
@@ -1017,10 +1231,7 @@ async fn a_replacement_agent_can_be_given_everything_the_prior_agent_left_behind
         .await
         .expect("the checkpoint survived")
         .expect("there is a checkpoint to resume from");
-    assert_eq!(
-        checkpoint.next_action,
-        "wire the middleware into the router"
-    );
+    assert_eq!(checkpoint, written);
     assert_eq!(
         runtime
             .store
@@ -1029,8 +1240,14 @@ async fn a_replacement_agent_can_be_given_everything_the_prior_agent_left_behind
             .await
             .expect("checkpoint history")
             .len(),
-        1
+        1,
+        "one observation with change, one checkpoint in the lineage"
     );
+    // A checkpoint taken against a dirty tree tells the replacement to
+    // reconcile it before reporting — the observed state, not a guess.
+    assert!(checkpoint
+        .next_action
+        .contains("uncommitted changes to reconcile"));
 
     // The latest transition, so a driver can say what changed most recently.
     let history = runtime
@@ -1041,6 +1258,21 @@ async fn a_replacement_agent_can_be_given_everything_the_prior_agent_left_behind
         .expect("history");
     let latest = history.last().expect("there is a transition");
     assert_eq!(latest.to, TaskStatus::InProgress);
+    // The package's transitions stop one short of the live history for the same
+    // reason its tenures do: the final `Todo → InProgress` *is* the
+    // replacement's assignment, written after the package was built. What the
+    // package carries is everything that led to the handoff — the state a
+    // driver briefs the replacement *on*.
+    assert_eq!(
+        recovery.package.transitions,
+        history[..history.len() - 1],
+        "the package carries the transitions that preceded the handoff"
+    );
+    assert_eq!(
+        history[history.len() - 2].to,
+        TaskStatus::Todo,
+        "the last transition the package saw was the rework returning the task"
+    );
 
     // The replacement agent's own record points at the work, so a driver
     // handing out the briefing is consistent with the registry.

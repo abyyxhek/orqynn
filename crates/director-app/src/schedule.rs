@@ -190,6 +190,15 @@ pub async fn schedule_at(
             agent_id: agent_id.clone(),
             assignment_id: ids.next::<AssignmentId>("sched"),
         };
+
+        // 6. If this task has a checkpoint, the agent about to receive it is
+        //    inheriting work, and the continuation package is its briefing.
+        //    Built *before* the assignment lands, so a read that fails leaves
+        //    nothing written, and so the package describes the work as it
+        //    stood before this tenure — which is what a replacement needs.
+        //    A fresh task reads no checkpoint and yields `None` here.
+        let recovery = crate::recovery::recovery_context_from_store(store, &task.id).await?;
+
         match assign::assign_at(store, request, now).await {
             Ok(assigned) => {
                 committed.insert(agent_id.clone());
@@ -197,6 +206,7 @@ pub async fn schedule_at(
                     task_id: task.id.clone(),
                     agent_id,
                     assignment: assigned.assignment,
+                    recovery,
                 });
             }
             // Nothing was written: the task is still `todo` and still handable,
@@ -347,6 +357,13 @@ pub struct Scheduled {
     /// The assignment as the store wrote it, reloaded rather than echoed from
     /// the request.
     pub assignment: AgentAssignment,
+    /// The recovery context for the agent now holding the work, when the task
+    /// has a checkpoint to resume from. `None` for a task nobody has worked on
+    /// before — there is nothing to inherit. This is the Phase 12 continuation
+    /// package: a replacement agent is handed its briefing at the moment the
+    /// scheduler gives it the work, rather than having to ask six unrelated
+    /// repository questions itself.
+    pub recovery: Option<crate::recovery::Recovery>,
 }
 
 /// A pairing the round proposed and the store refused.
@@ -634,6 +651,7 @@ mod tests {
                 TaskId::from_string("T"),
                 AgentId::from_string("AGENT-a"),
             ),
+            recovery: None,
         });
         assert!(done.is_settled());
 

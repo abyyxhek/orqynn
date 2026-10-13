@@ -15,8 +15,9 @@
 use std::process::Command;
 
 use director_adapters::git::GitService;
+use director_adapters::InMemoryProvider;
 use director_app::observe::{observe, observe_at, summary};
-use director_domain::ids::{ProjectId, RepositoryId};
+use director_domain::ids::{IdGenerator, ProjectId, RepositoryId};
 use director_domain::{ProjectRepository, ProjectStateRepository};
 use director_store::Store;
 
@@ -123,6 +124,13 @@ fn ids() -> (ProjectId, RepositoryId) {
     )
 }
 
+/// A semantic-memory provider that accepts every write, so an observation round
+/// has a substrate to publish checkpoints to. Its contents stay in memory and
+/// are dropped with the test.
+fn memory() -> InMemoryProvider {
+    InMemoryProvider::new()
+}
+
 #[tokio::test]
 async fn a_first_observation_registers_and_records_the_head() {
     let scratch = Scratch::new();
@@ -130,10 +138,19 @@ async fn a_first_observation_registers_and_records_the_head() {
     let (store, _store_dir) = Scratch::store().await;
     let git = scratch.service();
     let (project, repo) = ids();
+    let mut gen = IdGenerator::new();
 
-    let observed = observe(&store, &git, &project, &repo, &scratch.path())
-        .await
-        .expect("the first observation");
+    let observed = observe(
+        &store,
+        &git,
+        &mut gen,
+        &memory(),
+        &project,
+        &repo,
+        &scratch.path(),
+    )
+    .await
+    .expect("the first observation");
 
     // The project was created as a side effect of observing it.
     store
@@ -170,12 +187,13 @@ async fn a_repeated_observation_of_an_unchanged_repo_reports_no_change() {
     let (store, _store_dir) = Scratch::store().await;
     let git = scratch.service();
     let (project, repo) = ids();
+    let mut gen = IdGenerator::new();
     let path = scratch.path();
 
-    observe(&store, &git, &project, &repo, &path)
+    observe(&store, &git, &mut gen, &memory(), &project, &repo, &path)
         .await
         .expect("first");
-    let again = observe(&store, &git, &project, &repo, &path)
+    let again = observe(&store, &git, &mut gen, &memory(), &project, &repo, &path)
         .await
         .expect("second");
 
@@ -196,14 +214,15 @@ async fn a_new_commit_is_observed_as_a_change() {
     let (store, _store_dir) = Scratch::store().await;
     let git = scratch.service();
     let (project, repo) = ids();
+    let mut gen = IdGenerator::new();
     let path = scratch.path();
 
-    let first = observe(&store, &git, &project, &repo, &path)
+    let first = observe(&store, &git, &mut gen, &memory(), &project, &repo, &path)
         .await
         .expect("first observation");
 
     let sha = scratch.commit("src/lib.rs", "pub fn retry() {}\n", "add the retry helper");
-    let second = observe(&store, &git, &project, &repo, &path)
+    let second = observe(&store, &git, &mut gen, &memory(), &project, &repo, &path)
         .await
         .expect("second observation");
 
@@ -226,16 +245,17 @@ async fn a_dirty_working_tree_is_recorded_as_unclean() {
     let (store, _store_dir) = Scratch::store().await;
     let git = scratch.service();
     let (project, repo) = ids();
+    let mut gen = IdGenerator::new();
     let path = scratch.path();
 
-    observe(&store, &git, &project, &repo, &path)
+    observe(&store, &git, &mut gen, &memory(), &project, &repo, &path)
         .await
         .expect("clean observation");
 
     let untracked = scratch.repo_dir.join("src/lib.rs");
     std::fs::create_dir_all(untracked.parent().expect("a parent dir")).expect("parent dir");
     std::fs::write(&untracked, "uncommitted\n").expect("an untracked file");
-    let dirty = observe(&store, &git, &project, &repo, &path)
+    let dirty = observe(&store, &git, &mut gen, &memory(), &project, &repo, &path)
         .await
         .expect("observation with a dirty tree");
 
@@ -258,9 +278,10 @@ async fn a_directory_that_is_not_a_repository_is_refused() {
     let (store, _store_dir) = Scratch::store().await;
     let git = GitService::new(tmp.path().join("state")).expect("git service");
     let (project, repo) = ids();
+    let mut gen = IdGenerator::new();
     let path = not_a_repo.to_string_lossy().replace('\\', "/");
 
-    let err = observe(&store, &git, &project, &repo, &path)
+    let err = observe(&store, &git, &mut gen, &memory(), &project, &repo, &path)
         .await
         .unwrap_err();
 
@@ -286,18 +307,37 @@ async fn the_observation_clock_is_distinguishable_across_rounds() {
     let (store, _store_dir) = Scratch::store().await;
     let git = scratch.service();
     let (project, repo) = ids();
+    let mut gen = IdGenerator::new();
     let path = scratch.path();
 
     // observe_at exists so two rounds can be told apart by time; here it is
     // used to confirm the clock advances even when the state does not.
     let t0 = chrono::Utc::now();
-    let a = observe_at(&store, &git, &project, &repo, &path, t0)
-        .await
-        .expect("first");
+    let a = observe_at(
+        &store,
+        &git,
+        &mut gen,
+        &memory(),
+        &project,
+        &repo,
+        &path,
+        t0,
+    )
+    .await
+    .expect("first");
     std::thread::sleep(std::time::Duration::from_millis(10));
-    let b = observe_at(&store, &git, &project, &repo, &path, chrono::Utc::now())
-        .await
-        .expect("second");
+    let b = observe_at(
+        &store,
+        &git,
+        &mut gen,
+        &memory(),
+        &project,
+        &repo,
+        &path,
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("second");
 
     assert!(a.state.last_observed_at < b.state.last_observed_at);
     assert_eq!(a.state.observation_version + 1, b.state.observation_version);

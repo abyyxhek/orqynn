@@ -43,10 +43,18 @@
 //! what Orqyn *knows* and nothing else. Keeping it that way is what will make
 //! the later steps testable in isolation: each one consumes the state this
 //! produces.
+//!
+//! The one exception is checkpointing, and it is an exception because a
+//! checkpoint *is* what Orqyn just learned, written for a reader that has not
+//! arrived yet. The checkpoint half of the round lives in
+//! [`crate::checkpoint`] rather than here, so the observation stays about
+//! recording evidence and the checkpointing stays about preserving a resumption
+//! document; the two are one round, but they are not one concern.
 
 use director_adapters::git::GitService;
-use director_domain::ids::{ProjectId, RepositoryId};
+use director_domain::ids::{IdGenerator, ProjectId, RepositoryId};
 use director_domain::project::Project;
+use director_domain::providers::MemoryProvider;
 use director_domain::repository::{ProjectStateSnapshot, SyncStatus};
 use director_domain::state::TestResults;
 use director_domain::store::StoredProjectState;
@@ -57,7 +65,11 @@ use crate::ObserveError;
 
 /// The outcome of one OBSERVE round, reported to the caller rather than logged
 /// and dropped — the loop's later steps will branch on this.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: it carries [`Checkpoint`]s, whose
+/// `progress_fraction` is an `f32`, so total equality is not well defined.
+/// Comparisons are for test assertions.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Observation {
     /// The project the observation is about.
     pub project_id: ProjectId,
@@ -77,12 +89,19 @@ pub struct Observation {
     /// branch, or a changed working tree. A restatement is not an error — a
     /// loop polling an idle repository should see a steady stream of `false` —
     /// but it is the signal the loop uses to decide whether anything is worth
-    /// planning against.
+    /// planning against, and whether any in-flight work is worth
+    /// checkpointing.
     pub changed: bool,
     /// Whether this was the first observation Orqyn has ever made of this
     /// project. The first one is a baseline rather than a change: Orqyn arrived
     /// and found the repository as it was, it did not watch it get there.
     pub first_observation: bool,
+    /// The checkpoints this round wrote for in-progress tasks, if any. Empty
+    /// unless the observation recorded a real change and the project has work
+    /// in flight — a quiet round checkpoints nothing. This is the Phase 12
+    /// activation: the recovery lineage advances on the same evidence that
+    /// makes the loop re-plan.
+    pub checkpoints: Vec<director_domain::checkpoint::Checkpoint>,
 }
 
 /// The registered view of the repository, reported alongside the normalized
@@ -105,6 +124,9 @@ pub struct Observed {
     /// The loop's later steps branch on arrival-versus-change, so the
     /// distinction has to be right.
     pub first_observation: bool,
+    /// The checkpoints the round wrote for in-progress tasks. Empty on a quiet
+    /// round or a round with no work in flight.
+    pub checkpoints: Vec<director_domain::checkpoint::Checkpoint>,
 }
 
 /// Run one OBSERVE round for a project's repository.
@@ -112,9 +134,15 @@ pub struct Observed {
 /// `local_path` is the working tree to look at. Registering the project and
 /// repository is idempotent: a second call on the same ids reuses them rather
 /// than erroring, which is what makes this safe to call on every loop tick.
-pub async fn observe(
+///
+/// `memory` is the semantic-memory substrate the round publishes checkpoints
+/// to, best-effort. It is taken as the domain [`MemoryProvider`] trait so this
+/// step never learns which substrate is answering.
+pub async fn observe<M: MemoryProvider>(
     store: &Store,
     git: &GitService,
+    ids: &mut IdGenerator,
+    memory: &M,
     project_id: &ProjectId,
     repository_id: &RepositoryId,
     local_path: &str,
@@ -122,6 +150,8 @@ pub async fn observe(
     observe_at(
         store,
         git,
+        ids,
+        memory,
         project_id,
         repository_id,
         local_path,
@@ -133,9 +163,12 @@ pub async fn observe(
 /// [`observe`], with the observation time supplied by the caller. Exposed so a
 /// test can make two rounds distinguishable and assert that observation
 /// versions advance; production passes [`chrono::Utc::now`].
-pub async fn observe_at(
+#[allow(clippy::too_many_arguments)]
+pub async fn observe_at<M: MemoryProvider>(
     store: &Store,
     git: &GitService,
+    ids: &mut IdGenerator,
+    memory: &M,
     project_id: &ProjectId,
     repository_id: &RepositoryId,
     local_path: &str,
@@ -183,11 +216,31 @@ pub async fn observe_at(
     };
     let stored = store.project_state().update_project_state(&state).await?;
 
+    // 5. Checkpoint the in-flight work. This is the Phase 12 activation: the
+    //    observation is the one place that holds durable progress evidence, so
+    //    it is the step that advances the recovery lineage. A quiet round writes
+    //    nothing, which is what keeps an idle repository from accumulating
+    //    restatements. A conflict here is reported rather than swallowed — a
+    //    checkpoint the round believed it wrote but did not is exactly the thing
+    //    a caller must learn about.
+    let checkpoints = crate::checkpoint::checkpoint_round(
+        store,
+        ids,
+        memory,
+        project_id,
+        &stored,
+        &sync,
+        &view.snapshot.working_tree,
+        now,
+    )
+    .await?;
+
     Ok(Observed {
         view,
         sync,
         state: stored,
         first_observation: first,
+        checkpoints: checkpoints.written,
     })
 }
 
@@ -211,6 +264,7 @@ pub fn summary(
         // recorded a new fact counts as a change.
         changed: !observed.first_observation && observed.sync.status == SyncStatus::Synced,
         first_observation: observed.first_observation,
+        checkpoints: observed.checkpoints.clone(),
     }
 }
 

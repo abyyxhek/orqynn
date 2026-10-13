@@ -347,15 +347,29 @@ pub trait AssignmentRepository: Store {
 
 /// Persistence for checkpoints — Orqyn's own resumption documents.
 ///
-/// Phase 4 stores the durable foundation: the record, the latest-for-task
-/// marking, and the versions it must be compared against. The automatic
-/// checkpoint *engine* is a later phase; this trait deliberately has no
-/// "take a checkpoint automatically" method.
+/// Phase 4 stored the durable foundation: the record, the latest-for-task
+/// marking, and the versions it must be compared against. Phase 12 activates
+/// it by writing checkpoints automatically from OBSERVE; the trait itself still
+/// has no "take a checkpoint automatically" method, because *when* to take one
+/// is a loop decision that belongs to `director-app`, not to persistence.
 #[async_trait]
 pub trait CheckpointRepository: Store {
     /// Persist a new checkpoint and mark it current for its task. The previous
     /// current checkpoint for that task is superseded, not deleted.
-    async fn create_checkpoint(&self, checkpoint: &Checkpoint) -> Result<Checkpoint, Self::Error>;
+    ///
+    /// `expected_current_version` is the optimistic-concurrency precondition:
+    /// the `state_version` of the checkpoint this task's caller read before
+    /// deciding to write a new one, or `None` when the caller read no current
+    /// checkpoint at all. If another writer landed a checkpoint in between, the
+    /// stored version will not match and the write is refused as a
+    /// [`StoreError::StateVersionConflict`] — the newer checkpoint stays
+    /// current and the caller re-reads. The check happens inside the
+    /// transaction, so a refused write supersedes nothing.
+    async fn create_checkpoint(
+        &self,
+        checkpoint: &Checkpoint,
+        expected_current_version: Option<u64>,
+    ) -> Result<Checkpoint, Self::Error>;
 
     /// Load a checkpoint by id, or [`StoreError::NotFound`].
     async fn get_checkpoint(&self, id: &CheckpointId) -> Result<Checkpoint, Self::Error>;

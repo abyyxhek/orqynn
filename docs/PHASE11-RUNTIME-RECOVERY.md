@@ -297,6 +297,11 @@ deliberately incomplete.
   resumption today rests on the task, the tenure history, and the verification
   history; the progress narrative has to be written by the caller until that
   step exists.
+
+  > **Resolved in Phase 12**, which landed the writer inside OBSERVE and the
+  > recovery assembly the scheduler hands a replacement. See
+  > [`PHASE12-CHECKPOINT-RECOVERY.md`](PHASE12-CHECKPOINT-RECOVERY.md). This
+  > entry stays as written because it is what Phase 11 proved at the time.
 - **`Blocker` is not persisted at all.** It exists in `director-domain` with a
   kind, a status, and a resolution, but there is no `blockers` table, no
   migration, and no repository. REPLAN reports stranded dependents and writes

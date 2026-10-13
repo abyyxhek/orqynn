@@ -1678,18 +1678,29 @@ async fn creating_a_checkpoint_supersedes_the_previous_one_without_deleting_it()
         .await
         .expect("task");
 
+    // No current checkpoint exists yet, so the expected version is None. The
+    // first write is gated the same way as every later one: a caller that
+    // expected a version here would conflict.
     let first = store
         .checkpoints()
-        .create_checkpoint(&checkpoint("CHK-1", "TASK-1", "update the last two sites"))
+        .create_checkpoint(
+            &checkpoint("CHK-1", "TASK-1", "update the last two sites"),
+            None,
+        )
         .await
         .expect("first checkpoint");
     assert_eq!(first.status, CheckpointStatus::Current);
 
     // Creating a second current checkpoint for the same task must succeed, not
-    // conflict: the latest-for-task pointer moves rather than being unique.
+    // conflict: the latest-for-task pointer moves rather than being unique. The
+    // caller passes the version of the checkpoint it read — the one that is
+    // about to be superseded.
     store
         .checkpoints()
-        .create_checkpoint(&checkpoint("CHK-2", "TASK-1", "run the retry suite"))
+        .create_checkpoint(
+            &checkpoint("CHK-2", "TASK-1", "run the retry suite"),
+            Some(first.state_version),
+        )
         .await
         .expect("second checkpoint");
 
@@ -1716,6 +1727,232 @@ async fn creating_a_checkpoint_supersedes_the_previous_one_without_deleting_it()
         "newest first"
     );
     assert_eq!(all[1].status, CheckpointStatus::Superseded);
+}
+
+/// The fixture the version-gate tests build on: a task with one current
+/// checkpoint at a known version, ready for a stale writer to fail against.
+async fn task_with_current_checkpoint(store: &Store) -> Checkpoint {
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+    store
+        .checkpoints()
+        .create_checkpoint(&checkpoint("CHK-1", "TASK-1", "the first checkpoint"), None)
+        .await
+        .expect("the current checkpoint")
+}
+
+#[tokio::test]
+async fn a_stale_checkpoint_write_conflicts_and_leaves_the_newer_checkpoint_current() {
+    // The race this exists for: two writers both read version N, one of them
+    // writes N+1, the other tries to write on top of its stale read. The stale
+    // writer must be refused, and the checkpoint that actually is current must
+    // stay current — a slower writer can never bury a faster one's work.
+    let (store, _path) = store().await;
+    let first = task_with_current_checkpoint(&store).await;
+
+    // A concurrent write lands. The caller read the real current version, so it
+    // succeeds and moves the lineage forward.
+    let second = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-2", "TASK-1", "the intervening write"),
+            Some(first.state_version),
+        )
+        .await
+        .expect("the intervening write lands");
+    // The store assigns the lineage position: the second checkpoint in the
+    // task's history is version 2, which is what makes the next stale write
+    // detectable.
+    assert_eq!(second.state_version, 2);
+    assert_eq!(second.status, CheckpointStatus::Current);
+
+    // The stale writer, still holding the version it read before CHK-2 existed.
+    // Its supersession predicate matches no row, so the write is refused.
+    let err = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-3", "TASK-1", "the stale write"),
+            Some(first.state_version),
+        )
+        .await
+        .expect_err("a stale checkpoint write must conflict");
+    match err {
+        StoreError::StateVersionConflict {
+            entity,
+            id,
+            caller,
+            stored,
+        } => {
+            assert_eq!(entity, "checkpoint");
+            assert_eq!(id, "TASK-1");
+            assert_eq!(caller, first.state_version);
+            assert_eq!(
+                stored, second.state_version,
+                "the conflict names the winner"
+            );
+        }
+        other => panic!("expected a state version conflict, got {other:?}"),
+    }
+
+    // Nothing the stale writer attempted survived: CHK-2 is still the current
+    // checkpoint, CHK-1 is still the only superseded row, and CHK-3 was never
+    // written.
+    let latest = store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the lineage")
+        .expect("there is a current checkpoint");
+    assert_eq!(latest.id, CheckpointId::from_string("CHK-2"));
+    assert_eq!(latest.status, CheckpointStatus::Current);
+
+    let all = store
+        .checkpoints()
+        .checkpoints_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the full history");
+    assert_eq!(
+        all.len(),
+        2,
+        "the stale write created no row and superseded nothing"
+    );
+    assert!(all
+        .iter()
+        .all(|cp| cp.id != CheckpointId::from_string("CHK-3")));
+}
+
+#[tokio::test]
+async fn a_checkpoint_write_that_expects_none_conflicts_when_one_already_exists() {
+    // The first-write case in the other direction: the caller believes there is
+    // no current checkpoint, but one exists. Expecting None is a precondition
+    // like any other — a writer that has not read the current state cannot be
+    // allowed to supersede it.
+    let (store, _path) = store().await;
+    let first = task_with_current_checkpoint(&store).await;
+
+    let err = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-2", "TASK-1", "assumes nothing exists"),
+            None,
+        )
+        .await
+        .expect_err("writing over an existing checkpoint with no precondition must conflict");
+    match err {
+        StoreError::StateVersionConflict {
+            entity, id, stored, ..
+        } => {
+            assert_eq!(entity, "checkpoint");
+            assert_eq!(id, "TASK-1");
+            assert_eq!(stored, first.state_version);
+        }
+        other => panic!("expected a state version conflict, got {other:?}"),
+    }
+
+    let latest = store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the lineage")
+        .expect("the original checkpoint survived");
+    assert_eq!(latest.id, CheckpointId::from_string("CHK-1"));
+    assert_eq!(latest.status, CheckpointStatus::Current);
+}
+
+#[tokio::test]
+async fn expecting_a_version_for_a_task_with_no_checkpoint_conflicts() {
+    // The mirror image: the caller read a version for a checkpoint that no
+    // longer exists as current (or never did). Its precondition does not match
+    // the world, so the write is refused rather than accepted as a first write.
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    let err = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-1", "TASK-1", "assumes a checkpoint exists"),
+            Some(7),
+        )
+        .await
+        .expect_err("a version precondition with no current checkpoint must conflict");
+    assert!(matches!(err, StoreError::StateVersionConflict { .. }));
+
+    // And nothing was written.
+    assert!(store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the lineage")
+        .is_none());
+}
+
+#[tokio::test]
+async fn a_current_checkpoint_can_be_rewritten_against_the_version_a_read_returns() {
+    // The recovery path a conflict drives a caller toward: re-read, take the
+    // version that comes back, and write again. The retry must succeed, which
+    // is what makes the conflict a retryable condition rather than a dead end.
+    let (store, _path) = store().await;
+    let first = task_with_current_checkpoint(&store).await;
+
+    let _ = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-2", "TASK-1", "the intervening write"),
+            Some(first.state_version),
+        )
+        .await
+        .expect("the intervening write");
+
+    // The stale writer re-reads and retries with the version it now finds.
+    let current = store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the re-read")
+        .expect("there is a current checkpoint");
+    let retried = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-3", "TASK-1", "the retried write"),
+            Some(current.state_version),
+        )
+        .await
+        .expect("the retry lands after a re-read");
+
+    assert_eq!(retried.id, CheckpointId::from_string("CHK-3"));
+    assert_eq!(retried.status, CheckpointStatus::Current);
+    assert_eq!(
+        store
+            .checkpoints()
+            .checkpoints_for_task(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("the lineage")
+            .len(),
+        3,
+        "every write is retained"
+    );
 }
 
 #[tokio::test]
@@ -1768,7 +2005,7 @@ async fn a_checkpoint_carries_its_test_results_and_decisions() {
 
     let stored = store
         .checkpoints()
-        .create_checkpoint(&cp)
+        .create_checkpoint(&cp, None)
         .await
         .expect("checkpoint stored");
     assert_eq!(stored.changed_files, vec!["src/retry.rs"]);
@@ -1781,6 +2018,407 @@ async fn a_checkpoint_carries_its_test_results_and_decisions() {
         vec![director_domain::ids::DecisionId::from_string("DEC-1")]
     );
     assert!(stored.test_results.is_some(), "test results round-trip");
+}
+
+/// The first checkpoint for a task: no current row exists, so the precondition
+/// is `None`, and the store assigns lineage version 1.
+#[tokio::test]
+async fn the_first_checkpoint_for_a_task_is_created_against_a_none_precondition() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+
+    // `None` is the honest precondition: the caller read no current checkpoint.
+    let first = store
+        .checkpoints()
+        .create_checkpoint(&checkpoint("CHK-1", "TASK-1", "the first checkpoint"), None)
+        .await
+        .expect("the first checkpoint");
+
+    assert_eq!(first.id, CheckpointId::from_string("CHK-1"));
+    assert_eq!(first.status, CheckpointStatus::Current);
+    assert_eq!(first.state_version, 1, "a fresh lineage starts at 1");
+
+    // It is the current checkpoint, and it is the only row the task has.
+    let latest = store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the lineage")
+        .expect("there is a current checkpoint");
+    assert_eq!(latest.id, first.id);
+    assert_eq!(latest.state_version, 1);
+}
+
+/// Supersession on a fresh read: the caller presents the version it read, the
+/// sitting checkpoint is marked rather than deleted, and the new one takes the
+/// next lineage position.
+#[tokio::test]
+async fn a_supersession_on_a_current_read_marks_the_sitting_checkpoint() {
+    let (store, _path) = store().await;
+    let first = task_with_current_checkpoint(&store).await;
+
+    let second = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-2", "TASK-1", "the superseding write"),
+            Some(first.state_version),
+        )
+        .await
+        .expect("the supersession lands");
+
+    // The new checkpoint is current, one lineage position ahead.
+    assert_eq!(second.status, CheckpointStatus::Current);
+    assert_eq!(second.state_version, first.state_version + 1);
+
+    // The sitting checkpoint is retained and marked, not deleted.
+    let old = store
+        .checkpoints()
+        .get_checkpoint(&CheckpointId::from_string("CHK-1"))
+        .await
+        .expect("the superseded checkpoint still exists");
+    assert_eq!(old.status, CheckpointStatus::Superseded);
+    assert_eq!(old.state_version, first.state_version + 1);
+
+    let latest = store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the lineage")
+        .expect("there is a current checkpoint");
+    assert_eq!(latest.id, CheckpointId::from_string("CHK-2"));
+    assert_eq!(latest.state_version, 2);
+}
+
+/// The contract's central guarantee, stated as a property rather than a
+/// scenario: whatever a stale writer presents, the newer checkpoint stays
+/// current and the stale writer writes nothing.
+#[tokio::test]
+async fn a_stale_writer_cannot_supersede_a_newer_checkpoint() {
+    let (store, _path) = store().await;
+    let first = task_with_current_checkpoint(&store).await;
+    let second = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-2", "TASK-1", "the intervening write"),
+            Some(first.state_version),
+        )
+        .await
+        .expect("the intervening write lands");
+
+    // A stale writer holding the version it read before CHK-2 existed. Its
+    // precondition names a checkpoint that is no longer current.
+    let stale = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-3", "TASK-1", "the stale write"),
+            Some(first.state_version),
+        )
+        .await
+        .expect_err("a stale write must be refused");
+
+    match &stale {
+        StoreError::StateVersionConflict {
+            entity,
+            id,
+            stored,
+            caller,
+        } => {
+            assert_eq!(*entity, "checkpoint");
+            assert_eq!(id, "TASK-1");
+            assert_eq!(
+                *stored, second.state_version,
+                "the conflict names the winner"
+            );
+            assert_eq!(*caller, first.state_version);
+        }
+        other => panic!("expected a state version conflict, got {other:?}"),
+    }
+
+    // The newer checkpoint stands; the stale writer wrote nothing.
+    let latest = store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the lineage")
+        .expect("the newer checkpoint is still current");
+    assert_eq!(latest.id, CheckpointId::from_string("CHK-2"));
+    assert_eq!(latest.state_version, second.state_version);
+
+    let all = store
+        .checkpoints()
+        .checkpoints_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the full history");
+    assert_eq!(all.len(), 2, "the stale write created no row");
+    assert!(all
+        .iter()
+        .all(|cp| cp.id != CheckpointId::from_string("CHK-3")));
+    assert_eq!(all[0].id, CheckpointId::from_string("CHK-2"));
+    assert_eq!(all[0].status, CheckpointStatus::Current);
+    assert_eq!(all[1].status, CheckpointStatus::Superseded);
+
+    // And the stale writer's checkpoint id is not taken, so a retry can reuse it.
+    let retried = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-3", "TASK-1", "the retried write"),
+            Some(second.state_version),
+        )
+        .await
+        .expect("a re-read and retry lands");
+    assert_eq!(retried.state_version, 3);
+}
+
+/// A duplicate checkpoint id must not be able to wedge the lineage: the insert
+/// fails on the primary key, and because the insert and the supersession share
+/// one transaction the supersession is undone with it. The task is left with its
+/// original current checkpoint, unchanged.
+#[tokio::test]
+async fn a_duplicate_checkpoint_id_rolls_back_the_supersession() {
+    let (store, _path) = store().await;
+    let first = task_with_current_checkpoint(&store).await;
+    assert_eq!(first.status, CheckpointStatus::Current);
+
+    // A caller that reuses the sitting checkpoint's id — a stale id generator, a
+    // retried request that kept its id — passes the gate, supersedes CHK-1, then
+    // collides on the primary key.
+    let err = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-1", "TASK-1", "the duplicate id"),
+            Some(first.state_version),
+        )
+        .await
+        .expect_err("a duplicate id must be rejected");
+
+    // A duplicate id is a constraint violation, not a conflict: this caller is
+    // wrong about the id, not about the version.
+    match &err {
+        StoreError::ConstraintViolation(msg) => {
+            assert!(
+                msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("constraint"),
+                "the message should name the violated constraint: {msg}"
+            );
+        }
+        other => panic!("expected a constraint violation, got {other:?}"),
+    }
+
+    // The rollback: CHK-1 is still current, at its original version, and the
+    // task has exactly one row. The supersession did not survive the failed
+    // insert, so the lineage was not left with no current checkpoint.
+    let still_current = store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the lineage survived")
+        .expect("there is still a current checkpoint");
+    assert_eq!(still_current.id, CheckpointId::from_string("CHK-1"));
+    assert_eq!(still_current.status, CheckpointStatus::Current);
+    assert_eq!(
+        still_current.state_version, first.state_version,
+        "the supersession's version bump was undone"
+    );
+
+    let all = store
+        .checkpoints()
+        .checkpoints_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the full history");
+    assert_eq!(all.len(), 1, "no partial row survived");
+
+    // The lineage is undamaged: a subsequent write against the version it read
+    // still lands at the position it should.
+    let next = store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-2", "TASK-1", "the write after the rollback"),
+            Some(first.state_version),
+        )
+        .await
+        .expect("the lineage is usable");
+    assert_eq!(next.state_version, 2);
+}
+
+/// Two writers that both read the same version, on two pooled connections, so
+/// the gate cannot distinguish them: only one may win, and the other must be
+/// refused rather than left to bury the winner's checkpoint.
+///
+/// This is the race the transaction's read snapshot creates. Both connections
+/// read a current checkpoint at the same version before either writes, so both
+/// pass the gate; SQLite then refuses the loser's write against a snapshot the
+/// winner has already moved past. The test holds the *outcome* the contract
+/// promises — one winner, one refusal, one current checkpoint — rather than
+/// asserting which connection wins, because that is what the store controls.
+#[tokio::test]
+async fn two_concurrent_writers_on_the_same_version_see_one_winner_and_one_conflict() {
+    let (store, dir) = store().await;
+    // `task_with_current_checkpoint` opens the project, the agent, the task, and
+    // the baseline checkpoint. The fixture is shared with the other checkpoint
+    // tests precisely so the setup cannot drift between them.
+    let first = task_with_current_checkpoint(&store).await;
+
+    // A second store is a second connection pool against the same file, which is
+    // how two concurrent tabs or two loop steps actually contend.
+    let other = Store::open(dir.path().join("director.db"))
+        .await
+        .expect("the second store opens the same database");
+
+    // Both read the current version before either writes. This is the snapshot
+    // the gate will see, and it is identical for both.
+    let read_a = store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("read a")
+        .map(|cp| cp.state_version);
+    let read_b = other
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("read b")
+        .map(|cp| cp.state_version);
+    assert_eq!(read_a, read_b, "both writers read the same version");
+
+    // Race them. Exactly one wins; the ordering is not something the test gets to
+    // choose, so it asserts the outcome instead. The repositories and the
+    // checkpoints are bound first because both are borrowed across the await.
+    let cp_a = checkpoint("CHK-A", "TASK-1", "the first writer");
+    let cp_b = checkpoint("CHK-B", "TASK-1", "the second writer");
+    let repo_a = store.checkpoints();
+    let repo_b = other.checkpoints();
+    let (res_a, res_b) = tokio::join!(
+        repo_a.create_checkpoint(&cp_a, read_a),
+        repo_b.create_checkpoint(&cp_b, read_b)
+    );
+
+    // One write landed and one was refused — never both, never neither.
+    let winner = res_a.is_ok();
+    let loser = res_b.is_ok();
+    assert!(
+        winner ^ loser,
+        "exactly one writer must win; got a={:?}, b={:?}",
+        res_a.as_ref().err(),
+        res_b.as_ref().err()
+    );
+
+    // The loser was refused with a conflict, not with a storage error: this is
+    // the case a caller retries, and a mis-categorized failure would hide it.
+    let refused = if winner { &res_b } else { &res_a };
+    match refused {
+        Err(StoreError::StateVersionConflict {
+            entity, id, stored, ..
+        }) => {
+            assert_eq!(*entity, "checkpoint");
+            assert_eq!(id, "TASK-1");
+            assert!(
+                *stored > first.state_version,
+                "the conflict reports the version that won: {stored}"
+            );
+        }
+        Err(other_err) => {
+            panic!("a losing concurrent writer must be a conflict, got {other_err:?}")
+        }
+        Ok(_) => unreachable!("the loser cannot have written"),
+    }
+
+    // Exactly one current checkpoint exists, and it is the winner's. The schema's
+    // partial unique index is what makes this checkable at all.
+    let current = store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the lineage survived the race")
+        .expect("there is exactly one current checkpoint");
+    let winner_id = if winner { "CHK-A" } else { "CHK-B" };
+    assert_eq!(current.id, CheckpointId::from_string(winner_id));
+    assert_eq!(current.state_version, first.state_version + 1);
+
+    // The lineage holds the original checkpoint, marked, plus the winner's.
+    let all = store
+        .checkpoints()
+        .checkpoints_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the full history");
+    assert_eq!(all.len(), 2, "the loser wrote no row");
+    assert!(all
+        .iter()
+        .all(|cp| cp.id != CheckpointId::from_string(if winner { "CHK-B" } else { "CHK-A" })));
+}
+
+/// A checkpoint id that is new to the task but collides with another task's
+/// checkpoint is also a constraint violation, and also leaves nothing written.
+#[tokio::test]
+async fn a_checkpoint_id_from_another_task_is_rejected_and_writes_nothing() {
+    let (store, _path) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .agents()
+        .register_agent(&agent("AGENT-1"))
+        .await
+        .expect("agent");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task");
+    store
+        .tasks()
+        .create_task(&task("TASK-2", "PROJ-1"))
+        .await
+        .expect("second task");
+    store
+        .checkpoints()
+        .create_checkpoint(
+            &checkpoint("CHK-1", "TASK-1", "the first task's checkpoint"),
+            None,
+        )
+        .await
+        .expect("checkpoint for TASK-1");
+
+    // TASK-2 has no checkpoint, so its precondition is honestly `None` — but the
+    // id belongs to TASK-1.
+    let err = store
+        .checkpoints()
+        .create_checkpoint(&checkpoint("CHK-1", "TASK-2", "the borrowed id"), None)
+        .await
+        .expect_err("a borrowed id must be rejected");
+    assert!(matches!(err, StoreError::ConstraintViolation(_)));
+
+    // TASK-2 still has no checkpoint, and TASK-1's is untouched.
+    assert!(store
+        .checkpoints()
+        .latest_checkpoint(&TaskId::from_string("TASK-2"))
+        .await
+        .expect("the lineage")
+        .is_none());
+    assert_eq!(
+        store
+            .checkpoints()
+            .latest_checkpoint(&TaskId::from_string("TASK-1"))
+            .await
+            .expect("the lineage")
+            .expect("TASK-1's checkpoint survived")
+            .id,
+        CheckpointId::from_string("CHK-1")
+    );
 }
 
 // ---------------------------------------------------------------------------

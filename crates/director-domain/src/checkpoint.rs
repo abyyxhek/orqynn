@@ -12,8 +12,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::assignment::AgentAssignment;
+use crate::decision::Decision;
 use crate::ids::{CheckpointId, DecisionId, TaskId};
 use crate::state::{StateComparison, TestResults};
+use crate::store::TaskStatusTransition;
+use crate::verification::Verification;
 
 /// Bumped whenever the checkpoint shape changes in a way a reader must handle.
 ///
@@ -221,12 +225,39 @@ impl Checkpoint {
 
 /// A resumption document: the latest checkpoint for a task plus enough
 /// surrounding context for a new agent to continue (Phase 12).
+///
+/// Every field comes from records Orqyn persists. The checkpoint is the
+/// narrative; the histories around it are the answers to the questions a
+/// replacement actually asks — who held this before me and how did that end,
+/// what has Orqyn already judged about this work, and what did the task's
+/// lifecycle look like. A field that cannot be reconstructed from persisted
+/// state is a field reported as empty, never a field filled with a guess.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContinuationPackage {
     /// The task to resume.
     pub task_id: TaskId,
+    /// The task's state version when the package was built. A replacement that
+    /// writes back presents this version, so its write is refused if anything
+    /// moved the task in between rather than silently clobbering it.
+    pub task_state_version: u64,
     /// The latest checkpoint for that task.
     pub checkpoint: Checkpoint,
+    /// The task's tenure history, newest first. This is what answers "what
+    /// happened to the previous agent" — each entry carries how its tenure
+    /// ended, so a replacement knows whether it is following a clean handoff,
+    /// an expiry, or a failure.
+    pub tenures: Vec<AgentAssignment>,
+    /// The verification history with its evidence, newest first. A replacement
+    /// that does not know what already failed repeats it, so the judgments are
+    /// part of the briefing rather than a query the replacement must remember
+    /// to make.
+    pub verifications: Vec<Verification>,
+    /// The task's lifecycle transitions. The most recent entry is what changed
+    /// last, which is how a replacement reads "what was the previous state".
+    pub transitions: Vec<TaskStatusTransition>,
+    /// Decisions a replacement must honor, so a resumption does not re-litigate
+    /// a question the project already settled.
+    pub decisions: Vec<Decision>,
     /// The bounded activity window.
     pub recent_context: crate::context::RecentContext,
     /// Freshly observed project state.
