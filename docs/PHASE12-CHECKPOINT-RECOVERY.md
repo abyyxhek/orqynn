@@ -1,8 +1,9 @@
 # Phase 12 — Automatic checkpointing and recovery context
 
-> **Status:** implemented in the working tree, **uncommitted**, and currently
-> **not compiling**. See [The unfinished edit](#the-unfinished-edit) before
-> building anything from this document.
+> **Status:** complete and committed. Builds clean and passes the full
+> workspace suite, including the regression tests below. This document was
+> written while the work was in progress; [The finished edit](#the-finished-edit)
+> records how the open question it ends on was resolved.
 
 Phase 11 proved the store alone is enough to brief a replacement agent mid-flight —
 and it proved it the hard way. Its context-continuity test,
@@ -187,31 +188,26 @@ absence cases:
 abandonment, a vanished agent losing its lease to a replacement, rework after failure,
 and context continuity.
 
-## The unfinished edit
+`tests/checkpoint_lineage.rs` pins the regression that motivated deriving checkpoint ids
+from the lineage rather than from a process-local counter. A restarted process holds a
+fresh `IdGenerator` whose counters are back at zero; the old code re-minted `CHK-work-1`
+for a task that already had it and the whole observation round failed on
+`checkpoints.id`'s primary key. The test drives three observations across a simulated
+restart and asserts the lineage keeps advancing (`CHK-work-2`, `CHK-work-1`) instead of
+colliding.
 
-The working tree does not compile. `CheckpointRound` gained a documented `conflicts`
+## The finished edit
+
+While this phase was being written, `CheckpointRound` gained a documented `conflicts`
 field — a round that loses a race for one task's checkpoint lineage should report it and
-keep checkpointing the others, not abort — and the field, the `CheckpointConflict` type,
-its `retry_against()` helper, and the `has_conflicts()` / `conflicted_tasks()` accessors
-all exist and are documented. But `checkpoint_round` still propagates a conflict with `?`
-and omits the field from its constructor, so nothing ever pushes into `conflicts`:
-
-```
-error[E0063]: missing field `conflicts` in initializer of `CheckpointRound`
-  --> crates/director-app/src/checkpoint.rs:527
-```
-
-The completion is small and the shape is already dictated by the existing types. In
-`checkpoint_round`, around the `create_checkpoint` call: catch
-`StoreError::StateVersionConflict { stored, caller, .. }` per task, push a
-`CheckpointConflict { task_id: task.id.clone(), stored, caller }`, `continue`, convert
-any other error with `.into()`, and include `conflicts` in the returned `CheckpointRound`.
-`CheckpointError::Conflict` in `director-app::lib.rs` is the variant this replaces —
-observe already maps it to `ObserveError::Checkpointing`, so once the round collects
-instead of propagating, a caller learns about a lost race through the round's report
-rather than through a failed round.
-
-`retry_against()` carries the cure with the complaint: `stored` is the version the store
+keep checkpointing the others, not abort. The shape it dictated is the shape that shipped:
+`checkpoint_round` catches the lineage conflict per task via
+`CheckpointWrite::Conflict`, pushes the `CheckpointConflict` into the round's `conflicts`
+list, and continues with the remaining tasks, rather than propagating the error and losing
+every other task's checkpoint in the round. `retry_against()` carries the cure with the
+complaint: `stored` is the version the store reported when it refused, so a caller that
+re-derives its checkpoint and presents that version writes at the next lineage position
+rather than conflicting a second time.
 reported when it refused, so a caller that re-derives its checkpoint and presents that
 version writes at the next lineage position rather than conflicting a second time.
 
