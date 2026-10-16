@@ -297,6 +297,25 @@ pub fn validate_assignment(
         });
     }
 
+    // Phase 13: the ground this task declares must be free. Every *other* task
+    // currently in flight is a holder of some region of the tree; if this task's
+    // scope reaches into one of them, handing it out starts two agents editing
+    // the same files, which is the collision this step exists to refuse.
+    //
+    // `plan_tasks` is the live list this function was handed, read fresh by
+    // `assign_at` on every call — so a task that started after planning was
+    // checked for but is visible here, and nothing is assumed from an earlier
+    // round. Only `in_progress` work holds ground: `todo` work holds nothing,
+    // and terminal work is over.
+    if let Some(overlap) = scope_holder(task, plan_tasks) {
+        return Err(AssignError::ScopeConflict {
+            task: task.id.clone(),
+            holder: overlap.0,
+            overlap: overlap.1.describe(),
+            undeclared: overlap.1.undeclared,
+        });
+    }
+
     // The agent has to be able to take the work. An agent that is busy, stale,
     // or gone is not available, and one that lacks a required capability is
     // being set up to fail.
@@ -320,6 +339,29 @@ pub fn validate_assignment(
     }
 
     Ok(())
+}
+
+/// The first in-flight task whose declared scope overlaps `task`'s, and why.
+///
+/// Returns the holder and the overlap together so the refusal names both the
+/// task in the way and the ground the two share — "cannot assign" is not
+/// actionable, and a caller that can see the paths can fix the plan instead of
+/// guessing.
+///
+/// The search is in `plan_tasks` order, so when two in-flight tasks both
+/// collide the one reported is deterministic rather than whichever the store
+/// happened to return first.
+fn scope_holder(
+    task: &Task,
+    plan_tasks: &[Task],
+) -> Option<(TaskId, director_domain::task::ScopeOverlap)> {
+    plan_tasks
+        .iter()
+        .filter(|other| other.status == TaskStatus::InProgress)
+        .find_map(|other| {
+            task.scope_overlap(other)
+                .map(|overlap| (other.id.clone(), overlap))
+        })
 }
 
 #[cfg(test)]

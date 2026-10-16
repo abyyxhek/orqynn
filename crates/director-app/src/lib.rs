@@ -294,6 +294,28 @@ pub enum AssignError {
         unmet: Vec<TaskId>,
     },
 
+    /// The task may only start once the ground it declares is free.
+    ///
+    /// Two tasks whose scopes overlap must not be in flight together: the second
+    /// would edit files the first is holding, and the merge that follows is
+    /// exactly the failure Orqynn exists to prevent. This check runs against the
+    /// tasks' **current** state, re-read from the store on every call, so a task
+    /// that became `in_progress` after planning is caught rather than assumed
+    /// away.
+    #[error("task {task} conflicts with in-flight task {holder}: {overlap}")]
+    ScopeConflict {
+        /// The task the caller tried to hand out.
+        task: TaskId,
+        /// The task already holding overlapping ground.
+        holder: TaskId,
+        /// The overlapping scopes, as the two tasks declared them.
+        overlap: String,
+        /// True when a task declared no usable scope, so the overlap is total
+        /// rather than located at named paths. Declaring disjoint scopes is the
+        /// only fix; there is nothing to narrow.
+        undeclared: bool,
+    },
+
     /// The agent cannot take work right now — busy, stale, disconnected, or
     /// offline.
     #[error("agent {agent} cannot accept work (status: {status:?})")]

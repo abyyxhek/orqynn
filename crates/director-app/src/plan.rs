@@ -117,6 +117,11 @@ pub struct TaskSpec {
     pub priority: Option<Priority>,
     /// Rough size, for load balancing.
     pub complexity: Complexity,
+    /// What this task may touch, in the caller's own path spelling. Empty means
+    /// the scope is *undeclared*, which Orqynn treats as "may touch anything"
+    /// rather than "touches nothing" — see [`director_domain::task::Task::scope_overlap`].
+    /// Declaring disjoint scopes is what lets two tasks run at once.
+    pub scope_paths: Vec<String>,
 }
 
 impl TaskSpec {
@@ -131,12 +136,34 @@ impl TaskSpec {
             expected_outputs: vec![],
             priority: None,
             complexity: Complexity::Unknown,
+            scope_paths: vec![],
         }
     }
 
     /// Declare that this task depends on `dep`. Chainable.
     pub fn depends_on(mut self, dep: TaskId) -> Self {
         self.depends_on.push(dep);
+        self
+    }
+
+    /// Declare what this task may touch. Chainable.
+    ///
+    /// This is the only way a scope reaches a planned task, and it matters more
+    /// than its size suggests: a planned task with no declared scope is treated
+    /// by SCHEDULE and ASSIGN as unrestricted, so it will not be run beside
+    /// anything else. Two tasks may share a round only when both declared
+    /// disjoint scopes.
+    ///
+    /// Paths are recorded as written and compared after normalization, so
+    /// `src\auth`, `./src/auth/`, and `src/x/../auth` are all the same scope.
+    /// Use paths relative to the project root; an absolute path is accepted and
+    /// compared conservatively against relative ones.
+    pub fn scopes<I, S>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.scope_paths.extend(paths.into_iter().map(Into::into));
         self
     }
 
@@ -280,6 +307,10 @@ pub async fn plan_at(
             task.expected_outputs = spec.expected_outputs.clone();
             task.priority = spec.priority;
             task.complexity = spec.complexity;
+            // Phase 13: the declared scope has to survive planning, or ASSIGN
+            // and SCHEDULE have nothing to compare and every planned task
+            // reads as unrestricted.
+            task.scope_paths = spec.scope_paths.clone();
             task.created_at = now;
             task.updated_at = now;
             task

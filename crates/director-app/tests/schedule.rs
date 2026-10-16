@@ -69,6 +69,7 @@ impl Fixture {
                 );
                 task.status = TaskStatus::Todo;
                 task.required_capabilities = spec.capabilities.clone();
+                task.scope_paths = vec![scoped(spec.id)];
                 task
             })
             .collect();
@@ -158,6 +159,17 @@ struct TestTask {
     id: &'static str,
     objective: &'static str,
     capabilities: Vec<Capability>,
+}
+
+/// Every fixture task declares a scope derived from its id, so two fixtures in
+/// one round are disjoint by construction and may be handed out together.
+///
+/// That is not a convenience. Phase 13 treats an *undeclared* scope as
+/// unrestricted, so two unscoped tasks would be refused as conflicting and a
+/// test about pairing two tasks with two agents could never reach the pairing
+/// logic. Declaring the scope is what these tests mean to say.
+fn scoped(id: &'static str) -> String {
+    format!("src/{id}/")
 }
 
 fn task(id: &'static str) -> TestTask {

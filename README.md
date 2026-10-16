@@ -7,8 +7,8 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20%2F%20MCP%20Boundary-purple.svg?style=for-the-badge)](docs/PHASE0-FORENSICS.md)
-[![Tests](https://img.shields.io/badge/Tests-608%20Passed-brightgreen.svg?style=for-the-badge)](tests/)
-[![Status](https://img.shields.io/badge/Status-Phases%201--3%2C%205--7%2C%2010--12%20Complete-success.svg?style=for-the-badge)](docs/)
+[![Tests](https://img.shields.io/badge/Tests-641%20Passed-brightgreen.svg?style=for-the-badge)](tests/)
+[![Status](https://img.shields.io/badge/Status-Phases%201--3%2C%205--7%2C%2010--13%20Complete-success.svg?style=for-the-badge)](docs/)
 
 **A vendor-independent orchestration brain for multi-agent software engineering.**
 
@@ -124,6 +124,15 @@ A replacement agent picks up in-flight work from a checkpoint, and that checkpoi
 - Quiet rounds write nothing. A checkpoint that merely restates the previous one is detected (`restates_current`) and skipped, so the per-task recovery lineage carries one entry per genuine advance instead of noise.
 - Checkpoint ids advance with the lineage rather than with a process-local counter, so a restarted Orqyn cannot re-mint an id the lineage already used and abort its first observation round on a primary-key collision.
 - SQLite is authoritative; publishing a checkpoint to semantic memory that fails or times out is reported as a gap, not an error.
+
+### 8. Two Agents Never Hold the Same Ground
+Every task declares what it may touch, and no two tasks with overlapping scope are in flight at once.
+- Each task's `scope_paths` are normalized before comparison: separators unified, `.` and `..` resolved, empty segments dropped, `\` accepted. `src\auth`, `./src/auth/`, and `src/x/../auth` are one scope.
+- Two scopes overlap when one is a **path prefix** of the other, so a parent directory covers what is inside it and `/` — the repository root — covers the whole tree.
+- **An empty scope means undeclared, not empty.** A task that says nothing about what it may touch is treated as unrestricted, because reading an empty list as "safe beside anything" would make the default task silently unsafe. The cost is honest: declaring disjoint scopes is what buys concurrency.
+- SCHEDULE refuses a pairing whose ground another task in the same round already took; ASSIGN refuses the handoff against any task already `in_progress`, re-read from the store on every call so a task that started after planning is caught.
+- A refusal is structured and names both the task in the way and the paths in dispute — `AssignError::ScopeConflict`, or `UnassignedReason::ScopeConflict` for contention within a round. Nothing is written, and the task stays `todo`.
+- Comparison is case-sensitive on every platform, so the same plan yields the same assignments on Linux, macOS, and Windows. See [`docs/PHASE13-CONFLICT-DETECTION.md`](docs/PHASE13-CONFLICT-DETECTION.md) for the full semantics and the known limitation this creates on a case-insensitive filesystem.
 
 ---
 
@@ -246,7 +255,7 @@ cd orqynn
 # Build all workspace crates
 cargo build
 
-# Run the complete test suite (608 tests)
+# Run the complete test suite (641 tests)
 cargo test --workspace
 ```
 
@@ -438,7 +447,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | **10** | **Verification Engine** | Machine-checkable probe runner (`Probe::Command`), exit-code analysis, append-only history. | ✅ Complete |
 | **11** | **Runtime & Recovery Validation** | Integration test suite proving crash survival, rebase tolerance, and replacement agent briefings. | ✅ Complete |
 | **12** | **Checkpointing & Recovery Context** | `checkpoint::checkpoint_round` derives evidence-backed checkpoints inside OBSERVE; `recovery::RecoveryBuilder` assembles a replacement agent's continuation package in one place, and SCHEDULE attaches it. | ✅ Complete |
-| **13** | **Deterministic Conflict Detection** | Use task `scope_paths` so two agents told to touch disjoint trees cannot collide on the same files, with collisions detected rather than hoped away. | 🔄 Planned |
+| **13** | **Deterministic Conflict Detection** | Normalized `scope_paths` compared as path prefixes; SCHEDULE refuses overlapping pairings and ASSIGN refuses the handoff, naming the task in the way and the ground in dispute. An undeclared scope is treated as unrestricted, not empty. | ✅ Complete |
 
 ---
 
@@ -457,6 +466,7 @@ Comprehensive design specifications and architectural reports are available in t
 - [📄 PHASE10-ENGINE.md](docs/PHASE10-ENGINE.md) — Probe resolution, evidence gathering, and verification recording.
 - [📄 PHASE11-RUNTIME-RECOVERY.md](docs/PHASE11-RUNTIME-RECOVERY.md) — Crash resilience and agent briefing recovery proofs.
 - [📄 PHASE12-CHECKPOINT-RECOVERY.md](docs/PHASE12-CHECKPOINT-RECOVERY.md) — Automatic checkpointing inside OBSERVE and the recovery context SCHEDULE hands a replacement.
+- [📄 PHASE13-CONFLICT-DETECTION.md](docs/PHASE13-CONFLICT-DETECTION.md) — Scope normalization, the undeclared-scope rule, and where overlapping work is refused.
 
 ---
 

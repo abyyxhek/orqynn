@@ -159,8 +159,33 @@ pub async fn schedule_at(
     // would both be proposed to the same agent and the second would be refused
     // by `assign` instead of reported cleanly.
     let mut committed: HashSet<AgentId> = HashSet::new();
+    // The tasks this round has already handed out, watched for scope overlap as
+    // the round proceeds. The store cannot do this check for us: the assignments
+    // exist, but `assign_at` only ever compares one task against what is
+    // already `in_progress` when it is called, and two tasks in the same round
+    // reach it as fast as the loop turns. Without this, two agents would be
+    // handed overlapping ground in a single tick — the exact collision Phase 13
+    // exists to refuse.
+    let mut committed_scopes: Vec<Task> = Vec::new();
 
     for task in &ready {
+        // 0. Before anything else: does this task's ground have already gone to
+        //    someone in this round? Checked first so a conflict is reported as a
+        //    conflict rather than arriving as an ASSIGN refusal further down,
+        //    where a caller would have to know to look for it.
+        if let Some(holder) = committed_scopes
+            .iter()
+            .find(|other| task.scope_overlap(other).is_some())
+        {
+            report.unassigned.push(Unassigned {
+                task_id: task.id.clone(),
+                reason: UnassignedReason::ScopeConflict {
+                    holder: holder.id.clone(),
+                },
+            });
+            continue;
+        }
+
         // 3. Who has already tried this task, so the policy can prefer an agent
         //    who has not. Read per task, because it is only the history *of this
         //    task* that matters.
@@ -202,6 +227,7 @@ pub async fn schedule_at(
         match assign::assign_at(store, request, now).await {
             Ok(assigned) => {
                 committed.insert(agent_id.clone());
+                committed_scopes.push(assigned.task);
                 report.assigned.push(Scheduled {
                     task_id: task.id.clone(),
                     agent_id,
@@ -329,10 +355,15 @@ impl ScheduleReport {
     }
 
     /// The ready work the round could not pair, with why.
+    ///
+    /// The reason is yielded by value, cloned out of the report. Three of the
+    /// four variants are unit-sized and free to copy; only
+    /// [`UnassignedReason::ScopeConflict`] carries an id, and that clone only
+    /// happens when there is a real conflict to report.
     pub fn unassigned(&self) -> impl Iterator<Item = (&TaskId, UnassignedReason)> {
         self.unassigned
             .iter()
-            .map(|unassigned| (&unassigned.task_id, unassigned.reason))
+            .map(|unassigned| (&unassigned.task_id, unassigned.reason.clone()))
     }
 
     /// True if the round handed out every ready task it surveyed.
@@ -387,7 +418,11 @@ pub struct Unassigned {
 }
 
 /// Why a ready task was left without an agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No `Copy`: [`Self::ScopeConflict`] names the task holding the ground, and an
+/// id is not a `Copy` type. It is `Clone` so a caller can keep the reason after
+/// moving it out of the report.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnassignedReason {
     /// Orqyn's registry is empty, so nothing can be handed out at all.
     NoAgentsAtAll,
@@ -399,6 +434,14 @@ pub enum UnassignedReason {
     /// the same round. Contention, not a shortage — the next round may find the
     /// agent free again.
     AgentTakenEarlier,
+    /// Another task already handed out this round declares a scope that overlaps
+    /// this one's, so handing it out now would put two agents on the same files.
+    /// Contention rather than a shortage: the holder finishes, and a later round
+    /// finds the ground free. Declaring disjoint scopes removes it.
+    ScopeConflict {
+        /// The task already holding the overlapping ground.
+        holder: TaskId,
+    },
 }
 
 #[cfg(test)]
