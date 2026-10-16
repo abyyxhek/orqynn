@@ -63,6 +63,7 @@ use director_app::assign::{assign_at, AssignRequest};
 use director_app::plan::{PlanRequest, TaskSpec};
 use director_app::AssignError;
 use director_domain::agent::{Agent, AgentStatus, Harness};
+use director_domain::assignment::AgentAssignment;
 use director_domain::capability::Capability;
 use director_domain::ids::{AgentId, AssignmentId, MachineId, PlanId, ProjectId, TaskId};
 use director_domain::project::Project;
@@ -160,6 +161,45 @@ impl Fixture {
             .await
             .expect("assignment lookup works")
             .map(|assignment| assignment.agent_id.to_string())
+    }
+
+    /// Hand a task to an agent **and start it**, through `assign_and_start`.
+    ///
+    /// The ids are bound to locals inside so a caller can pass this into
+    /// `tokio::join!` or `in_parallel` without a temporary outliving the borrow.
+    async fn handoff(
+        &self,
+        store: &Store,
+        task: &str,
+        agent: &AgentId,
+        assignment: &str,
+    ) -> Result<(AgentAssignment, Task, Option<AgentId>), StoreError> {
+        let task_id = TaskId::from_string(task);
+        let assignment_id = AssignmentId::from_string(assignment);
+        store
+            .assign_and_start(&task_id, agent, &assignment_id, now())
+            .await
+    }
+
+    /// Hand a task to an agent through `assign_task`, which records the
+    /// assignment but leaves the task `todo`.
+    ///
+    /// A deliberately different path from [`Fixture::handoff`]: this one has no
+    /// production caller in the loop, and it is the reason these tests exist —
+    /// two ways of handing out a task must not disagree about whether
+    /// overlapping ground may be held twice.
+    async fn assign_only(
+        &self,
+        store: &Store,
+        task: &str,
+        agent: &AgentId,
+        assignment: &str,
+    ) -> Result<AgentAssignment, StoreError> {
+        let task_id = TaskId::from_string(task);
+        let assignment_id = AssignmentId::from_string(assignment);
+        store
+            .assign_task(&task_id, agent, &assignment_id, now())
+            .await
     }
 }
 
@@ -659,4 +699,331 @@ async fn the_conflict_mapping_does_not_disguise_other_store_errors() {
         | AssignError::ScopeConflict { .. } => {}
         other => panic!("expected a legality refusal, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The `assign_task` path
+// ---------------------------------------------------------------------------
+//
+// `Store::assign_task` records an assignment but leaves the task `todo`, and it
+// has no caller in the loop. It is still a public API with its own test suite in
+// `director-store`, so it was not dead code — which made it a real bypass: two
+// ways of handing out a task that disagreed about whether overlapping ground may
+// be held twice would make the invariant depend on which method a caller reached
+// for.
+//
+// It now runs the same guard, through the same `guard_scope`, under the same
+// `IMMEDIATE` transaction.
+//
+// One semantic is worth stating because it looks like a hole and is not:
+// `assign_task` does not start the task, so the task it assigns is still `todo`,
+// and only `in_progress` work holds ground. Two `assign_task` calls on
+// overlapping tasks therefore both succeed — neither is holding anything yet.
+// The invariant still holds at the moment it matters: starting either task goes
+// through `assign_and_start`, whose guard then refuses the other. The tests below
+// pin that escalation rather than leaving it to be discovered.
+
+#[tokio::test]
+async fn assign_task_refuses_a_scope_that_in_flight_work_already_holds() {
+    let fixture = Fixture::new().await;
+    fixture
+        .plan(vec![
+            scoped("AUTH", "src/auth"),
+            scoped("API", "src/auth/login.rs"),
+        ])
+        .await;
+    let auth_agent = fixture.agent("AGENT-1").await;
+    let api_agent = fixture.agent("AGENT-2").await;
+
+    // Take the ground with the production path, which starts the task.
+    fixture
+        .handoff(&fixture.store, "AUTH", &auth_agent, "ASG-1")
+        .await
+        .expect("the first handoff succeeds");
+
+    let refused = fixture
+        .assign_only(&fixture.store, "API", &api_agent, "ASG-2")
+        .await;
+
+    match refused {
+        Err(StoreError::ScopeConflict {
+            task,
+            holder,
+            undeclared,
+            ..
+        }) => {
+            assert_eq!(task.as_str(), "API");
+            assert_eq!(
+                holder.as_str(),
+                "AUTH",
+                "the refusal names the task actually holding the ground"
+            );
+            assert!(!undeclared, "both scopes were declared, so this is located");
+        }
+        other => panic!("expected a structured scope conflict, got {other:?}"),
+    }
+
+    // Nothing partial: the loser was never assigned and never started.
+    assert!(
+        fixture.active_holder("API").await.is_none(),
+        "the rejected handoff wrote no assignment row"
+    );
+    assert_eq!(
+        fixture.reload("API").await.status,
+        TaskStatus::Todo,
+        "and never moved the task"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .agents()
+            .get_agent(&api_agent)
+            .await
+            .expect("agent reads")
+            .current_task,
+        None,
+        "the refused agent was left free rather than marked as working"
+    );
+}
+
+/// The counterweight: the guard must not over-refuse through this path either.
+/// Disjoint ground beside in-flight work is exactly what parallel work means.
+#[tokio::test]
+async fn assign_task_allows_a_disjoint_scope_beside_in_flight_work() {
+    let fixture = Fixture::new().await;
+    fixture
+        .plan(vec![
+            scoped("AUTH", "src/auth"),
+            scoped("BILLING", "src/billing"),
+        ])
+        .await;
+    let auth_agent = fixture.agent("AGENT-1").await;
+    let billing_agent = fixture.agent("AGENT-2").await;
+
+    fixture
+        .handoff(&fixture.store, "AUTH", &auth_agent, "ASG-1")
+        .await
+        .expect("the first handoff succeeds");
+
+    fixture
+        .assign_only(&fixture.store, "BILLING", &billing_agent, "ASG-2")
+        .await
+        .expect("a disjoint scope is not refused through this path either");
+
+    assert_eq!(
+        fixture.active_holder("BILLING").await.as_deref(),
+        Some("AGENT-2")
+    );
+    assert_eq!(
+        fixture.reload("AUTH").await.status,
+        TaskStatus::InProgress,
+        "and the in-flight work is undisturbed"
+    );
+    assert_eq!(
+        fixture.reload("BILLING").await.status,
+        TaskStatus::Todo,
+        "assign_task records the assignment without starting the task, by design"
+    );
+}
+
+/// Undeclared keeps its conservative meaning through this path: it collides with
+/// everything, including work already in flight.
+#[tokio::test]
+async fn an_undeclared_scope_through_assign_task_still_conflicts() {
+    let fixture = Fixture::new().await;
+    fixture
+        .plan(vec![undeclared("AUTH"), undeclared("API")])
+        .await;
+    let auth_agent = fixture.agent("AGENT-1").await;
+    let api_agent = fixture.agent("AGENT-2").await;
+
+    fixture
+        .handoff(&fixture.store, "AUTH", &auth_agent, "ASG-1")
+        .await
+        .expect("the first handoff succeeds");
+
+    let refused = fixture
+        .assign_only(&fixture.store, "API", &api_agent, "ASG-2")
+        .await;
+
+    match refused {
+        Err(StoreError::ScopeConflict { undeclared, .. }) => assert!(
+            undeclared,
+            "the conflict is total rather than located, because API named no ground"
+        ),
+        other => panic!("expected a structured scope conflict, got {other:?}"),
+    }
+}
+
+/// Reassignment of a task that is already in flight is still legal. The guard
+/// excludes the task being assigned, so a task is never judged against its own
+/// ground — otherwise reassignment would be impossible.
+#[tokio::test]
+async fn assign_task_can_still_reassign_a_task_that_is_already_in_flight() {
+    let fixture = Fixture::new().await;
+    fixture.plan(vec![scoped("AUTH", "src/auth")]).await;
+    let auth_agent = fixture.agent("AGENT-1").await;
+    let api_agent = fixture.agent("AGENT-2").await;
+
+    fixture
+        .handoff(&fixture.store, "AUTH", &auth_agent, "ASG-1")
+        .await
+        .expect("the first handoff succeeds");
+
+    fixture
+        .assign_only(&fixture.store, "AUTH", &api_agent, "ASG-2")
+        .await
+        .expect("reassigning a task is not a conflict with itself");
+
+    assert_eq!(
+        fixture.active_holder("AUTH").await.as_deref(),
+        Some("AGENT-2"),
+        "the new agent holds it"
+    );
+    let history = fixture
+        .store
+        .assignments()
+        .assignment_history(&TaskId::from_string("AUTH"))
+        .await
+        .expect("history reads");
+    assert_eq!(
+        history.len(),
+        2,
+        "the displaced tenure is retained, so 'who had this and why' stays answerable"
+    );
+}
+
+/// The invariant under real contention on this path: two independent
+/// connection pools, both reaching for the same ground, both refused — and refused
+/// with a scope conflict rather than a SQLite lock error.
+#[tokio::test]
+async fn concurrent_assign_task_handoffs_are_both_refused_with_a_structured_conflict() {
+    let fixture = Fixture::new().await;
+    fixture
+        .plan(vec![
+            scoped("HOLDER", "src/race"),
+            scoped("B1", "src/race/one"),
+            scoped("B2", "src/race/one/two"),
+        ])
+        .await;
+    let holder_agent = fixture.agent("AGENT-H").await;
+    let b1_agent = fixture.agent("AGENT-1").await;
+    let b2_agent = fixture.agent("AGENT-2").await;
+
+    fixture
+        .handoff(&fixture.store, "HOLDER", &holder_agent, "ASG-H")
+        .await
+        .expect("the holder takes the ground");
+
+    let (first, second) = in_parallel(
+        || run(fixture.assign_only(&fixture.store, "B1", &b1_agent, "ASG-1")),
+        || run(fixture.assign_only(&fixture.other, "B2", &b2_agent, "ASG-2")),
+    );
+
+    // Both lose, because the holder already owns the ground they reach for. What
+    // matters is *how* they lose: a structured refusal, not contention.
+    for result in [first, second] {
+        match result {
+            Err(StoreError::ScopeConflict { .. }) => {}
+            Err(other) => {
+                panic!("expected a scope conflict, not an unexplained failure: {other:?}")
+            }
+            Ok(_) => panic!("a task overlapping in-flight ground was assigned anyway"),
+        }
+    }
+
+    assert!(fixture.active_holder("B1").await.is_none());
+    assert!(fixture.active_holder("B2").await.is_none());
+    assert_eq!(
+        fixture.active_holder("HOLDER").await.as_deref(),
+        Some("AGENT-H"),
+        "the holder is undisturbed by two refused attempts"
+    );
+}
+
+/// And the contention control: disjoint ground on this path, from two independent
+/// pools, both succeed. Without this, a test proving "both refused" would also
+/// pass if the guard simply refused everything.
+#[tokio::test]
+async fn concurrent_assign_task_handoffs_of_disjoint_scopes_both_succeed() {
+    let fixture = Fixture::new().await;
+    fixture
+        .plan(vec![
+            scoped("HOLDER", "src/race"),
+            scoped("B1", "src/one"),
+            scoped("B2", "src/two"),
+        ])
+        .await;
+    let holder_agent = fixture.agent("AGENT-H").await;
+    let b1_agent = fixture.agent("AGENT-1").await;
+    let b2_agent = fixture.agent("AGENT-2").await;
+
+    fixture
+        .handoff(&fixture.store, "HOLDER", &holder_agent, "ASG-H")
+        .await
+        .expect("the holder takes the ground");
+
+    let (first, second) = in_parallel(
+        || run(fixture.assign_only(&fixture.store, "B1", &b1_agent, "ASG-1")),
+        || run(fixture.assign_only(&fixture.other, "B2", &b2_agent, "ASG-2")),
+    );
+
+    let (winners, failures) = partition([first, second]);
+    assert!(
+        failures.is_empty(),
+        "disjoint scopes are not refused: {failures:?}"
+    );
+    assert_eq!(winners, 2, "both agents get their own ground");
+    assert_eq!(
+        fixture.active_holder("B1").await.as_deref(),
+        Some("AGENT-1")
+    );
+    assert_eq!(
+        fixture.active_holder("B2").await.as_deref(),
+        Some("AGENT-2")
+    );
+}
+
+/// The escalation, pinned rather than left to be discovered: two `assign_task`
+/// calls on overlapping tasks both succeed, because neither starts its task and
+/// `todo` work holds no ground. Starting either one then refuses the other,
+/// because by then the winner is `in_progress` and does hold ground.
+#[tokio::test]
+async fn two_assigned_but_unstarted_tasks_still_cannot_both_be_started() {
+    let fixture = Fixture::new().await;
+    fixture
+        .plan(vec![
+            scoped("B1", "src/race/one"),
+            scoped("B2", "src/race/one/two"),
+        ])
+        .await;
+    let b1_agent = fixture.agent("AGENT-1").await;
+    let b2_agent = fixture.agent("AGENT-2").await;
+
+    // Neither is in progress, so neither holds ground: both assignments land.
+    fixture
+        .assign_only(&fixture.store, "B1", &b1_agent, "ASG-1")
+        .await
+        .expect("B1 is assigned");
+    fixture
+        .assign_only(&fixture.store, "B2", &b2_agent, "ASG-2")
+        .await
+        .expect("B2 is assigned");
+    assert_eq!(fixture.reload("B1").await.status, TaskStatus::Todo);
+    assert_eq!(fixture.reload("B2").await.status, TaskStatus::Todo);
+
+    // Starting B1 makes it hold ground; starting B2 then collides with it.
+    fixture
+        .handoff(&fixture.store, "B1", &b1_agent, "ASG-3")
+        .await
+        .expect("B1 starts");
+    assert_eq!(fixture.reload("B1").await.status, TaskStatus::InProgress);
+
+    let refused = fixture
+        .handoff(&fixture.store, "B2", &b2_agent, "ASG-4")
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::ScopeConflict { .. })),
+        "the invariant still bites when the work actually starts, got {refused:?}"
+    );
 }

@@ -299,6 +299,56 @@ fn assignment_row(
     }
 }
 
+/// The authoritative scope guard: refuse a handoff whose task's declared scope
+/// overlaps ground some `in_progress` task already holds.
+///
+/// Must be called **inside** a transaction that took the write lock before
+/// reading, so the state it reads cannot change underneath it. A guard run in a
+/// deferred transaction — or outside a transaction at all — reads a snapshot
+/// taken before any competing writer committed, and two handoffs of overlapping
+/// tasks then each see "nothing in flight" and both commit.
+///
+/// The comparison itself is the domain's [`Task::scope_overlap`], not a
+/// reimplementation, so this guard and the application layer's optimistic
+/// pre-check cannot disagree about what counts as a conflict. Only `in_progress`
+/// work holds ground: `todo` work holds nothing and terminal work is over.
+///
+/// Self is excluded, so reassigning a task that is already in flight is judged
+/// against *other* tasks' ground and not against its own. A task with no project
+/// has nothing to compare against — scope conflict is defined between tasks of
+/// one project, because one project is one repository root — so the guard defers
+/// to the caller's own checks for it.
+///
+/// Runs before any write, so a refusal rolls the transaction back with nothing
+/// written: the task stays `todo` and still handable.
+fn guard_scope(tx: &rusqlite::Transaction<'_>, task_id: &TaskId) -> Result<(), StoreError> {
+    let this_task = crate::tasks::load_task(tx, task_id)?;
+    let Some(project) = this_task.project_id.clone() else {
+        return Ok(());
+    };
+    let in_flight = crate::tasks::in_progress_tasks_for_project(tx, &project)?;
+    // Same rule and same order as the application layer's `scope_holder`: only
+    // `in_progress` work holds ground, and the reported holder is the first
+    // colliding task rather than whichever row happened to come back.
+    let conflict = in_flight
+        .iter()
+        .filter(|other| other.id != this_task.id)
+        .find_map(|other| {
+            this_task
+                .scope_overlap(other)
+                .map(|overlap| (other, overlap))
+        });
+    let Some((holder, overlap)) = conflict else {
+        return Ok(());
+    };
+    Err(StoreError::ScopeConflict {
+        task: this_task.id.clone(),
+        holder: holder.id.clone(),
+        overlap: overlap.describe(),
+        undeclared: overlap.undeclared,
+    })
+}
+
 /// The atomic assignment operation: release any sitting tenant, insert the new
 /// assignment as active, and move the agent's `current_task` view — one
 /// transaction, all or nothing.
@@ -307,6 +357,16 @@ fn assignment_row(
 /// `create_assignment` inserts a row in any status (a `Proposed` assignment
 /// that is not yet acknowledged); this is the operation that actually hands the
 /// task to an agent.
+///
+/// Enforces the same scope invariant as [`assign_and_start`], through the same
+/// [`guard_scope`], and under the same `IMMEDIATE` transaction. Two ways of
+/// handing a task to an agent that disagreed about whether overlapping ground may
+/// be held twice would make the invariant depend on which method a caller reached
+/// for, so there is only one rule and both paths run it.
+///
+/// Note what this path does *not* do: it leaves the task `todo`. Only
+/// `in_progress` work holds ground, so a task assigned this way is not yet
+/// holding any — and the guard treats it accordingly.
 pub async fn assign_task(
     pool: &crate::connection::ConnectionPool,
     task_id: &TaskId,
@@ -315,7 +375,13 @@ pub async fn assign_task(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<AgentAssignment, StoreError> {
     let mut conn = pool.get();
-    let tx = conn.transaction().map_err(translate_error)?;
+    // `IMMEDIATE`, for the same reason as `assign_and_start`: the guard below
+    // reads authoritative state and the writes that follow are decided from that
+    // read, so the write lock has to be taken before the read, not after.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(translate_error)?;
+    guard_scope(&tx, task_id)?;
     handoff(&tx, task_id, agent_id, assignment_id, now)?;
     tx.commit().map_err(translate_error)?;
 
@@ -375,50 +441,15 @@ pub async fn assign_and_start(
         .transpose()?;
 
     // The authoritative scope guard, inside the write-locked transaction and
-    // immediately before the write it can veto.
+    // immediately before the write it can veto. Shared with `assign_task` through
+    // `guard_scope`, so both paths enforce one rule rather than two that can
+    // drift apart.
     //
-    // The application layer already ran this rule before calling - that check is
+    // The application layer already ran this check before calling - that check is
     // pure and cheap, and refusing before paying for a write is worth it - but it
     // read that state before this transaction opened, so it may be stale. This is
-    // the check that decides. It reads the task and the project's in-flight work
-    // through the transaction, so it sees every commit that preceded it and
-    // nothing that follows.
-    //
-    // A task with no project has nothing to compare against: scope conflict is
-    // defined between tasks of one project, because one project is one
-    // repository root. Such a task is guarded by the caller's own checks.
-    let this_task = crate::tasks::load_task(&tx, task_id)?;
-    if let Some(project) = this_task.project_id.clone() {
-        let in_flight = crate::tasks::in_progress_tasks_for_project(&tx, &project)?;
-        // Same rule and same order as the application layer's `scope_holder`: only
-        // `in_progress` work holds ground, and the reported holder is the first
-        // colliding task rather than whichever row happened to come back. The
-        // comparison itself is the domain's `Task::scope_overlap`, not a
-        // reimplementation, so the two halves cannot disagree about what counts
-        // as a conflict.
-        if let Some((holder, overlap)) = in_flight
-            .iter()
-            // A task never conflicts with itself, but the filter is explicit so
-            // the exclusion is visible here rather than resting on the domain
-            // method alone.
-            .filter(|other| other.id != this_task.id)
-            .find_map(|other| {
-                this_task
-                    .scope_overlap(other)
-                    .map(|overlap| (other, overlap))
-            })
-        {
-            // Returning here drops the transaction, which rolls it back. The
-            // refusal happens before any write, so there is nothing to undo and
-            // the losing task stays `todo` and still handable.
-            return Err(StoreError::ScopeConflict {
-                task: this_task.id.clone(),
-                holder: holder.id.clone(),
-                overlap: overlap.describe(),
-                undeclared: overlap.undeclared,
-            });
-        }
-    }
+    // the check that decides.
+    guard_scope(&tx, task_id)?;
 
     let sitting = handoff(&tx, task_id, agent_id, assignment_id, now)?;
 

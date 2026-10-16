@@ -145,6 +145,12 @@ const CHILD_ASSIGNMENT: &str = "ORQYNN_PROCESS_KILL_ASSIGNMENT";
 const CHILD_RESULT: &str = "ORQYNN_PROCESS_KILL_RESULT";
 const CHILD_GATE: &str = "ORQYNN_PROCESS_KILL_GATE";
 
+/// Which assignment path an `assign` child uses: the loop's `assign_and_start`,
+/// or the public `assign_task` that records a handoff without starting the task.
+const CHILD_OPERATION: &str = "ORQYNN_PROCESS_KILL_OPERATION";
+const OPERATION_START: &str = "assign_and_start";
+const OPERATION_ASSIGN_ONLY: &str = "assign_task";
+
 /// How long a racing child waits for its partner to reach the rendezvous, and
 /// how long the parent waits for a child to finish.
 const GATE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -248,6 +254,11 @@ fn run_assign_child() {
     let assignment = AssignmentId::from_string(required_env(CHILD_ASSIGNMENT));
     let result_path = PathBuf::from(required_env(CHILD_RESULT));
     let gate_dir = PathBuf::from(required_env(CHILD_GATE));
+    // Which of the two assignment paths this child uses. `assign_and_start` is
+    // the default so the existing cross-process tests are unaffected by this
+    // knob; `assign_task` is the public path that records an assignment without
+    // starting the task, and which must enforce the same invariant.
+    let operation = std::env::var(CHILD_OPERATION).unwrap_or_else(|_| OPERATION_START.to_string());
 
     // Announce arrival, then wait for the partner. If the partner never comes the
     // outcome is recorded as a synchronization failure, so a broken rendezvous can
@@ -271,11 +282,19 @@ fn run_assign_child() {
 
     let outcome = runtime.block_on(async move {
         let store = Store::open(&db).await.expect("the store opens");
-        match store
-            .assign_and_start(&task, &agent, &assignment, stamp(0))
-            .await
-        {
-            Ok(_) => json!({"outcome": "ok"}),
+        let attempt = match operation.as_str() {
+            OPERATION_START => store
+                .assign_and_start(&task, &agent, &assignment, stamp(0))
+                .await
+                .map(|_| ()),
+            OPERATION_ASSIGN_ONLY => store
+                .assign_task(&task, &agent, &assignment, stamp(0))
+                .await
+                .map(|_| ()),
+            other => panic!("unknown child operation {other:?}"),
+        };
+        match attempt {
+            Ok(()) => json!({"outcome": "ok", "operation": operation}),
             Err(StoreError::ScopeConflict {
                 task,
                 holder,
@@ -283,6 +302,7 @@ fn run_assign_child() {
                 undeclared,
             }) => json!({
                 "outcome": "scope_conflict",
+                "operation": operation,
                 "task": task.to_string(),
                 "holder": holder.to_string(),
                 "overlap": overlap,
@@ -292,7 +312,11 @@ fn run_assign_child() {
             // structured refusal from a lock error or a missing row. A child that
             // lost the race should never report this arm; if it does, the test
             // fails loudly rather than quietly counting it as a refusal.
-            Err(other) => json!({"outcome": "other", "error": format!("{other:?}")}),
+            Err(other) => json!({
+                "outcome": "other",
+                "operation": operation,
+                "error": format!("{other:?}"),
+            }),
         }
     });
 
@@ -1126,6 +1150,25 @@ impl RaceHarness {
     /// the assignment id in their marker filename. Giving each its own directory
     /// would mean each waits forever for a partner that can never appear.
     fn start_child(&self, label: &str, task: &str, agent: &str, assignment: &str) -> Child {
+        self.start_child_on(label, task, agent, assignment, OPERATION_START)
+    }
+
+    /// Start one `assign` child on a named assignment path.
+    ///
+    /// Both are spawned before either is waited on, which is what makes them
+    /// concurrent rather than merely adjacent.
+    ///
+    /// Both children rendezvous in the *same* gate directory, distinguished by
+    /// the assignment id in their marker filename. Giving each its own directory
+    /// would mean each waits forever for a partner that can never appear.
+    fn start_child_on(
+        &self,
+        label: &str,
+        task: &str,
+        agent: &str,
+        assignment: &str,
+        operation: &str,
+    ) -> Child {
         let result = self.spare_dir.join(format!("result-{label}.json"));
         let _ = std::fs::remove_file(&result);
 
@@ -1135,8 +1178,42 @@ impl RaceHarness {
             .env(CHILD_AGENT, agent)
             .env(CHILD_ASSIGNMENT, assignment)
             .env(CHILD_RESULT, path_string(&result))
-            .env(CHILD_GATE, path_string(&self.gate_dir));
+            .env(CHILD_GATE, path_string(&self.gate_dir))
+            .env(CHILD_OPERATION, operation);
         command.spawn().expect("the assign child spawns")
+    }
+
+    /// Run one pair of children on the same path and return both outcomes.
+    ///
+    /// The two are started before either is waited on, then each is given the
+    /// timeout so a wedged child is killed rather than hanging the run. A child
+    /// that never met its partner, or that failed outright, fails the test here —
+    /// a broken harness must never be counted as evidence about the guard.
+    fn race_pair(
+        &self,
+        left: (&str, &str, &str, &str),
+        right: (&str, &str, &str, &str),
+        operation: &str,
+    ) -> [Value; 2] {
+        self.reset_gate();
+        let first = self.start_child_on(left.0, left.1, left.2, left.3, operation);
+        let second = self.start_child_on(right.0, right.1, right.2, right.3, operation);
+        let first_status = wait_with_timeout(first, left.0);
+        let second_status = wait_with_timeout(second, right.0);
+        for (label, status) in [(left.0, first_status), (right.0, second_status)] {
+            assert_ne!(
+                status.code(),
+                Some(GATE_TIMEOUT_EXIT_CODE),
+                "the {label} child never met its partner at the rendezvous, so this \
+                 scenario proves nothing about the guard"
+            );
+            assert!(
+                status.success(),
+                "the {label} child exited with {status}; a child that cannot do its job \
+                 is not evidence either way"
+            );
+        }
+        [self.outcome(left.0), self.outcome(right.0)]
     }
 
     /// Clear the rendezvous, so a marker left by an earlier round cannot let a
@@ -1381,6 +1458,234 @@ async fn two_processes_can_both_acquire_disjoint_task_scopes() {
                 .as_deref(),
             Some(agent),
             "{task} is held by {agent} and nobody else"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process scope safety for `Store::assign_task`
+// ---------------------------------------------------------------------------
+//
+// `Store::assign_task` is the public path that records a handoff *without*
+// starting the task. It has no caller in the loop, but it is public and has its
+// own suite in `director-store`, and it now runs the same guard under the same
+// `IMMEDIATE` transaction as `assign_and_start`.
+//
+// The scenario shape is therefore deliberately *not* a copy of the
+// `assign_and_start` race. Two `assign_task` calls on overlapping tasks both
+// succeed, because neither starts its task and only `in_progress` work holds
+// ground — that is the documented Phase 13 rule and this file does not redefine
+// it. So the invariant this test proves is the one that actually applies here:
+// once some task *is* in flight holding ground, no process may hand out
+//   another task whose scope overlaps it, through either path.
+//
+// The holder is seeded by the parent before either child starts, so the
+// contested state is settled and the outcome does not depend on which child
+// happens to arrive first.
+//
+// ## What this proves, and what it does not
+//
+// It proves that the guard **runs** on the `assign_task` path in a separate OS
+// process, that it refuses, and that it refuses *structurally* — the child
+// reports `scope_conflict` naming the holder, never a SQLite lock error.
+//
+// It does **not** prove that `IMMEDIATE` is load-bearing here, and it should not
+// be read as doing so. Reverting `assign_task` to a deferred transaction leaves
+// these tests green, and that is expected: both children are refused by a holder
+// that was already committed before either of them started, so each one's
+// decision depends only on state it could not have missed. The stale-read window
+// `IMMEDIATE` closes requires one caller's write to be visible to the other,
+// and for this path that cannot happen — a task assigned without being started
+// is still `todo`, so it holds no ground for anyone to see.
+//
+// That atomicity is evidenced elsewhere: the in-process tests in
+// `assign_concurrency.rs`, where reverting the transaction mode does fail
+// (`concurrent_assign_task_handoffs_of_disjoint_scopes_both_succeed` fails with
+// `sqlite error 5: database is locked`). Together the two layers cover the guard
+// and the locking separately, which is the honest division of the evidence.
+
+#[tokio::test]
+async fn two_processes_cannot_assign_a_scope_in_flight_work_already_holds() {
+    let fixture = RaceHarness::new().await;
+    let store = Store::open(&fixture.db).await.expect("store opens");
+
+    fixture
+        .plan(
+            &store,
+            "PLAN-RACE",
+            vec![
+                race_task("HOLDER", "src/race"),
+                race_task("B1", "src/race/one"),
+                race_task("B2", "src/race/one/two"),
+            ],
+        )
+        .await;
+    fixture.agent(&store, "AGENT-H").await;
+    fixture.agent(&store, "AGENT-1").await;
+    fixture.agent(&store, "AGENT-2").await;
+
+    // Seed the holder in this process, so the contested state is settled before
+    // either child starts and the race is purely about the two attempts.
+    store
+        .assign_and_start(
+            &TaskId::from_string("HOLDER"),
+            &AgentId::from_string("AGENT-H"),
+            &AssignmentId::from_string("ASG-H"),
+            stamp(0),
+        )
+        .await
+        .expect("the holder takes the ground and starts");
+
+    let outcomes = fixture.race_pair(
+        ("a", "B1", "AGENT-1", "ASG-1"),
+        ("b", "B2", "AGENT-2", "ASG-2"),
+        OPERATION_ASSIGN_ONLY,
+    );
+
+    for outcome in &outcomes {
+        assert_eq!(
+            outcome["operation"], OPERATION_ASSIGN_ONLY,
+            "the child really used the assign_task path"
+        );
+        match outcome["outcome"].as_str() {
+            Some("scope_conflict") => {}
+            Some("other") => panic!(
+                "a process was refused with something other than a scope conflict: {}",
+                outcome["error"]
+            ),
+            other => panic!("expected a structured scope conflict, got {other:?}"),
+        }
+    }
+
+    // The refusal is specific: each loser names the holder, not the other loser.
+    for outcome in &outcomes {
+        assert_eq!(
+            outcome["holder"].as_str(),
+            Some("HOLDER"),
+            "the refusal names the task actually holding the ground"
+        );
+        assert_eq!(outcome["undeclared"], false);
+    }
+
+    // Nothing partial from either rejected attempt.
+    for task in ["B1", "B2"] {
+        assert_eq!(
+            store
+                .tasks()
+                .get_task(&TaskId::from_string(task))
+                .await
+                .expect("task reads")
+                .status,
+            TaskStatus::Todo,
+            "{task} was never started by a rejected handoff"
+        );
+        assert_eq!(
+            store
+                .assignments()
+                .assignment_history(&TaskId::from_string(task))
+                .await
+                .expect("history reads")
+                .len(),
+            0,
+            "{task} has no assignment history at all: the refusal wrote nothing"
+        );
+        assert_eq!(
+            store
+                .agents()
+                .get_agent(&AgentId::from_string(match task {
+                    "B1" => "AGENT-1",
+                    _ => "AGENT-2",
+                }))
+                .await
+                .expect("agent reads")
+                .current_task,
+            None,
+            "the refused agent was left free rather than marked as working"
+        );
+    }
+
+    // And the holder is untouched by two refused attempts.
+    assert_eq!(
+        store
+            .assignments()
+            .active_assignment_for_task(&TaskId::from_string("HOLDER"))
+            .await
+            .expect("lookup")
+            .map(|a| a.agent_id.to_string())
+            .as_deref(),
+        Some("AGENT-H")
+    );
+}
+
+/// The control that keeps the guard honest. Disjoint ground, from two real
+/// processes, both succeed — so a test proving "both refused" cannot pass merely
+/// because the guard refuses everything under contention.
+#[tokio::test]
+async fn two_processes_both_assign_disjoint_scopes_through_assign_task() {
+    let fixture = RaceHarness::new().await;
+    let store = Store::open(&fixture.db).await.expect("store opens");
+
+    fixture
+        .plan(
+            &store,
+            "PLAN-RACE",
+            vec![
+                race_task("HOLDER", "src/race"),
+                race_task("B1", "src/one"),
+                race_task("B2", "src/two"),
+            ],
+        )
+        .await;
+    fixture.agent(&store, "AGENT-H").await;
+    fixture.agent(&store, "AGENT-1").await;
+    fixture.agent(&store, "AGENT-2").await;
+
+    store
+        .assign_and_start(
+            &TaskId::from_string("HOLDER"),
+            &AgentId::from_string("AGENT-H"),
+            &AssignmentId::from_string("ASG-H"),
+            stamp(0),
+        )
+        .await
+        .expect("the holder takes the ground and starts");
+
+    let outcomes = fixture.race_pair(
+        ("a", "B1", "AGENT-1", "ASG-1"),
+        ("b", "B2", "AGENT-2", "ASG-2"),
+        OPERATION_ASSIGN_ONLY,
+    );
+
+    for outcome in &outcomes {
+        assert_eq!(
+            outcome["outcome"], "ok",
+            "disjoint scopes are not refused through assign_task across processes either, \
+             got {}",
+            outcome
+        );
+    }
+
+    for (task, agent) in [("B1", "AGENT-1"), ("B2", "AGENT-2")] {
+        assert_eq!(
+            store
+                .assignments()
+                .active_assignment_for_task(&TaskId::from_string(task))
+                .await
+                .expect("lookup")
+                .map(|a| a.agent_id.to_string())
+                .as_deref(),
+            Some(agent),
+            "{task} is held by {agent} and nobody else"
+        );
+        assert_eq!(
+            store
+                .tasks()
+                .get_task(&TaskId::from_string(task))
+                .await
+                .expect("task reads")
+                .status,
+            TaskStatus::Todo,
+            "assign_task records the assignment without starting the task, by design"
         );
     }
 }
