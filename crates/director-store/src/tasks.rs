@@ -18,7 +18,7 @@
 //! names an agent.
 
 use async_trait::async_trait;
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 
 use director_domain::decision::Decision;
 use director_domain::ids::{ProjectId, TaskId};
@@ -370,7 +370,11 @@ fn replace_dependencies(
 }
 
 /// Load one task by id, or [`StoreError::NotFound`].
-pub(crate) fn load_task(conn: &PooledConn, id: &TaskId) -> Result<Task, StoreError> {
+///
+/// Takes a `&Connection` rather than a `&PooledConn` so a caller inside a
+/// transaction can read through it: `&Transaction` derefs to `&Connection`,
+/// while a pooled connection cannot be borrowed from an open transaction.
+pub(crate) fn load_task(conn: &Connection, id: &TaskId) -> Result<Task, StoreError> {
     conn.query_row(
         "SELECT id, project_id, title, objective, description, status, priority,
                 complexity, expected_outputs, dependencies, scope_paths,
@@ -380,6 +384,41 @@ pub(crate) fn load_task(conn: &PooledConn, id: &TaskId) -> Result<Task, StoreErr
         row_to_task,
     )
     .map_err(translate_error)
+}
+
+/// Load every task in `project` that is `in_progress`, in creation order.
+///
+/// The authoritative read behind the scope guard in
+/// [`crate::assignments::assign_and_start`]. Only `in_progress` work holds
+/// ground — `todo` work holds nothing and terminal work is over — so this is
+/// exactly the set a scope check has to consider.
+///
+/// Ordering is by `created_at`, matching [`load_task`]'s sibling
+/// `list_tasks`, so a refusal names the same holder the application layer's
+/// pre-check would have named rather than whichever row arrived first.
+pub(crate) fn in_progress_tasks_for_project(
+    conn: &Connection,
+    project: &ProjectId,
+) -> Result<Vec<Task>, StoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, project_id, title, objective, description, status, priority,
+                    complexity, expected_outputs, dependencies, scope_paths,
+                    required_capabilities, subtasks, state_version, created_at, updated_at
+             FROM tasks WHERE project_id = ?1 AND status = ?2 ORDER BY created_at",
+        )
+        .map_err(translate_error)?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![project.as_str(), json::to_json(&TaskStatus::InProgress)?,],
+            row_to_task,
+        )
+        .map_err(translate_error)?;
+    let mut all = Vec::new();
+    for row in rows {
+        all.push(row.map_err(translate_error)?);
+    }
+    Ok(all)
 }
 
 /// Map a row into a [`Task`]. Any malformed column is an error rather than a

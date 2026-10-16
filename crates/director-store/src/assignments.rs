@@ -343,10 +343,22 @@ pub async fn assign_and_start(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(AgentAssignment, Task, Option<AgentId>), StoreError> {
     let mut conn = pool.get();
-    let tx = conn.transaction().map_err(translate_error)?;
+
+    // `IMMEDIATE`, not the deferred default. The whole point of this transaction
+    // is that the scope guard below reads authoritative state and the write that
+    // follows is decided from that same read. A deferred transaction takes its
+    // read snapshot before any competing writer has committed, so two
+    // concurrent handoffs of overlapping tasks could each read "nothing in
+    // flight", each validate, and each commit — the assignments touch disjoint
+    // rows, so nothing would collide. `BEGIN IMMEDIATE` takes the reserved write
+    // lock up front, so the second caller blocks here until the first has
+    // committed, and then reads the first's row.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(translate_error)?;
 
     // The status the task is moving from, read inside the transaction so the
-    // transition history records what the store actually saw — not what the
+    // transition history records what the store actually saw - not what the
     // caller believed when it decided to assign. A task that is not `todo` is
     // not started here; the handoff still happens, and the history records the
     // real transition, so the record stays honest even if a concurrent writer
@@ -361,6 +373,52 @@ pub async fn assign_and_start(
         .map_err(translate_error)?
         .map(|text| json::from_json::<TaskStatus>(&text))
         .transpose()?;
+
+    // The authoritative scope guard, inside the write-locked transaction and
+    // immediately before the write it can veto.
+    //
+    // The application layer already ran this rule before calling - that check is
+    // pure and cheap, and refusing before paying for a write is worth it - but it
+    // read that state before this transaction opened, so it may be stale. This is
+    // the check that decides. It reads the task and the project's in-flight work
+    // through the transaction, so it sees every commit that preceded it and
+    // nothing that follows.
+    //
+    // A task with no project has nothing to compare against: scope conflict is
+    // defined between tasks of one project, because one project is one
+    // repository root. Such a task is guarded by the caller's own checks.
+    let this_task = crate::tasks::load_task(&tx, task_id)?;
+    if let Some(project) = this_task.project_id.clone() {
+        let in_flight = crate::tasks::in_progress_tasks_for_project(&tx, &project)?;
+        // Same rule and same order as the application layer's `scope_holder`: only
+        // `in_progress` work holds ground, and the reported holder is the first
+        // colliding task rather than whichever row happened to come back. The
+        // comparison itself is the domain's `Task::scope_overlap`, not a
+        // reimplementation, so the two halves cannot disagree about what counts
+        // as a conflict.
+        if let Some((holder, overlap)) = in_flight
+            .iter()
+            // A task never conflicts with itself, but the filter is explicit so
+            // the exclusion is visible here rather than resting on the domain
+            // method alone.
+            .filter(|other| other.id != this_task.id)
+            .find_map(|other| {
+                this_task
+                    .scope_overlap(other)
+                    .map(|overlap| (other, overlap))
+            })
+        {
+            // Returning here drops the transaction, which rolls it back. The
+            // refusal happens before any write, so there is nothing to undo and
+            // the losing task stays `todo` and still handable.
+            return Err(StoreError::ScopeConflict {
+                task: this_task.id.clone(),
+                holder: holder.id.clone(),
+                overlap: overlap.describe(),
+                undeclared: overlap.undeclared,
+            });
+        }
+    }
 
     let sitting = handoff(&tx, task_id, agent_id, assignment_id, now)?;
 

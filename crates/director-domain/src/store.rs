@@ -105,6 +105,31 @@ pub enum StoreError {
     /// a reference to a project/task/agent that does not exist.
     #[error("constraint violation: {0}")]
     ConstraintViolation(String),
+    /// A task could not be started because work already in flight holds ground
+    /// its declared scope overlaps.
+    ///
+    /// This is the store's *authoritative* answer, produced inside the same
+    /// transaction that would have written the assignment, so two concurrent
+    /// handoffs of overlapping tasks cannot both believe they won. The
+    /// application layer's pre-check is the optimistic half of the same rule and
+    /// can be stale by the time it runs; this one cannot. Callers map it onto
+    /// their own structured refusal rather than reading it as a generic failure.
+    ///
+    /// A conflict is a fact about the world, not a malfunction: the transaction
+    /// rolled back, nothing was written, and the caller can free the ground and
+    /// retry later.
+    #[error("scope conflict: task {task} overlaps in-flight task {holder}: {overlap}")]
+    ScopeConflict {
+        /// The task that could not be started.
+        task: crate::ids::TaskId,
+        /// The task already holding the overlapping ground.
+        holder: crate::ids::TaskId,
+        /// The overlapping scopes, as the two tasks declared them.
+        overlap: String,
+        /// True when a task declared no usable scope, so the overlap is total
+        /// rather than located at named paths.
+        undeclared: bool,
+    },
     /// A migration could not be applied, or the schema is in a state the code
     /// does not know how to handle. The database is not usable as-is.
     #[error("migration error: {0}")]

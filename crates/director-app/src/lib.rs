@@ -344,7 +344,29 @@ pub enum AssignError {
 
 impl From<director_domain::StoreError> for AssignError {
     fn from(err: director_domain::StoreError) -> Self {
-        AssignError::Store(err.to_string())
+        match err {
+            // The store's authoritative scope guard, refusing inside the same
+            // transaction that would have written the assignment. It surfaces as
+            // the same structured refusal the optimistic pre-check raises, so a
+            // caller has one error to handle rather than two that mean the same
+            // thing - and it is deliberately not flattened into a generic store
+            // failure, which would read to a retry loop as a transient fault when
+            // in fact it is a fact about the world: something else holds the
+            // ground. Every other store failure stays `AssignError::Store`,
+            // undisguised.
+            director_domain::StoreError::ScopeConflict {
+                task,
+                holder,
+                overlap,
+                undeclared,
+            } => AssignError::ScopeConflict {
+                task,
+                holder,
+                overlap,
+                undeclared,
+            },
+            other => AssignError::Store(other.to_string()),
+        }
     }
 }
 
