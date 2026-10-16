@@ -110,10 +110,14 @@ use director_app::recovery::{self, Recovery};
 use director_app::runner::Runner;
 use director_domain::agent::{Agent, Harness};
 use director_domain::capability::Capability;
-use director_domain::ids::{AgentId, MachineId, PlanId, ProjectId, RepositoryId, TaskId};
+use director_domain::ids::{
+    AgentId, AssignmentId, MachineId, PlanId, ProjectId, RepositoryId, TaskId,
+};
+use director_domain::project::Project;
 use director_domain::task::{ExpectedOutput, TaskStatus};
 use director_domain::{
-    AgentRepository, AssignmentRepository, CheckpointRepository, TaskRepository,
+    AgentRepository, AssignmentRepository, CheckpointRepository, ProjectRepository, StoreError,
+    TaskRepository,
 };
 use director_store::Store;
 use serde_json::{json, Value};
@@ -125,6 +129,27 @@ const STATE_DIR: &str = "ORQYNN_PROCESS_KILL_STATE";
 const MARKER_PATH: &str = "ORQYNN_PROCESS_KILL_MARKER";
 const REPORT_PATH: &str = "ORQYNN_PROCESS_KILL_REPORT";
 const KILL_POINT: &str = "ORQYNN_PROCESS_KILL_POINT";
+
+/// Environment for the `assign` role: which task, which agent, which assignment
+/// id, where to record the outcome, and where the cross-process rendezvous lives.
+///
+/// These reuse the same `ORQYNN_PROCESS_KILL_` prefix rather than inventing a
+/// second namespace, so there is one place to look for what a child process was
+/// asked to do.
+const CHILD_TASK: &str = "ORQYNN_PROCESS_KILL_TASK";
+const CHILD_AGENT: &str = "ORQYNN_PROCESS_KILL_AGENT";
+const CHILD_ASSIGNMENT: &str = "ORQYNN_PROCESS_KILL_ASSIGNMENT";
+const CHILD_RESULT: &str = "ORQYNN_PROCESS_KILL_RESULT";
+const CHILD_GATE: &str = "ORQYNN_PROCESS_KILL_GATE";
+
+/// How long a racing child waits for its partner to reach the rendezvous, and
+/// how long the parent waits for a child to finish.
+const GATE_TIMEOUT: Duration = Duration::from_secs(60);
+const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A child that gave up waiting for its partner, so the parent can tell a
+/// synchronization failure apart from a genuine assignment outcome.
+const GATE_TIMEOUT_EXIT_CODE: i32 = 4;
 const TASK_ID: &str = "AUTH";
 
 const PROJECT: &str = "PROJ-1";
@@ -196,8 +221,91 @@ fn child_harness() {
     match role.as_str() {
         "phase" => run_phase_child(),
         "recover" => run_recover_child(),
+        "assign" => run_assign_child(),
         other => panic!("unknown role {other:?}"),
     }
+}
+
+/// A process attempting exactly one assignment, against a database another
+/// process is contending for.
+///
+/// Unlike the `phase` role this one does not park to be killed: it takes part in
+/// a race, records what happened, and exits on its own. The parent enforces the
+/// timeout instead.
+///
+/// The rendezvous is a directory, not a timer. Each child drops a `ready-*` file
+/// and then waits until both are present, so neither process can be so far ahead
+/// that the other arrives after the transaction has already committed. That makes
+/// the two `BEGIN IMMEDIATE` calls land close together without anyone sleeping for
+/// an arbitrary duration and hoping.
+fn run_assign_child() {
+    let db = PathBuf::from(required_env(DB_PATH));
+    let task = TaskId::from_string(required_env(CHILD_TASK));
+    let agent = AgentId::from_string(required_env(CHILD_AGENT));
+    let assignment = AssignmentId::from_string(required_env(CHILD_ASSIGNMENT));
+    let result_path = PathBuf::from(required_env(CHILD_RESULT));
+    let gate_dir = PathBuf::from(required_env(CHILD_GATE));
+
+    // Announce arrival, then wait for the partner. If the partner never comes the
+    // outcome is recorded as a synchronization failure, so a broken rendezvous can
+    // never be mistaken for "the guard refused the loser".
+    std::fs::write(gate_dir.join(format!("ready-{assignment}")), b"ready")
+        .expect("the ready marker is written");
+
+    let deadline = Instant::now() + GATE_TIMEOUT;
+    while ready_markers(&gate_dir) < 2 {
+        if Instant::now() > deadline {
+            let _ = std::fs::write(&result_path, json!({"outcome": "gate_timeout"}).to_string());
+            std::process::exit(GATE_TIMEOUT_EXIT_CODE);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    let outcome = runtime.block_on(async move {
+        let store = Store::open(&db).await.expect("the store opens");
+        match store
+            .assign_and_start(&task, &agent, &assignment, stamp(0))
+            .await
+        {
+            Ok(_) => json!({"outcome": "ok"}),
+            Err(StoreError::ScopeConflict {
+                task,
+                holder,
+                overlap,
+                undeclared,
+            }) => json!({
+                "outcome": "scope_conflict",
+                "task": task.to_string(),
+                "holder": holder.to_string(),
+                "overlap": overlap,
+                "undeclared": undeclared,
+            }),
+            // Anything else is recorded verbatim so the parent can tell a
+            // structured refusal from a lock error or a missing row. A child that
+            // lost the race should never report this arm; if it does, the test
+            // fails loudly rather than quietly counting it as a refusal.
+            Err(other) => json!({"outcome": "other", "error": format!("{other:?}")}),
+        }
+    });
+
+    std::fs::write(&result_path, outcome.to_string()).expect("the result is written");
+}
+
+/// How many children have announced themselves at the rendezvous.
+fn ready_markers(gate_dir: &Path) -> usize {
+    std::fs::read_dir(gate_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("ready-"))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// The dying process: drive the workflow to the kill point, announce what it
@@ -467,6 +575,47 @@ fn packages_agree(first: Option<&Recovery>, second: Option<&Recovery>) -> bool {
 // Parent-side harness
 // ---------------------------------------------------------------------------
 
+/// The base command for any child harness: this binary, the `child_harness` test,
+/// and the environment every role shares.
+fn harness_command(role: &str, db: &Path, repo_dir: &Path, state_dir: &Path) -> Command {
+    let mut command = Command::new(current_exe());
+    command
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("child_harness")
+        .arg("--nocapture")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env(ROLE, role)
+        .env(DB_PATH, path_string(db))
+        .env(REPO_DIR, path_string(repo_dir))
+        .env(STATE_DIR, path_string(state_dir));
+    command
+}
+
+/// Wait for a child, killing it if it overruns.
+///
+/// The `assign` role exits on its own, so this is a safety net rather than the
+/// normal path. Without it a wedged child would hang the whole test run instead
+/// of failing it — and a killed child is reported as such, never as a pass.
+fn wait_with_timeout(mut child: Child, label: &str) -> std::process::ExitStatus {
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) => {}
+            Err(err) => panic!("waiting for the {label} child failed: {err}"),
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the {label} child did not finish within {CHILD_TIMEOUT:?} and was killed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Everything a child process needs, assembled in a temporary directory.
 struct KillHarness {
     db: PathBuf,
@@ -502,22 +651,10 @@ impl KillHarness {
 
     /// Spawn the child harness in the given role, with extra environment.
     fn spawn(&self, role: &str, kill_point: KillPoint, extra: &[(&str, &str)]) -> Child {
-        let mut command = Command::new(current_exe());
-        command
-            .arg("--ignored")
-            .arg("--exact")
-            .arg("child_harness")
-            .arg("--nocapture")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env(ROLE, role)
-            .env(DB_PATH, path_string(&self.db))
-            .env(REPO_DIR, path_string(&self.repo_dir))
-            .env(STATE_DIR, path_string(&self.state_dir))
-            .env(MARKER_PATH, path_string(&self.marker))
-            .env(REPORT_PATH, path_string(&self.report))
-            .env(KILL_POINT, kill_point.name());
+        let mut command = harness_command(role, &self.db, &self.repo_dir, &self.state_dir);
+        command.env(MARKER_PATH, path_string(&self.marker));
+        command.env(REPORT_PATH, path_string(&self.report));
+        command.env(KILL_POINT, kill_point.name());
         for (key, value) in extra {
             command.env(key, value);
         }
@@ -894,4 +1031,353 @@ fn the_harness_actually_terminates_the_child() {
         !status.success(),
         "a killed child must not report success, or the kill proves nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process scope-conflict safety
+// ---------------------------------------------------------------------------
+
+/// A parent-side fixture for the cross-process assignment race: one shared
+/// SQLite file, two agents, and a rendezvous directory the two children meet in.
+///
+/// This reuses the child-process machinery above — the same binary, the same
+/// `--ignored --exact child_harness` entry point, the same environment-driven
+/// role dispatch — rather than standing up a second harness. What is new here is
+/// only the fixture: no git repository, because the race is about the assignment
+/// transaction and has nothing to do with OBSERVE.
+struct RaceHarness {
+    db: PathBuf,
+    gate_dir: PathBuf,
+    spare_dir: PathBuf,
+    project: ProjectId,
+    _tmp: tempfile::TempDir,
+}
+
+impl RaceHarness {
+    async fn new() -> Self {
+        let tmp = tempfile::TempDir::new().expect("a temp dir");
+        let db = tmp.path().join("orqyn.db");
+        let gate_dir = tmp.path().join("gate");
+        let spare_dir = tmp.path().join("spare");
+        std::fs::create_dir_all(&gate_dir).expect("gate dir");
+        std::fs::create_dir_all(&spare_dir).expect("spare dir");
+
+        let store = Store::open(&db).await.expect("store opens");
+        let project = ProjectId::from_string("PROJ-RACE");
+        store
+            .projects()
+            .create_project(&Project::new(project.clone(), "proj", "/nowhere"))
+            .await
+            .expect("project created");
+
+        RaceHarness {
+            db,
+            gate_dir,
+            spare_dir,
+            project,
+            _tmp: tmp,
+        }
+    }
+
+    /// Register one agent that can take work.
+    async fn agent(&self, store: &Store, id: &str) -> AgentId {
+        let agent_id = AgentId::from_string(id);
+        let mut agent = Agent::register(
+            agent_id.clone(),
+            id,
+            Harness::ClaudeCode,
+            MachineId::from_string("MACH-a"),
+            vec![Capability::Coding],
+        );
+        agent.status = director_domain::agent::AgentStatus::Available;
+        store
+            .agents()
+            .register_agent(&agent)
+            .await
+            .expect("agent registers");
+        agent_id
+    }
+
+    /// Plan `specs` through the real PLAN step so scopes are persisted, not
+    /// injected.
+    async fn plan(&self, store: &Store, plan_id: &str, specs: Vec<TaskSpec>) {
+        director_app::plan::plan(
+            store,
+            PlanRequest {
+                project_id: self.project.clone(),
+                plan_id: PlanId::from_string(plan_id),
+                objective: "race the assignment transaction".into(),
+                rationale: "the cross-process tests need real scoped tasks".into(),
+                tasks: specs,
+                authorized_by: AgentId::from_string("AGENT-planner"),
+            },
+        )
+        .await
+        .expect("plan succeeds");
+    }
+
+    /// Start one `assign` child. Both are started before either is waited on,
+    /// which is what makes them concurrent rather than merely adjacent.
+    ///
+    /// Both children rendezvous in the *same* gate directory, distinguished by
+    /// the assignment id in their marker filename. Giving each its own directory
+    /// would mean each waits forever for a partner that can never appear.
+    fn start_child(&self, label: &str, task: &str, agent: &str, assignment: &str) -> Child {
+        let result = self.spare_dir.join(format!("result-{label}.json"));
+        let _ = std::fs::remove_file(&result);
+
+        let mut command = harness_command("assign", &self.db, &self.spare_dir, &self.spare_dir);
+        command
+            .env(CHILD_TASK, task)
+            .env(CHILD_AGENT, agent)
+            .env(CHILD_ASSIGNMENT, assignment)
+            .env(CHILD_RESULT, path_string(&result))
+            .env(CHILD_GATE, path_string(&self.gate_dir));
+        command.spawn().expect("the assign child spawns")
+    }
+
+    /// Clear the rendezvous, so a marker left by an earlier round cannot let a
+    /// child skip the wait and race ahead on its own.
+    fn reset_gate(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.gate_dir) else {
+            return;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            if entry.file_name().to_string_lossy().starts_with("ready-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Read one child's recorded outcome, failing if it never recorded one.
+    fn outcome(&self, label: &str) -> Value {
+        let path = self.spare_dir.join(format!("result-{label}.json"));
+        let deadline = Instant::now() + CHILD_TIMEOUT;
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the {label} child recorded no outcome within {CHILD_TIMEOUT:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("result readable"))
+            .expect("result is valid JSON")
+    }
+}
+
+/// One task spec with a declared scope.
+fn race_task(id: &str, scope: &str) -> TaskSpec {
+    TaskSpec::new(TaskId::from_string(id), id, format!("do {id}")).scopes([scope])
+}
+
+/// The decisive cross-process proof.
+///
+/// Two independently spawned OS processes, two connection pools, one SQLite file.
+/// Both attempt to take overlapping ground in the same project at the same moment,
+/// and the invariant is that **at most one** can win — with the loser receiving a
+/// structured scope conflict rather than a lock error or a silent double grant.
+///
+/// Three rounds with distinct scope paths run in one test, so the property is
+/// exercised repeatedly without the rounds interfering: each round's ground is
+/// disjoint from every earlier round's, which is still in flight.
+#[tokio::test]
+async fn two_processes_cannot_both_acquire_overlapping_task_scopes() {
+    let fixture = RaceHarness::new().await;
+    let store = Store::open(&fixture.db).await.expect("store opens");
+
+    let mut specs = Vec::new();
+    for round in 1..=3 {
+        specs.push(race_task(
+            &format!("R{round}A"),
+            &format!("src/round{round}/a"),
+        ));
+        specs.push(race_task(
+            &format!("R{round}B"),
+            &format!("src/round{round}/a/inner"),
+        ));
+    }
+    fixture.plan(&store, "PLAN-RACE", specs).await;
+    for round in 1..=3 {
+        fixture.agent(&store, &format!("AGENT-{round}A")).await;
+        fixture.agent(&store, &format!("AGENT-{round}B")).await;
+    }
+
+    for round in 1..=3 {
+        let label_a = format!("r{round}a");
+        let label_b = format!("r{round}b");
+
+        // Both processes are started before either is waited on.
+        fixture.reset_gate();
+        let first = fixture.start_child(
+            &label_a,
+            &format!("R{round}A"),
+            &format!("AGENT-{round}A"),
+            &format!("ASG-{round}-A"),
+        );
+        let second = fixture.start_child(
+            &label_b,
+            &format!("R{round}B"),
+            &format!("AGENT-{round}B"),
+            &format!("ASG-{round}-B"),
+        );
+        let first_status = wait_with_timeout(first, &label_a);
+        let second_status = wait_with_timeout(second, &label_b);
+
+        for (label, status) in [(&label_a, first_status), (&label_b, second_status)] {
+            assert_ne!(
+                status.code(),
+                Some(GATE_TIMEOUT_EXIT_CODE),
+                "the {label} child never met its partner at the rendezvous, so this round \
+                 proves nothing about the guard"
+            );
+            assert!(
+                status.success(),
+                "the {label} child exited with {status}; a child that cannot do its job \
+                 is not evidence either way"
+            );
+        }
+
+        let outcomes = [fixture.outcome(&label_a), fixture.outcome(&label_b)];
+        let wins = outcomes.iter().filter(|o| o["outcome"] == "ok").count();
+        let conflicts = outcomes
+            .iter()
+            .filter(|o| o["outcome"] == "scope_conflict")
+            .count();
+
+        assert_eq!(
+            wins, 1,
+            "round {round}: exactly one process may take overlapping ground, got {outcomes:?}"
+        );
+        assert_eq!(
+            conflicts, 1,
+            "round {round}: the loser must receive a structured scope conflict, got {outcomes:?}"
+        );
+
+        // The conflict names the task that already held the ground, which is the
+        // winner. So the holder is the winner and the other task is the loser -
+        // the two processes agree about who won rather than one guessing.
+        let holder = outcomes
+            .iter()
+            .find(|o| o["outcome"] == "scope_conflict")
+            .map(|o| o["holder"].as_str().unwrap_or_default().to_string())
+            .expect("a conflict names its holder");
+        assert!(
+            !holder.is_empty(),
+            "round {round}: the conflict names the holding task"
+        );
+        let winner = holder;
+        let loser_task = if winner.ends_with('A') {
+            format!("R{round}B")
+        } else {
+            format!("R{round}A")
+        };
+        assert_eq!(
+            store
+                .tasks()
+                .get_task(&TaskId::from_string(&winner))
+                .await
+                .expect("winner reads")
+                .status,
+            TaskStatus::InProgress,
+            "round {round}: the winner is in flight"
+        );
+        assert_eq!(
+            store
+                .tasks()
+                .get_task(&TaskId::from_string(&loser_task))
+                .await
+                .expect("loser reads")
+                .status,
+            TaskStatus::Todo,
+            "round {round}: the loser never started"
+        );
+        assert!(
+            store
+                .assignments()
+                .active_assignment_for_task(&TaskId::from_string(&loser_task))
+                .await
+                .expect("loser assignment lookup")
+                .is_none(),
+            "round {round}: the rejected handoff wrote no assignment row"
+        );
+        assert_eq!(
+            store
+                .assignments()
+                .assignment_history(&TaskId::from_string(&loser_task))
+                .await
+                .expect("loser history reads")
+                .len(),
+            0,
+            "round {round}: the rejected handoff left no assignment history at all"
+        );
+    }
+}
+
+/// The control that keeps the guard honest: disjoint scopes across two processes
+/// must both succeed. Without this, a test proving "only one wins" would also
+/// pass if the guard simply refused everything.
+#[tokio::test]
+async fn two_processes_can_both_acquire_disjoint_task_scopes() {
+    let fixture = RaceHarness::new().await;
+    let store = Store::open(&fixture.db).await.expect("store opens");
+
+    fixture
+        .plan(
+            &store,
+            "PLAN-RACE",
+            vec![
+                race_task("AUTH", "src/auth"),
+                race_task("BILLING", "src/billing"),
+            ],
+        )
+        .await;
+    fixture.agent(&store, "AGENT-A").await;
+    fixture.agent(&store, "AGENT-B").await;
+
+    fixture.reset_gate();
+    let first = fixture.start_child("da", "AUTH", "AGENT-A", "ASG-D-A");
+    let second = fixture.start_child("db", "BILLING", "AGENT-B", "ASG-D-B");
+    let first_status = wait_with_timeout(first, "da");
+    let second_status = wait_with_timeout(second, "db");
+
+    for (label, status) in [("da", first_status), ("db", second_status)] {
+        assert_ne!(
+            status.code(),
+            Some(GATE_TIMEOUT_EXIT_CODE),
+            "the {label} child never met its partner at the rendezvous"
+        );
+        assert!(status.success(), "the {label} child exited with {status}");
+    }
+
+    let outcomes = [fixture.outcome("da"), fixture.outcome("db")];
+    for outcome in &outcomes {
+        assert_eq!(
+            outcome["outcome"], "ok",
+            "disjoint scopes are the case the guard must let through across processes too, \
+             got {outcomes:?}"
+        );
+    }
+
+    for (task, agent) in [("AUTH", "AGENT-A"), ("BILLING", "AGENT-B")] {
+        assert_eq!(
+            store
+                .tasks()
+                .get_task(&TaskId::from_string(task))
+                .await
+                .expect("task reads")
+                .status,
+            TaskStatus::InProgress
+        );
+        assert_eq!(
+            store
+                .assignments()
+                .active_assignment_for_task(&TaskId::from_string(task))
+                .await
+                .expect("assignment lookup")
+                .map(|a| a.agent_id.to_string())
+                .as_deref(),
+            Some(agent),
+            "{task} is held by {agent} and nobody else"
+        );
+    }
 }
