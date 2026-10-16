@@ -591,6 +591,14 @@ pub struct RecoveryStep {
     pub tenures: usize,
     /// How many verification records with evidence the briefing carries.
     pub verifications: usize,
+    /// What this task may touch, as the task declared it.
+    ///
+    /// Carried so a replacement agent is told which paths are its own instead of
+    /// inferring that from whatever is nearest. Empty means **undeclared**, which
+    /// conflicts with everything — see
+    /// [`director_domain::task::Task::scope_overlap`] — so an empty list is a
+    /// conservative signal, not permission to roam.
+    pub scope_paths: Vec<String>,
 }
 
 impl RecoveryStep {
@@ -603,6 +611,10 @@ impl RecoveryStep {
             gaps_clean: recovery.gaps.is_clean(),
             tenures: recovery.package.tenures.len(),
             verifications: recovery.package.verifications.len(),
+            // Copied as declared, not normalized: the briefing reports what
+            // the task claims, and comparison semantics belong to
+            // `Task::scope_overlap` at enforcement time.
+            scope_paths: recovery.package.scope_paths.clone(),
         }
     }
 }

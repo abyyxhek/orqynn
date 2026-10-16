@@ -461,6 +461,12 @@ impl<'s> RecoveryBuilder<'s> {
         let package = ContinuationPackage {
             task_id: task.id.clone(),
             task_state_version: task.state_version,
+            // The scope comes from the task row this builder already loaded from
+            // the store, so it is the authoritative persisted declaration and not
+            // something reconstructed from a checkpoint, a message, or the files a
+            // commit happened to touch. Copied as written: normalization and
+            // comparison happen at enforcement time, not here.
+            scope_paths: task.scope_paths.clone(),
             checkpoint,
             tenures,
             verifications,

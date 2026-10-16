@@ -240,6 +240,37 @@ pub struct ContinuationPackage {
     /// writes back presents this version, so its write is refused if anything
     /// moved the task in between rather than silently clobbering it.
     pub task_state_version: u64,
+    /// What this task may touch, copied verbatim from the authoritative persisted
+    /// task — never inferred from an agent's message or from the files a
+    /// checkpoint happens to mention.
+    ///
+    /// This exists because conflict detection is Orqynn's alone. Enforcement reads
+    /// the task row, so a missing field could never put two agents on the same
+    /// files; but a replacement agent is handed this package and nothing else, and
+    /// an agent that does not know which paths are its own will edit whatever is
+    /// nearest. The briefing was incomplete about exactly the thing the agent must
+    /// not get wrong.
+    ///
+    /// **Empty means the scope is undeclared, not unrestricted.** See
+    /// [`crate::task::Task::scope_overlap`]: an undeclared scope overlaps
+    /// everything, including another undeclared one. So a reader that finds this
+    /// empty must ask *why* — either the planner declared no scope, or this
+    /// package was serialized by a build that predates scope reporting. Both are
+    /// real, and neither is resolved by guessing.
+    ///
+    /// Paths are stored **as the task declared them**, in declaration order, and
+    /// are not normalized here. Normalization is a comparison concern and belongs
+    /// to [`crate::task::normalize_scope_paths`], so this field stays a faithful
+    /// copy that a reader can match against the task's own declaration.
+    ///
+    /// `#[serde(default)]` because the field was added to an existing serialized
+    /// type, following this crate's convention for additive fields: a package
+    /// written before scope reporting must stay readable rather than failing to
+    /// deserialize. Defaulting to empty is the conservative direction — an absent
+    /// scope is treated as undeclared, which is the assumption least likely to let
+    /// an agent collide with another.
+    #[serde(default)]
+    pub scope_paths: Vec<String>,
     /// The latest checkpoint for that task.
     pub checkpoint: Checkpoint,
     /// The task's tenure history, newest first. This is what answers "what
@@ -546,5 +577,95 @@ mod tests {
         assert_eq!(parsed.status, CheckpointStatus::Current);
         assert!(parsed.project_state_version.is_none());
         assert!(parsed.task_state_version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ContinuationPackage scope
+    // -----------------------------------------------------------------------
+
+    /// A package with only the fields that matter to these tests; the rest are
+    /// empty histories, which are all legal.
+    fn package_with_scope(scope_paths: Vec<String>) -> ContinuationPackage {
+        ContinuationPackage {
+            task_id: TaskId::from_string("AUTH-42"),
+            task_state_version: 3,
+            checkpoint: Checkpoint::new(
+                CheckpointId::from_string("CHK-1"),
+                TaskId::from_string("AUTH-42"),
+                "auth",
+                "p",
+                "n",
+            ),
+            scope_paths,
+            tenures: vec![],
+            verifications: vec![],
+            transitions: vec![],
+            decisions: vec![],
+            recent_context: crate::context::RecentContext::for_task(TaskId::from_string("AUTH-42")),
+            observed_state: observed("abc123", Some("main")),
+            comparison: StateComparison::Unchanged,
+            active_agents: vec![],
+            blockers: vec![],
+            next_action: "n".into(),
+            resume_status: ResumeStatus::Ready,
+        }
+    }
+
+    #[test]
+    fn a_continuation_package_carries_its_task_scope_through_serde() {
+        let package = package_with_scope(vec![
+            "src/auth".to_string(),
+            "src/auth/login.rs".to_string(),
+        ]);
+
+        let json = serde_json::to_string(&package).expect("the package serializes");
+        let parsed: ContinuationPackage =
+            serde_json::from_str(&json).expect("the package deserializes");
+
+        assert_eq!(
+            parsed.scope_paths,
+            vec!["src/auth".to_string(), "src/auth/login.rs".to_string()],
+            "a replacement agent must be told which paths are its own, in the order the \
+             task declared them"
+        );
+        assert_eq!(parsed, package, "the whole package round-trips unchanged");
+    }
+
+    #[test]
+    fn an_empty_scope_survives_serde_as_empty() {
+        // Empty is not a missing value and not a bug: it is the *undeclared*
+        // scope, which conflicts with everything. It has to survive the round trip
+        // as empty rather than being filled in or dropped.
+        let package = package_with_scope(vec![]);
+        let json = serde_json::to_string(&package).expect("the package serializes");
+        let parsed: ContinuationPackage =
+            serde_json::from_str(&json).expect("the package deserializes");
+
+        assert!(
+            parsed.scope_paths.is_empty(),
+            "an undeclared scope must stay undeclared across a handoff"
+        );
+        assert_eq!(parsed, package);
+    }
+
+    #[test]
+    fn a_package_written_before_scope_reporting_still_deserializes() {
+        // The compatibility case: a payload from a build that predates the field.
+        // It has to keep reading, and it has to read *conservatively* — an absent
+        // scope is treated as undeclared rather than as unrestricted.
+        let mut legacy = serde_json::to_value(package_with_scope(vec!["src/auth".to_string()]))
+            .expect("the package serializes");
+        legacy
+            .as_object_mut()
+            .expect("the payload is an object")
+            .remove("scope_paths");
+
+        let parsed: ContinuationPackage =
+            serde_json::from_value(legacy).expect("an older package still reads");
+        assert!(
+            parsed.scope_paths.is_empty(),
+            "a package with no scope field defaults to undeclared, which is the \
+             conservative direction: it cannot let an agent collide with another"
+        );
     }
 }

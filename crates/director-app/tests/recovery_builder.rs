@@ -425,6 +425,94 @@ async fn an_in_flight_task_on_the_checkpointed_commit_builds_ready() {
     assert_eq!(recovery.next_action(), cp.next_action);
 }
 
+/// The scope a replacement is handed must be the task's own persisted
+/// declaration — read from the task row, not inferred from the checkpoint, the
+/// observed files, or anything an agent said. An agent that is told the wrong
+/// ground edits files another agent owns.
+#[tokio::test]
+async fn a_recovery_package_carries_the_task_s_scope_exactly_as_declared() {
+    let (_dir, store) = boot().await;
+
+    let mut task = Task::for_project(
+        ProjectId::from_string(PROJ),
+        TaskId::from_string(TASK),
+        TASK,
+        "ship the feature",
+    );
+    task.status = TaskStatus::Todo;
+    // Deliberately not normalized, and deliberately out of any obvious order:
+    // the package reports the declaration verbatim and leaves comparison
+    // semantics to `Task::scope_overlap`.
+    task.scope_paths = vec![
+        "src\\auth".to_string(),
+        "./src/auth/login.rs".to_string(),
+        "docs/".to_string(),
+    ];
+    let task = store
+        .tasks()
+        .create_task(&task)
+        .await
+        .expect("the task is created");
+    let task = move_task_to(&store, &task, TaskStatus::InProgress).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    // The authoritative scope, re-read from the store rather than reused from the
+    // local value — so this compares the package against what is persisted.
+    let authoritative = store
+        .tasks()
+        .get_task(&task.id)
+        .await
+        .expect("the task reads")
+        .scope_paths;
+
+    let recovery = RecoveryBuilder::new(&store, task.id.clone())
+        .observed(observed("abc", "main", false), history(&["abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("an in-flight task with a checkpoint builds");
+
+    assert_eq!(
+        recovery.package.scope_paths, authoritative,
+        "the briefing's scope is the task's persisted declaration, byte for byte"
+    );
+    assert_eq!(
+        recovery.package.scope_paths.len(),
+        3,
+        "no path is dropped and none is invented"
+    );
+    assert_eq!(
+        recovery.package.scope_paths[0], "src\\auth",
+        "declaration order is preserved, and Windows separators are not rewritten"
+    );
+}
+
+/// A task that declared no scope must not acquire one on the way into a briefing.
+/// Empty here is *undeclared*, which conflicts with everything, so silently
+/// filling it in — or reporting a task's files as if they were its scope — would
+/// make the briefing actively misleading.
+#[tokio::test]
+async fn a_task_with_no_declared_scope_briefs_as_undeclared_rather_than_empty_by_accident() {
+    let (_dir, store) = boot().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    let recovery = RecoveryBuilder::new(&store, task.id.clone())
+        .observed(observed("abc", "main", false), history(&["abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("an in-flight task with a checkpoint builds");
+
+    assert!(
+        recovery.package.scope_paths.is_empty(),
+        "an undeclared scope stays undeclared; it is not back-filled from the \
+         checkpoint's changed files or the observed working tree"
+    );
+}
+
 #[tokio::test]
 async fn a_dirty_tree_on_the_same_commit_is_stale() {
     let (_dir, store) = boot().await;

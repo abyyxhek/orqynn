@@ -92,9 +92,12 @@
 //!   after the writer is dead. The race must be resolved — the `IMMEDIATE`
 //!   transaction documented in `PHASE13_AUDIT_NOTE.md` §6 — before concurrent
 //!   assignment is enabled, and nothing here is evidence that it is safe.
-//! - **`ContinuationPackage` still omits `scope_paths`.** The recovery reports
-//!   below assert what the package actually carries. They do not assert a scope,
-//!   because it is not there. Tracked as a separate follow-up.
+//! - **`ContinuationPackage` now carries `scope_paths`.** The package reads the
+//!   scope from the persisted task, so a recovered briefing can tell a
+//!   replacement agent which paths are its own. The recovery reports below
+//!   deliberately do *not* assert it: these tests fix the durability of the
+//!   workflow, and scope correctness is covered where the rule lives, in
+//!   `recovery_builder.rs` and the domain's serde tests.
 //! - **No daemon, CLI, or MCP server.** The harness is libtest.
 
 use std::path::{Path, PathBuf};

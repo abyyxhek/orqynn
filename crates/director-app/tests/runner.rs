@@ -843,7 +843,10 @@ async fn a_recovery_briefing_is_reconstructible_from_the_store_alone() {
 
     let mut runner = fixture.runner();
     runner
-        .plan(plan_request(vec![spec_with_check("AUTH", FAILS)]), now())
+        .plan(
+            plan_request(vec![scoped_spec("AUTH", FAILS, "src/auth")]),
+            now(),
+        )
         .await
         .expect("the plan lands");
     let scheduled = runner
@@ -882,6 +885,12 @@ async fn a_recovery_briefing_is_reconstructible_from_the_store_alone() {
         .expect("the recovery build")
         .expect("an in-flight task with a checkpoint has a briefing");
     assert_eq!(brief.task_id, TaskId::from_string("AUTH"));
+    assert_eq!(
+        brief.scope_paths,
+        vec!["src/auth".to_string()],
+        "the briefing tells a replacement agent which paths are its own, as the \
+         task declared them"
+    );
     assert_eq!(brief.tenures, 1, "the tenure is in the briefing");
     assert_eq!(brief.verifications, 0, "nothing has been judged yet");
     assert!(
