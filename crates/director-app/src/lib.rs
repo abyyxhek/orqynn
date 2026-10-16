@@ -51,6 +51,7 @@ pub mod observe;
 pub mod plan;
 pub mod recovery;
 pub mod replan;
+pub mod runner;
 pub mod schedule;
 pub mod verify;
 
