@@ -299,6 +299,20 @@ pub struct ContinuationPackage {
     pub active_agents: Vec<crate::ids::AgentId>,
     /// Open blockers on the task.
     pub blockers: Vec<crate::ids::BlockerId>,
+    /// The blockers themselves, oldest first, open and cleared alike.
+    ///
+    /// `blockers` above is the id list this field was always typed as, and ids
+    /// alone cannot answer "what is blocking this, and what would clear it" —
+    /// the question a replacement agent actually has. So the records come too.
+    ///
+    /// Added as a separate field rather than by retyping `blockers`, because
+    /// `ContinuationPackage` is serialized and packages are already on disk in
+    /// the old shape; `#[serde(default)]` keeps every earlier package
+    /// readable. Cleared blockers are retained on purpose: "we fixed it" and
+    /// "we stopped trying" are different answers, and a package that kept only
+    /// open blockers could not tell them apart.
+    #[serde(default)]
+    pub blocker_details: Vec<crate::blocker::Blocker>,
     /// The concrete first step for the receiving agent.
     pub next_action: String,
     /// Orqyn's verdict on whether resumption can proceed.
@@ -606,6 +620,7 @@ mod tests {
             comparison: StateComparison::Unchanged,
             active_agents: vec![],
             blockers: vec![],
+            blocker_details: vec![],
             next_action: "n".into(),
             resume_status: ResumeStatus::Ready,
         }

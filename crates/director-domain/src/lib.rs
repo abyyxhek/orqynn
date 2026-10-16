@@ -109,10 +109,10 @@ pub use verification::{
 // Flat for the same reason as everything else — callers say `TaskRepository`,
 // not `store::TaskRepository`.
 pub use store::{
-    AgentRepository, AssignmentRepository, CheckpointRepository, DecisionRepository,
-    PlanRepository, ProjectRepository, ProjectStateRepository, ProviderSync,
-    ProviderSyncRepository, SessionRepository, Store, StoreError, StoredProjectState,
-    TaskRepository, TaskStatusTransition, VerificationRepository,
+    ActionRepository, AgentRepository, AssignmentRepository, BlockerRepository,
+    CheckpointRepository, DecisionRepository, PlanRepository, ProjectRepository,
+    ProjectStateRepository, ProviderSync, ProviderSyncRepository, SessionRepository, Store,
+    StoreError, StoredProjectState, TaskRepository, TaskStatusTransition, VerificationRepository,
 };
 
 #[cfg(test)]

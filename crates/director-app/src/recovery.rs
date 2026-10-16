@@ -39,34 +39,47 @@
 //!
 //! ## What is here, and what is not
 //!
-//! Everything in a [`ContinuationPackage`] comes from persisted records. Two of
-//! its fields cannot be populated from anything Orqyn stores, and rather than
-//! invent content for them they are represented at their empty defaults with the
-//! reason recorded in [`RecoveryGaps`]:
+//! Everything in a [`ContinuationPackage`] comes from persisted records, and a
+//! briefing now reconstructs both kinds of activity it previously could not:
 //!
-//! - [`RecentContext`] has no table and no repository. It is an in-memory action
-//!   window; persisting it is out of scope for Phase 12, so the package carries
-//!   an empty window and [`Recovery::actions_available`] says `false`.
-//! - [`Blocker`](director_domain::Blocker) is not persisted either. REPLAN
-//!   reports stranded dependents and writes nothing about them, so the package's
-//!   blocker list is empty — the *task's* status still carries `blocked`, which
-//!   is what drives [`ResumeStatus::Blocked`].
+//! - [`RecentContext`] is built from the `task_actions` table, oldest first, and
+//!   is bounded and compacted by [`RecentContext`] itself rather than by a second
+//!   limit here. It is a record of what Orqynn actually observed.
+//! - [`Blocker`](director_domain::Blocker) is read from the `blockers` table,
+//!   **including cleared blockers** - the row is retained when a blocker stops
+//!   blocking, so "we fixed it" stays distinguishable from "we stopped trying".
 //!
-//! A gap is a statement about Orqyn's persistence, never about the work: an
-//! empty window with `recent_context_unavailable` set means Orqyn does not keep
-//! that window, not that the agent did nothing. Without the flag the two read
+//! Two honest limits remain, and neither is a missing table:
+//!
+//! - **No production execution path records actions yet.** The storage, ordering,
+//!   bounding, and restart-durability of action history are real; nothing in the
+//!   loop writes to it, because Orqynn has no agent driver to observe. An empty
+//!   window is therefore reported as *unavailable history* rather than as a
+//!   complete history: Orqynn cannot tell "an agent worked without recording" from
+//!   "nothing happened", and it does not guess.
+//! - **`ResumeStatus` derives its blocked verdict from task status, not from
+//!   blockers.** A persisted open blocker does not move a task to
+//!   [`TaskStatus::Blocked`], and nothing in the store or the loop ever writes
+//!   that status today - REPLAN deliberately declines to, so it does not own
+//!   another entity's lifecycle. A task can therefore carry an open blocker
+//!   while its resume verdict reads `Ready` or `Stale`. The blockers are in the
+//!   briefing either way.
+//!
+//! A gap is a statement about what could be reconstructed, never about the work:
+//! an empty window with `recent_context_unavailable` set means nothing was
+//! recorded, not that the agent did nothing. Without the flag the two read
 //! identically.
 //!
-//! No new tables were added to make the package look complete. A field that
-//! cannot be reconstructed is a field reported as absent, not a field filled
+//! No field is invented. A fact that cannot be sourced is reported as absent, not
 //! with a guess.
 
 use director_domain::checkpoint::{Checkpoint, ContinuationPackage, ResumeStatus};
 use director_domain::context::RecentContext;
-use director_domain::ids::{AgentId, BlockerId, TaskId};
+use director_domain::ids::{AgentId, TaskId};
 use director_domain::state::ProjectState;
 use director_domain::store::StoredProjectState;
 use director_domain::task::{Task, TaskStatus};
+use director_domain::{ActionRepository, BlockerRepository};
 use director_domain::{
     AgentRepository, AssignmentRepository, CheckpointRepository, DecisionRepository,
     ProjectStateRepository, TaskRepository, VerificationRepository,
@@ -118,10 +131,13 @@ impl Recovery {
     }
 
     /// Whether the package's recent-action window is populated from persisted
-    /// actions. Today it is always `false`: `RecentContext` has no persistence
-    /// backing, so the window is an empty placeholder rather than a record. This
-    /// flag is what keeps that placeholder from being mistaken for "the agent
-    /// did nothing." See [`Self::gaps`] for the full ledger.
+    /// actions.
+    ///
+    /// `true` when at least one action was reconstructed from `task_actions`;
+    /// `false` for an empty window. `false` is deliberately not read as "the agent
+    /// did nothing" - no production execution path records actions yet, so an
+    /// empty window means Orqynn has no record either way. See [`Self::gaps`]
+    /// for the full ledger.
     pub fn actions_available(&self) -> bool {
         !self.gaps.recent_context_unavailable
     }
@@ -136,31 +152,42 @@ impl Recovery {
 
 /// What a recovery build could not reconstruct from persisted records.
 ///
-/// Both gaps are structural today — no table backs either field — so both are
-/// always set on a successful build. They are reported per build rather than
-/// assumed as constants so that adding persistence later is a matter of
-/// clearing a flag in one place, and so a caller reading a package never has to
-/// know that to read an empty field correctly.
+/// Both records now exist - `task_actions` and `blockers` - so neither gap is a
+/// limit of Orqynn's persistence. `recent_context_unavailable` is a statement
+/// about **this task** (nothing was recorded against it), and
+/// `blockers_unavailable` is `false` on every build, because an empty blocker
+/// list is an answer rather than a gap. They are still reported per build rather
+/// than assumed as constants, so a caller reading a package never has to know
+/// which fields are backed to read an empty one correctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RecoveryGaps {
-    /// `RecentContext` has no table and no repository. The package's window is
-    /// an empty placeholder; [`Recovery::actions_available`] reports `false`.
+    /// The briefing's action window is empty.
+    ///
+    /// No longer a statement about the build — actions are persisted now. It is a
+    /// statement about **this task**: nothing was ever recorded against it. That
+    /// is not the same as "nothing happened", and the flag exists so a caller
+    /// cannot mistake the two. Orqyn records what its own steps observe, so a task
+    /// driven entirely outside Orqyn legitimately has an empty window.
     pub recent_context_unavailable: bool,
-    /// `Blocker` rows are not persisted. The package's blocker list is empty;
-    /// the task's own status is what carries `blocked` and what drives
-    /// [`ResumeStatus::Blocked`].
+    /// `Blocker` rows are persisted, so this is no longer structural. It stays
+    /// in the type because a package serialized before blockers were recorded
+    /// will deserialize without them, and a reader needs to be able to say so.
     pub blockers_unavailable: bool,
 }
 
 impl RecoveryGaps {
-    /// Every gap that is a limit of Orqyn's persistence rather than a fact about
-    /// the world. A build reports this when nothing else prevented
-    /// reconstruction, so the two reasons an empty field can be empty stay
-    /// separated.
-    fn structural() -> Self {
+    /// The gaps that apply to a build that actually reconstructed something.
+    ///
+    /// Both records now exist, so a blocker list is always trustworthy and the
+    /// only question left is whether *this* task has any activity on record. An
+    /// empty window is reported as unavailable precisely because Orqyn cannot
+    /// distinguish "an agent worked without recording" from "nothing happened",
+    /// and the honest answer to that uncertainty is to say so rather than to
+    /// present an empty window as a complete history.
+    fn observed(recent_context: &RecentContext) -> Self {
         RecoveryGaps {
-            recent_context_unavailable: true,
-            blockers_unavailable: true,
+            recent_context_unavailable: recent_context.is_empty(),
+            blockers_unavailable: false,
         }
     }
 
@@ -291,9 +318,10 @@ enum Observation {
 /// ## What the builder will not do
 ///
 /// It will not invent a field it cannot source. [`RecentContext`] and
-/// [`Blocker`](director_domain::Blocker) have no tables, so the package carries
-/// empty defaults and the build records both as gaps. No new tables were added
-/// to make the package look complete.
+/// [`Blocker`](director_domain::Blocker) are both read from real tables now,
+/// and both are populated only with what those tables hold - actions are not
+/// inferred from working-tree changes, commits, or task status, and a
+/// blocker that was never recorded is not invented to explain a stuck task.
 pub struct RecoveryBuilder<'s> {
     store: &'s Store,
     task_id: TaskId,
@@ -440,6 +468,21 @@ impl<'s> RecoveryBuilder<'s> {
         let agents = self.store.agents().list_agents().await?;
         let active_agents: Vec<AgentId> = agents.into_iter().map(|agent| agent.id).collect();
 
+        // The two things a briefing could not reconstruct before, because nothing
+        // recorded them. Both are read from the store rather than inferred: an
+        // absent action is reported as an absent action, never as one invented
+        // from a status change or a changed file.
+        let blockers = self.store.blockers().blockers_for_task(&task.id).await?;
+        let actions = self.store.actions().actions_for_task(&task.id).await?;
+
+        // The bounded window is built by pushing into `RecentContext`, so the
+        // bound and the compaction rule are enforced by the same code that owns
+        // them, rather than by a second limit written here.
+        let mut recent_context = RecentContext::for_task(task.id.clone());
+        for action in &actions {
+            recent_context.push(action.clone());
+        }
+
         // The resume verdict: the checkpoint's recorded world against the world
         // as it now stands. `resume_status_for` computes the comparison itself
         // rather than taking the one below, so a caller cannot hand it a state
@@ -453,11 +496,7 @@ impl<'s> RecoveryBuilder<'s> {
         // about that instead of repeating a stale instruction.
         let next_action = next_action_for(&task, &checkpoint, resume_status);
 
-        // RecentContext has no persistence backing. An empty window is the
-        // honest representation, and `RecoveryGaps` is what keeps it from
-        // reading as "nothing happened."
-        let recent_context = RecentContext::for_task(task.id.clone());
-
+        let gaps = RecoveryGaps::observed(&recent_context);
         let package = ContinuationPackage {
             task_id: task.id.clone(),
             task_state_version: task.state_version,
@@ -476,15 +515,13 @@ impl<'s> RecoveryBuilder<'s> {
             observed_state: observed,
             comparison,
             active_agents,
-            blockers: blocker_list_for(&task),
+            blockers: blockers.iter().map(|blocker| blocker.id.clone()).collect(),
+            blocker_details: blockers,
             next_action,
             resume_status,
         };
 
-        Ok(RecoveryOutcome::Built(Box::new(Recovery {
-            package,
-            gaps: RecoveryGaps::structural(),
-        })))
+        Ok(RecoveryOutcome::Built(Box::new(Recovery { gaps, package })))
     }
 }
 
@@ -615,8 +652,12 @@ pub fn resume_status_for(
         return ResumeStatus::Conflicted;
     }
 
-    // 2. The task is blocked. `Blocker` rows are not persisted, so this comes
-    //    from the status the transition history records.
+    // 2. The task is blocked. This verdict comes from the *status*, not from the
+    //    persisted blocker list: nothing in the store or the loop ever writes
+    //    `TaskStatus::Blocked` (REPLAN declines to, so it does not own another
+    //    entity's lifecycle), so an open blocker can coexist with a non-blocked
+    //    status. The blockers are still in the briefing - the caller sees them -
+    //    but they do not decide this verdict.
     if task.status == TaskStatus::Blocked {
         return ResumeStatus::Blocked;
     }
@@ -719,16 +760,6 @@ pub fn next_action_for(task: &Task, checkpoint: &Checkpoint, status: ResumeStatu
             _ => format!("{} is not in progress; there is nothing to resume", task.title),
         },
     }
-}
-
-/// The blockers on a task, from persisted records.
-///
-/// `Blocker` has no table and no repository, so this is always empty today. The
-/// function exists so the package's field is filled by a call rather than by an
-/// inline `vec![]` — the place to add blocker persistence is one function, and
-/// every caller reads the same honest answer in the meantime.
-fn blocker_list_for(_task: &Task) -> Vec<BlockerId> {
-    Vec::new()
 }
 
 /// Build a [`ProjectState`] from the store's normalized state, for the recovery
@@ -1020,10 +1051,39 @@ mod tests {
     }
 
     #[test]
-    fn the_blocker_list_is_empty_because_blockers_are_not_persisted() {
-        // The honest representation: no blockers table exists, so the list is
-        // empty and the task's own status is what carries `blocked`.
-        assert!(blocker_list_for(&task(TaskStatus::Blocked)).is_empty());
+    fn an_empty_action_window_is_reported_as_unavailable_rather_than_as_a_history() {
+        // The same concern the old `blocker_list_is_empty` test covered, restated for
+        // the case that is now real: a task with nothing on record must not present an
+        // empty window as though it were a complete history.
+        let mut empty = RecentContext::for_task(TaskId::from_string("TASK-1"));
+        let gaps = RecoveryGaps::observed(&empty);
+        assert!(
+            gaps.recent_context_unavailable,
+            "no recorded actions means the briefing cannot say what happened"
+        );
+        assert!(
+            !gaps.blockers_unavailable,
+            "blockers are persisted now, so an empty blocker list is an answer, not a gap"
+        );
+        assert!(
+            !gaps.is_clean(),
+            "a window with nothing in it is not a clean build"
+        );
+
+        // One recorded action flips it, which is what makes the flag mean something.
+        let mut recorded = director_domain::action::Action::new(
+            director_domain::ids::ActionId::from_string("ACT-1"),
+            director_domain::action::ActionKind::Command,
+            "ran the tests",
+        );
+        recorded.task_id = Some(TaskId::from_string("TASK-1"));
+        empty.push(recorded);
+        let gaps = RecoveryGaps::observed(&empty);
+        assert!(!gaps.recent_context_unavailable);
+        assert!(
+            gaps.is_clean(),
+            "with both records readable there is nothing to report"
+        );
     }
 
     #[test]

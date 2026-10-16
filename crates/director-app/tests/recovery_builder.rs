@@ -23,21 +23,23 @@
 //! docs and by the fact that every other outcome below is reachable.
 
 use director_app::recovery::{recovery_context, RecoveryBuilder, RecoveryOutcome};
+use director_domain::action::{Action, ActionKind};
 use director_domain::assignment::ReleaseReason;
+use director_domain::blocker::{Blocker, BlockerKind};
 use director_domain::checkpoint::{Checkpoint, ResumeStatus};
 use director_domain::ids::{
-    AgentId, AssignmentId, CheckpointId, DecisionId, MachineId, ProjectId, SessionId, TaskId,
-    VerificationId,
+    ActionId, AgentId, AssignmentId, BlockerId, CheckpointId, DecisionId, MachineId, ProjectId,
+    SessionId, TaskId, VerificationId,
 };
 use director_domain::state::{ChangedFile, CommitInfo, FileChange, ProjectState, StateComparison};
 use director_domain::store::StoredProjectState;
 use director_domain::task::TaskStatus;
 use director_domain::verification::{Evidence, EvidenceStatus, ProbeKind, VerificationStatus};
 use director_domain::{
-    Agent, AgentAssignment, AgentRepository, AgentSession, AssignmentRepository, Capability,
-    CheckpointRepository, Decision, DecisionRepository, Harness, Project, ProjectRepository,
-    ProjectStateRepository, SessionRepository, Task, TaskRepository, TestResults, Verification,
-    VerificationRepository,
+    ActionRepository, Agent, AgentAssignment, AgentRepository, AgentSession, AssignmentRepository,
+    BlockerRepository, Capability, CheckpointRepository, Decision, DecisionRepository, Harness,
+    Project, ProjectRepository, ProjectStateRepository, SessionRepository, Task, TaskRepository,
+    TestResults, Verification, VerificationRepository,
 };
 use director_store::Store as SqliteStore;
 
@@ -821,16 +823,18 @@ async fn unpersisted_context_is_reported_as_unavailable_not_as_empty() {
         .package()
         .expect("built");
 
-    // `RecentContext` has no table and `Blocker` has no table. Both are reported
-    // by name, so an empty field is never read as "the agent did nothing" or
-    // "nothing was in the way".
+    // The action window is empty for this task, and is reported by name so an
+    // empty field is never read as "the agent did nothing". Blockers are
+    // different: they are persisted, so an empty blocker list is an *answer*,
+    // not a gap — and saying otherwise would tell a caller Orqyn cannot know,
+    // when in fact it can.
     assert!(recovery.gaps().recent_context_unavailable);
-    assert!(recovery.gaps().blockers_unavailable);
+    assert!(!recovery.gaps().blockers_unavailable);
     assert!(!recovery.actions_available());
     assert!(!recovery.gaps().is_clean());
     assert!(
         recovery.package.recent_context.is_empty(),
-        "the window is an honest placeholder, not a record",
+        "the window is empty because nothing was recorded, and is reported as such",
     );
     assert_eq!(recovery.package.recent_context.total_recorded, 0);
     assert!(recovery.package.blockers.is_empty());
@@ -939,4 +943,396 @@ async fn the_recovery_context_wrapper_still_answers_a_single_question() {
     // The wrapper is the same assembly path, so it reports the same gaps.
     assert_eq!(recovery.resume_status(), ResumeStatus::Ready);
     assert!(!recovery.actions_available());
+}
+
+// ---------------------------------------------------------------------------
+// Durable recovery context: actions and blockers
+// ---------------------------------------------------------------------------
+//
+// The two things a briefing could not reconstruct before, because nothing
+// recorded them. Both are read back from the store rather than inferred, and
+// the durability tests close the store and reopen it so nothing can pass on
+// in-memory state left behind by the writer.
+
+/// A store, and the path it lives at, so a test can drop the handle and reopen.
+async fn boot_at() -> (tempfile::TempDir, std::path::PathBuf, SqliteStore) {
+    let dir = tempfile::TempDir::new().expect("a temp dir for the store");
+    let path = dir.path().join("recovery.db");
+    let store = SqliteStore::open(&path)
+        .await
+        .expect("the store opens on a fresh file");
+    store
+        .projects()
+        .create_project(&Project::new(
+            ProjectId::from_string(PROJ),
+            PROJ,
+            "/nowhere",
+        ))
+        .await
+        .expect("project created");
+    (dir, path, store)
+}
+
+/// Record one action against `task`, as a running loop would.
+async fn record_action(store: &SqliteStore, task: &TaskId, id: &str, summary: &str) {
+    let mut action = Action::new(ActionId::from_string(id), ActionKind::Command, summary);
+    action.task_id = Some(task.clone());
+    store
+        .actions()
+        .record_action(&action)
+        .await
+        .expect("the action lands");
+}
+
+/// Record one blocker against `task`.
+async fn record_blocker(
+    store: &SqliteStore,
+    task: &TaskId,
+    id: &str,
+    description: &str,
+) -> Blocker {
+    let blocker = Blocker::raise(
+        BlockerId::from_string(id),
+        task.clone(),
+        BlockerKind::External,
+        description,
+    );
+    store
+        .blockers()
+        .create_blocker(&blocker)
+        .await
+        .expect("the blocker lands")
+}
+
+/// Recovery reconstructs the action window from durable records, and only after
+/// a real close-and-reopen — so nothing here can be served from the writer's
+/// memory.
+#[tokio::test]
+async fn recovery_reconstructs_recent_actions_after_the_store_is_reopened() {
+    let (_dir, path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    for (id, summary) in [
+        ("ACT-1", "ran the unit tests"),
+        ("ACT-2", "edited login.rs"),
+    ] {
+        record_action(&store, &task.id, id, summary).await;
+    }
+
+    // Close the writer entirely and open a fresh handle on the same file.
+    drop(store);
+    let reopened = SqliteStore::open(&path).await.expect("the store reopens");
+
+    let recovery = RecoveryBuilder::new(&reopened, task.id.clone())
+        .observed(observed("abc", "main", false), history(&["abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("an in-flight task with a checkpoint builds");
+
+    let summaries: Vec<&str> = recovery
+        .package
+        .recent_context
+        .actions
+        .iter()
+        .map(|action| action.summary.as_str())
+        .collect();
+    assert_eq!(
+        summaries,
+        vec!["ran the unit tests", "edited login.rs"],
+        "the window is reconstructed from durable records, oldest first"
+    );
+    assert_eq!(recovery.package.recent_context.total_recorded, 2);
+    assert!(
+        recovery.actions_available(),
+        "a window with recorded actions is a real record, not an absence"
+    );
+    assert!(!recovery.gaps().recent_context_unavailable);
+}
+
+/// Blockers survive a restart, and the package carries the records rather than
+/// only ids — ids cannot answer "what is blocking, and what would clear it".
+#[tokio::test]
+async fn blockers_survive_a_restart_and_reach_the_briefing() {
+    let (_dir, path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    let blocker = record_blocker(&store, &task.id, "BLK-1", "waiting on an API key").await;
+    assert!(blocker.status.is_blocking());
+
+    drop(store);
+    let reopened = SqliteStore::open(&path).await.expect("the store reopens");
+
+    let recovery = RecoveryBuilder::new(&reopened, task.id.clone())
+        .observed(observed("abc", "main", false), history(&["abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("built");
+
+    assert_eq!(
+        recovery.package.blockers,
+        vec![BlockerId::from_string("BLK-1")]
+    );
+    assert_eq!(recovery.package.blocker_details.len(), 1);
+    let restored = &recovery.package.blocker_details[0];
+    assert_eq!(restored.description, "waiting on an API key");
+    assert_eq!(restored.kind, BlockerKind::External);
+    assert!(restored.status.is_blocking());
+    assert!(
+        !recovery.gaps().blockers_unavailable,
+        "blockers are persisted, so an empty-or-not list is an answer rather than a gap"
+    );
+}
+
+/// Resolution history is preserved, and "we fixed it" stays distinguishable from
+/// "we stopped trying". A cleared blocker is retained, not deleted.
+#[tokio::test]
+async fn blocker_status_changes_and_resolution_history_are_preserved() {
+    let (_dir, path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    let mut blocker = record_blocker(&store, &task.id, "BLK-1", "waiting on review").await;
+    blocker = blocker.resolvable_by("a reviewer approves");
+    store
+        .blockers()
+        .update_blocker(&blocker)
+        .await
+        .expect("the resolution is recorded before the blocker clears");
+
+    blocker.resolve();
+    store
+        .blockers()
+        .update_blocker(&blocker)
+        .await
+        .expect("the blocker clears");
+
+    drop(store);
+    let reopened = SqliteStore::open(&path).await.expect("the store reopens");
+
+    let stored = reopened
+        .blockers()
+        .blockers_for_task(&task.id)
+        .await
+        .expect("the blocker history reads");
+    assert_eq!(
+        stored.len(),
+        1,
+        "a cleared blocker is retained, not deleted"
+    );
+    let restored = &stored[0];
+    assert!(!restored.status.is_blocking(), "it no longer blocks");
+    assert_eq!(
+        restored.resolution.as_deref(),
+        Some("a reviewer approves"),
+        "what would have cleared it is still on record"
+    );
+    assert!(
+        restored.resolved_at.is_some(),
+        "when it cleared survived the restart"
+    );
+    assert_eq!(
+        restored.raised_at.timestamp(),
+        blocker.raised_at.timestamp(),
+        "when it was raised is not rewritten by a later update"
+    );
+
+    // And a replacement reading the briefing sees the history, not just the id.
+    let recovery = RecoveryBuilder::new(&reopened, task.id.clone())
+        .observed(observed("abc", "main", false), history(&["abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("built");
+    assert_eq!(
+        recovery.package.blocker_details[0].resolution.as_deref(),
+        Some("a reviewer approves")
+    );
+}
+
+/// Both open and cleared blockers reach the briefing, oldest first — the list a
+/// replacement needs is "what has ever stopped this", not "what is stopping it".
+#[tokio::test]
+async fn the_briefing_carries_both_open_and_cleared_blockers_in_order() {
+    let (_dir, _path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    let mut first = record_blocker(&store, &task.id, "BLK-1", "first").await;
+    record_blocker(&store, &task.id, "BLK-2", "second").await;
+    first.resolve();
+    store
+        .blockers()
+        .update_blocker(&first)
+        .await
+        .expect("the first clears");
+
+    let recovery = RecoveryBuilder::new(&store, task.id.clone())
+        .observed(observed("abc", "main", false), history(&["abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("built");
+
+    let ids: Vec<String> = recovery
+        .package
+        .blocker_details
+        .iter()
+        .map(|b| b.id.to_string())
+        .collect();
+    assert_eq!(ids, vec!["BLK-1", "BLK-2"], "oldest first");
+    assert!(
+        !recovery.package.blocker_details[0].status.is_blocking(),
+        "the cleared one is still reported, marked as cleared"
+    );
+    assert!(recovery.package.blocker_details[1].status.is_blocking());
+}
+
+/// Missing history is reported as missing, and never invented. A task with
+/// nothing on record gets an empty window and an explicit gap — not a
+/// reconstruction guessed from status changes or changed files.
+#[tokio::test]
+async fn missing_history_is_reported_honestly_and_never_invented() {
+    let (_dir, _path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    // The repository genuinely moved between the checkpoint and now, and the
+    // working tree has a change — the tempting raw material for a fabricated
+    // action window. None of it may be used.
+    let recovery = RecoveryBuilder::new(&store, task.id.clone())
+        .observed(
+            observed("def456", "main", true),
+            history(&["abc", "def456"]),
+        )
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("built");
+
+    assert!(
+        recovery.package.recent_context.is_empty(),
+        "no actions were recorded, so none are reconstructed from commits or file changes"
+    );
+    assert_eq!(recovery.package.recent_context.total_recorded, 0);
+    assert!(
+        recovery.gaps().recent_context_unavailable,
+        "the absence is named rather than presented as a complete history"
+    );
+    assert!(!recovery.actions_available());
+    assert!(
+        recovery.package.blocker_details.is_empty(),
+        "and no blocker is invented either"
+    );
+    assert_eq!(recovery.package.blockers, Vec::<BlockerId>::new());
+}
+
+/// The window stays bounded no matter how much is on record: the store holds the
+/// log, `RecentContext` enforces the limit the briefing hands over.
+#[tokio::test]
+async fn the_reconstructed_window_stays_bounded_however_much_is_recorded() {
+    let (_dir, _path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    for n in 0..80 {
+        record_action(&store, &task.id, &format!("ACT-{n}"), &format!("step {n}")).await;
+    }
+    // The log itself is complete.
+    assert_eq!(
+        store
+            .actions()
+            .actions_for_task(&task.id)
+            .await
+            .expect("the log reads")
+            .len(),
+        80,
+        "the durable log is not truncated"
+    );
+
+    let recovery = RecoveryBuilder::new(&store, task.id.clone())
+        .observed(observed("abc", "main", false), history(&["abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("built");
+
+    let window = &recovery.package.recent_context;
+    assert!(
+        window.len() <= window.max_actions,
+        "the briefing never carries more than the bound"
+    );
+    assert!(
+        window.respects_bound(),
+        "and the window respects the invariant the domain states"
+    );
+    assert_eq!(
+        window.total_recorded, 80,
+        "compaction is lossy but accountable: the count still tells the truth"
+    );
+}
+
+/// The earlier continuation packages stay readable, and scope is untouched by
+/// any of this.
+#[tokio::test]
+async fn scope_survives_alongside_the_new_context() {
+    let (_dir, _path, store) = boot_at().await;
+
+    let mut scoped = Task::for_project(
+        ProjectId::from_string(PROJ),
+        TaskId::from_string(TASK),
+        TASK,
+        "ship it",
+    );
+    scoped.scope_paths = vec!["src/auth".to_string()];
+    let task = store
+        .tasks()
+        .create_task(&scoped)
+        .await
+        .expect("the task is created");
+    let task = move_task_to(&store, &task, TaskStatus::InProgress).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+    record_action(&store, &task.id, "ACT-1", "did a thing").await;
+
+    let recovery = RecoveryBuilder::new(&store, task.id.clone())
+        .observed(observed("abc", "main", false), history(&["abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("built");
+
+    assert_eq!(
+        recovery.package.scope_paths,
+        vec!["src/auth".to_string()],
+        "scope semantics are unchanged by this work"
+    );
+    assert_eq!(recovery.package.recent_context.actions.len(), 1);
+
+    // A package serialized before `blocker_details` existed still deserializes.
+    let mut legacy = serde_json::to_value(&recovery.package).expect("the package serializes");
+    legacy
+        .as_object_mut()
+        .expect("an object")
+        .remove("blocker_details");
+    let parsed = serde_json::from_value::<director_domain::ContinuationPackage>(legacy)
+        .expect("an older package still reads");
+    assert!(
+        parsed.blocker_details.is_empty(),
+        "the new field defaults rather than failing deserialization"
+    );
+    assert_eq!(
+        parsed.scope_paths,
+        vec!["src/auth".to_string()],
+        "and everything earlier in the payload is intact"
+    );
 }

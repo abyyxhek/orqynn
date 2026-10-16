@@ -58,8 +58,10 @@
 // already holds it — that is the shape the remaining helpers should take.
 #![allow(dead_code)]
 
+mod actions;
 mod agents;
 mod assignments;
+mod blockers;
 mod checkpoints;
 mod connection;
 mod decisions;
@@ -91,8 +93,10 @@ pub use state_sync::{SqliteProjectStateRepository, SqliteProviderSyncRepository}
 // connection pool, and the only way to the pool is [`Store::open`]. That keeps
 // "every connection is configured and migrated" an invariant rather than a
 // convention someone could forget to honor.
+pub use actions::SqliteActionRepository;
 pub use agents::SqliteAgentRepository;
 pub use assignments::SqliteAssignmentRepository;
+pub use blockers::SqliteBlockerRepository;
 pub use checkpoints::SqliteCheckpointRepository;
 pub use decisions::SqliteDecisionRepository;
 pub use plans::SqlitePlanRepository;
@@ -318,6 +322,20 @@ impl Store {
     /// retained, linked to the decision that reversed them.
     pub fn decisions(&self) -> SqliteDecisionRepository {
         SqliteDecisionRepository::new(self.pool.clone())
+    }
+
+    /// Blockers: what is standing in a task's way, and what cleared it.
+    ///
+    /// Cleared blockers are retained, so a replacement agent can read the
+    /// resolution history rather than only the current state.
+    pub fn blockers(&self) -> SqliteBlockerRepository {
+        SqliteBlockerRepository::new(self.pool.clone())
+    }
+
+    /// Observed task actions — the durable log a recovery briefing's bounded
+    /// window is built from.
+    pub fn actions(&self) -> SqliteActionRepository {
+        SqliteActionRepository::new(self.pool.clone())
     }
 
     /// Normalized project state — what Orqyn currently believes about a

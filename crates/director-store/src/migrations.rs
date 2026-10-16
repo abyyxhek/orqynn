@@ -86,6 +86,14 @@ pub fn migrations() -> BTreeMap<u32, Migration> {
             sql: include_str!("../migrations/0003_verifications.sql"),
         },
     );
+    all.insert(
+        4,
+        Migration {
+            version: 4,
+            name: "blockers_actions",
+            sql: include_str!("../migrations/0004_blockers_actions.sql"),
+        },
+    );
     all
 }
 
@@ -283,6 +291,8 @@ mod tests {
             "decisions",
             "project_states",
             "provider_sync",
+            "blockers",
+            "task_actions",
         ] {
             let exists: i64 = conn
                 .query_row(

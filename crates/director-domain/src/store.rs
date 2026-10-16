@@ -56,13 +56,15 @@
 
 use async_trait::async_trait;
 
+use crate::action::Action;
 use crate::agent::Agent;
 use crate::assignment::AgentAssignment;
+use crate::blocker::Blocker;
 use crate::checkpoint::Checkpoint;
 use crate::decision::Decision;
 use crate::ids::{
-    AgentId, AssignmentId, CheckpointId, DecisionId, PlanId, ProjectId, RepositoryId, SessionId,
-    TaskId, VerificationId,
+    ActionId, AgentId, AssignmentId, BlockerId, CheckpointId, DecisionId, PlanId, ProjectId,
+    RepositoryId, SessionId, TaskId, VerificationId,
 };
 use crate::plan::Plan;
 use crate::project::Project;
@@ -473,6 +475,55 @@ pub trait DecisionRepository: Store {
     /// The decisions made in the context of a task, newest first. A resuming
     /// agent reads these so it does not re-litigate a settled question.
     async fn decisions_for_task(&self, task: &TaskId) -> Result<Vec<Decision>, Self::Error>;
+}
+
+/// Persistence for blockers — what is standing in a task's way.
+///
+/// A blocker is retained after it stops blocking. Clearing one moves its `status`
+/// and stamps `resolved_at`; nothing is deleted, so "we fixed it" stays
+/// distinguishable from "we stopped trying" and a replacement agent can read the
+/// resolution history rather than only the current state.
+#[async_trait]
+pub trait BlockerRepository: Store {
+    /// Record a newly raised blocker.
+    async fn create_blocker(&self, blocker: &Blocker) -> Result<Blocker, Self::Error>;
+
+    /// Load a blocker by id, or [`StoreError::NotFound`].
+    async fn get_blocker(&self, id: &BlockerId) -> Result<Blocker, Self::Error>;
+
+    /// Persist a blocker's current state.
+    ///
+    /// Used both to attach a resolution before the blocker clears and to clear
+    /// it. The row is updated, never removed.
+    async fn update_blocker(&self, blocker: &Blocker) -> Result<Blocker, Self::Error>;
+
+    /// Every blocker recorded against a task, oldest first.
+    ///
+    /// Open **and** cleared: a replacement needs to know what stopped the
+    /// previous attempt, which is the question a list of only-open blockers
+    /// cannot answer.
+    async fn blockers_for_task(&self, task: &TaskId) -> Result<Vec<Blocker>, Self::Error>;
+}
+
+/// Persistence for task actions — the observed activity behind a task.
+///
+/// The store is the durable record; [`crate::context::RecentContext`] is the
+/// bounded *view* built from it. That split is the point: the bound is enforced
+/// on read, so the log stays complete for a query that wants it while a
+/// replacement agent still receives a window it can hold.
+#[async_trait]
+pub trait ActionRepository: Store {
+    /// Record an observed action.
+    async fn record_action(&self, action: &Action) -> Result<Action, Self::Error>;
+
+    /// Load an action by id, or [`StoreError::NotFound`].
+    async fn get_action(&self, id: &ActionId) -> Result<Action, Self::Error>;
+
+    /// The actions recorded against a task, oldest first.
+    ///
+    /// Unbounded: this is the durable log. Callers that need a window build one
+    /// through [`crate::context::RecentContext`], which is where the bound lives.
+    async fn actions_for_task(&self, task: &TaskId) -> Result<Vec<Action>, Self::Error>;
 }
 
 /// Persistence for normalized project state — what Orqyn currently knows.

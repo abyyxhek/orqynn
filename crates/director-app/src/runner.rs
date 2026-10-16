@@ -581,8 +581,14 @@ pub struct RecoveryStep {
     pub resume_status: ResumeStatus,
     /// The concrete first step for the receiving agent.
     pub next_action: String,
-    /// Whether the replacement has anything concrete it can do. `false` today,
-    /// because `RecentContext` has no persistence backing.
+    /// Whether the action window is a real record rather than an absence.
+    ///
+    /// `false` whenever [`Self::recent_actions`] is empty: Orqyn cannot
+    /// distinguish "an agent worked without recording" from "nothing happened",
+    /// so an empty window is reported as unavailable rather than as a complete
+    /// history. This was always derived from
+    /// [`Recovery::actions_available`], which was hardcoded `false` while
+    /// nothing was persisted; it is now driven by what the store actually holds.
     pub actions_available: bool,
     /// Whether every field was reconstructed. `false` today for every build,
     /// because two gaps are structural limits of Orqyn's persistence.
@@ -599,6 +605,35 @@ pub struct RecoveryStep {
     /// [`director_domain::task::Task::scope_overlap`] — so an empty list is a
     /// conservative signal, not permission to roam.
     pub scope_paths: Vec<String>,
+    /// The reconstructed action window: what was observed, oldest first.
+    ///
+    /// Built from persisted records, so it survives a restart. Empty is reported
+    /// honestly rather than filled in — `actions_available` is `false` whenever
+    /// this is empty, because Orqyn cannot distinguish "an agent worked without
+    /// recording" from "nothing happened".
+    pub recent_actions: Vec<String>,
+    /// The task's blockers, oldest first, open and cleared alike.
+    ///
+    /// Cleared blockers are kept so a replacement can tell "we fixed it" from
+    /// "we stopped trying".
+    pub blocker_details: Vec<BlockerSummary>,
+}
+
+/// One blocker, as a briefing reports it.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockerSummary {
+    /// The blocker's id.
+    pub id: String,
+    /// What kind of thing is blocking.
+    pub kind: String,
+    /// `open`, `resolved`, or `obsolete`.
+    pub status: String,
+    /// What is blocking, stated so someone else can act on it.
+    pub description: String,
+    /// What unblocking looks like, if recorded.
+    pub resolution: Option<String>,
+    /// When it was cleared, if it was.
+    pub resolved_at: Option<DateTime<Utc>>,
 }
 
 impl RecoveryStep {
@@ -615,6 +650,28 @@ impl RecoveryStep {
             // the task claims, and comparison semantics belong to
             // `Task::scope_overlap` at enforcement time.
             scope_paths: recovery.package.scope_paths.clone(),
+            // The window is already bounded by `RecentContext`; the briefing
+            // reports the summaries rather than re-deriving anything.
+            recent_actions: recovery
+                .package
+                .recent_context
+                .actions
+                .iter()
+                .map(|action| action.summary.clone())
+                .collect(),
+            blocker_details: recovery
+                .package
+                .blocker_details
+                .iter()
+                .map(|blocker| BlockerSummary {
+                    id: blocker.id.to_string(),
+                    kind: format!("{:?}", blocker.kind).to_lowercase(),
+                    status: format!("{:?}", blocker.status).to_lowercase(),
+                    description: blocker.description.clone(),
+                    resolution: blocker.resolution.clone(),
+                    resolved_at: blocker.resolved_at,
+                })
+                .collect(),
         }
     }
 }

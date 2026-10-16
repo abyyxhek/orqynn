@@ -17,14 +17,16 @@
 
 use std::matches;
 
+use director_domain::action::{Action, ActionKind};
 use director_domain::agent::{Agent, AgentStatus, Harness};
 use director_domain::assignment::{AgentAssignment, AssignmentStatus, ReleaseReason};
+use director_domain::blocker::{Blocker, BlockerKind};
 use director_domain::capability::Capability;
 use director_domain::checkpoint::{Checkpoint, CheckpointStatus};
 use director_domain::decision::{Decision, DecisionStatus};
 use director_domain::ids::{
-    AgentId, AssignmentId, CheckpointId, DecisionId, MachineId, PlanId, ProjectId, RepositoryId,
-    SessionId, TaskId, VerificationId,
+    ActionId, AgentId, AssignmentId, BlockerId, CheckpointId, DecisionId, MachineId, PlanId,
+    ProjectId, RepositoryId, SessionId, TaskId, VerificationId,
 };
 use director_domain::plan::{Plan, PlanStatus};
 use director_domain::project::{DefaultBranch, Project};
@@ -36,9 +38,10 @@ use director_domain::verification::{
     Evidence, EvidenceStatus, ProbeKind, Verification, VerificationStatus,
 };
 use director_domain::{
-    AgentRepository, AssignmentRepository, CheckpointRepository, DecisionRepository,
-    PlanRepository, ProjectRepository, ProjectStateRepository, ProviderSyncRepository,
-    SessionRepository, StoreError, TaskRepository, VerificationRepository,
+    ActionRepository, AgentRepository, AssignmentRepository, BlockerRepository,
+    CheckpointRepository, DecisionRepository, PlanRepository, ProjectRepository,
+    ProjectStateRepository, ProviderSyncRepository, SessionRepository, StoreError, TaskRepository,
+    VerificationRepository,
 };
 
 use director_store::Store;
@@ -3573,4 +3576,188 @@ async fn a_fresh_verification_lands_after_re_reading_the_task() {
         .await
         .expect("history");
     assert_eq!(history.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Blockers and actions: the durable records a recovery briefing is built from
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_blocker_round_trips_through_the_store() {
+    let (store, _dir) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task created");
+
+    let blocker = Blocker::raise(
+        BlockerId::from_string("BLK-1"),
+        TaskId::from_string("TASK-1"),
+        BlockerKind::External,
+        "waiting on a credential",
+    );
+    let stored = store
+        .blockers()
+        .create_blocker(&blocker)
+        .await
+        .expect("the blocker lands");
+    assert_eq!(stored.id, BlockerId::from_string("BLK-1"));
+    assert_eq!(stored.description, "waiting on a credential");
+    assert!(stored.status.is_blocking());
+
+    let read = store
+        .blockers()
+        .get_blocker(&BlockerId::from_string("BLK-1"))
+        .await
+        .expect("the blocker reads back");
+    assert_eq!(read, stored);
+}
+
+#[tokio::test]
+async fn a_cleared_blocker_is_retained_with_its_resolution() {
+    let (store, _dir) = store().await;
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task created");
+
+    let blocker = Blocker::raise(
+        BlockerId::from_string("BLK-1"),
+        TaskId::from_string("TASK-1"),
+        BlockerKind::Dependency,
+        "waiting on TASK-2",
+    )
+    .resolvable_by("TASK-2 completes");
+    let mut blocker = store
+        .blockers()
+        .create_blocker(&blocker)
+        .await
+        .expect("lands");
+    blocker.resolve();
+    let cleared = store
+        .blockers()
+        .update_blocker(&blocker)
+        .await
+        .expect("the blocker clears");
+
+    assert!(!cleared.status.is_blocking());
+    assert_eq!(cleared.resolution.as_deref(), Some("TASK-2 completes"));
+    assert!(cleared.resolved_at.is_some());
+
+    // Retained, not deleted — so "we fixed it" stays distinguishable from
+    // "we stopped trying".
+    let all = store
+        .blockers()
+        .blockers_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("history reads");
+    assert_eq!(all.len(), 1, "a cleared blocker is still on record");
+}
+
+#[tokio::test]
+async fn updating_a_blocker_that_was_never_raised_is_refused() {
+    let (store, _dir) = store().await;
+    let missing = Blocker::raise(
+        BlockerId::from_string("BLK-NOPE"),
+        TaskId::from_string("TASK-1"),
+        BlockerKind::Unknown,
+        "never stored",
+    );
+    let err = store
+        .blockers()
+        .update_blocker(&missing)
+        .await
+        .expect_err("updating nothing writes nothing");
+    assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn actions_come_back_oldest_first_and_survive_a_reopen() {
+    let dir = tempfile::TempDir::new().expect("a temp dir");
+    let path = dir.path().join("director.db");
+    let store = Store::open(&path).await.expect("store opens");
+    store
+        .projects()
+        .create_project(&project("PROJ-1"))
+        .await
+        .expect("project");
+    store
+        .tasks()
+        .create_task(&task("TASK-1", "PROJ-1"))
+        .await
+        .expect("task created");
+
+    for n in 0..3 {
+        let mut action = Action::new(
+            ActionId::from_string(format!("ACT-{n}")),
+            ActionKind::Note,
+            format!("step {n}"),
+        );
+        action.task_id = Some(TaskId::from_string("TASK-1"));
+        action.detail = Some("payload".to_string());
+        store
+            .actions()
+            .record_action(&action)
+            .await
+            .expect("the action lands");
+    }
+
+    let reopened = Store::open(&path).await.expect("the store reopens");
+    let actions = reopened
+        .actions()
+        .actions_for_task(&TaskId::from_string("TASK-1"))
+        .await
+        .expect("the log reads");
+    let summaries: Vec<&str> = actions.iter().map(|a| a.summary.as_str()).collect();
+    assert_eq!(
+        summaries,
+        vec!["step 0", "step 1", "step 2"],
+        "ordering is the narrative a replacement agent reads"
+    );
+    assert_eq!(actions[0].detail.as_deref(), Some("payload"));
+    assert_eq!(actions[0].kind, ActionKind::Note);
+    assert_eq!(
+        actions[0].task_id,
+        Some(TaskId::from_string("TASK-1")),
+        "the action is attributed to its task"
+    );
+}
+
+#[tokio::test]
+async fn an_action_with_no_task_is_context_too() {
+    let (store, _dir) = store().await;
+    // Exploration outside any task is still worth keeping — the same reason the
+    // in-memory window kept taskless actions.
+    let action = Action::new(
+        ActionId::from_string("ACT-1"),
+        ActionKind::Prompt,
+        "asked a question",
+    );
+    let stored = store
+        .actions()
+        .record_action(&action)
+        .await
+        .expect("a taskless action lands");
+    assert!(stored.task_id.is_none());
+    assert_eq!(
+        store
+            .actions()
+            .get_action(&ActionId::from_string("ACT-1"))
+            .await
+            .expect("reads back")
+            .summary,
+        "asked a question"
+    );
 }
