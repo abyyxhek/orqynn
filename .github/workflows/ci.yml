@@ -1,0 +1,87 @@
+name: CI
+
+# Runs the project's four established gates on every push and pull request.
+# These are the same four commands documented in the README quickstart and
+# enforced by hand until now.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  quality:
+    name: fmt / clippy / build / test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      # rust-toolchain.toml pins `stable-x86_64-pc-windows-gnu`, a
+      # triple-specific channel that only resolves on Windows. Override it here
+      # so the same toolchain resolution works on every runner. Keeping the
+      # override in CI rather than editing the pin preserves the local
+      # Windows workflow for contributors on that platform.
+      RUSTUP_TOOLCHAIN: stable
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable, with rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # `rusqlite` is built with the `bundled` feature and `libgit2-sys` vendors
+      # libgit2, so both need a working C compiler on unix. openssl is not
+      # required: no openssl-sys entry exists in Cargo.lock.
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install pkg-config
+
+      - name: Gate 1 - cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: Gate 2 - cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Gate 3 - cargo build --workspace
+        run: cargo build --workspace
+
+      - name: Gate 4a - cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets
+
+      - name: Gate 4b - cargo test --workspace --doc
+        run: cargo test --workspace --doc
+
+      # NOTE: the 13 live MCP tests (8 ai-memory + 5 handoff) are deliberately
+      # NOT run here. They are marked #[ignore] because they spawn real
+      # `handoff-mcp` and `ai-memory` server binaries, which this workflow does
+      # not install. They are still type-checked above, because
+      # --all-targets compiles every integration target including the ignored
+      # ones. Running them requires those two binaries on PATH; see
+      # docs/PHASE2-ADAPTERS.md and docs/PHASE3-MEMORY.md.

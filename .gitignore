@@ -22,3 +22,11 @@ Thumbs.db
 
 # Redirected target directory used to dodge OneDrive sync locks (see README).
 .director-brain-target/
+
+# Local scratch: build/test logs, generated audit workbooks, and source
+# snapshots kept beside a file while it is being edited. None of this belongs in
+# the history; the audit reports themselves are markdown and are tracked.
+*.txt
+*.xlsx
+*.bak
+*.original
