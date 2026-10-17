@@ -7,8 +7,8 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20%2F%20MCP%20Boundary-purple.svg?style=for-the-badge)](docs/PHASE0-FORENSICS.md)
-[![Tests](https://img.shields.io/badge/Tests-641%20Passed-brightgreen.svg?style=for-the-badge)](tests/)
-[![Status](https://img.shields.io/badge/Status-Phases%201--3%2C%205--7%2C%2010--13%20Complete-success.svg?style=for-the-badge)](docs/)
+[![Tests](https://img.shields.io/badge/Tests-727%20Passed%20%2F%2014%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
+[![Status](https://img.shields.io/badge/Status-Phases%201--3%2C%205--7%2C%2010--14%20Complete-success.svg?style=for-the-badge)](docs/)
 
 **A vendor-independent orchestration brain for multi-agent software engineering.**
 
@@ -33,6 +33,7 @@ Orqyn fills this gap. Sitting **above** the coding agents and **beside** memory/
 4. **Independently verifies completed work** using isolated, machine-checked test probes—completely eliminating hallucinated "I am done" declarations.
 5. **Maintains append-only, transactional audit logs** backed by SQLite with optimistic concurrency versioning.
 6. **Briefs replacement agents** with complete continuation packages containing project state, git diffs, prior verdicts, and dependency contracts.
+7. **Records what it actually observed** — the commands it ran, the exit codes it read — on a durable, append-only action log, so a replacement inherits a record of work rather than a claim of work.
 
 ```
                     ┌─────────────────────────────────────────────┐
@@ -78,6 +79,7 @@ Orqyn communicates with all external substrates **exclusively over Model Context
 | **4. Substrate Lock-in** | Orchestrators compile directly against specific memory or task libraries, creating rigid vendor lock-in. | **Zero Substrate Coupling**: Everything communicates across standard MCP JSON-RPC boundaries. Boundary tests fail the build if internal structs are imported. |
 | **5. Destructive State Overwrites** | Task updates, decisions, and replans overwrite previous records in place, destroying historical audit trails. | **Append-Only SQLite History**: Plans supersede rather than delete. Decisions, verifications, and assignment histories accumulate durably with optimistic locking. |
 | **6. Amnesiac Replacements** | A replacement agent restarts a task from a blank prompt — re-reading the tree, re-deriving intent, and redoing work the previous agent already finished. | **Evidence-Backed Recovery Context**: OBSERVE checkpoints in-flight work from git evidence on every real change, and `RecoveryBuilder` hands a replacement the continuation package: task contract, checkpoint lineage, prior verdicts, and exactly what to do next. |
+| **7. Fabricated History** | A replacement is handed a narrative: "the agent ran the tests, they passed." The narrative is unfalsifiable and is exactly what the crashed agent believed. | **Recorded Events, Not Reported Ones**: VERIFY records the commands *Orqyn* ran and the exit codes *Orqyn* read, keyed on the round's own persisted identity so the log cannot be double-written or restamped. Agent self-reports are claims and are never recorded as facts — `Recovery::actions_complete()` returns `false` for every build today, and says why. |
 
 ---
 
@@ -134,11 +136,21 @@ Every task declares what it may touch, and no two tasks with overlapping scope a
 - A refusal is structured and names both the task in the way and the paths in dispute — `AssignError::ScopeConflict`, or `UnassignedReason::ScopeConflict` for contention within a round. Nothing is written, and the task stays `todo`.
 - Comparison is case-sensitive on every platform, so the same plan yields the same assignments on Linux, macOS, and Windows. See [`docs/PHASE13-CONFLICT-DETECTION.md`](docs/PHASE13-CONFLICT-DETECTION.md) for the full semantics and the known limitation this creates on a case-insensitive filesystem.
 
+### 9. A Log Records Work, and a Gap Is Announced — Never Papered Over
+The recovery briefing distinguishes *nothing happened* from *Orqyn has no record either way*, and refuses to invent the difference.
+- **VERIFY is the only step that records actions**, because it is the only one whose events are *observed*: it runs the commands and reads the exit codes itself. An agent's report of what it did is a claim about the work, and a claim is not written to a log of facts.
+- **An action id is derived, not drawn.** `ACT-{verification_id}-{ordinal}` is built from the round's own persisted identity, never from a counter or the clock — so a restart cannot re-mint it, one round cannot be recorded twice, and the same inputs produce the same log.
+- **A round that changed nothing records nothing.** A task left `verification_pending` is surveyed again next tick, so recording each attempt would grow the log by one duplicate of the same failure per tick. Duplicates dressed as history are what the log exists to rule out.
+- **The one provable hole is reported.** The verdict commits before its actions are written, so a process killed in between leaves a durable verdict with no actions — and no later round will fill them, because the task has left the survey set. `RecoveryGaps::actions_incomplete` detects exactly that (a verification id with no matching action) and `RecoveryStep::actions_incomplete` carries it to the caller.
+- **A blocker is a decision, so it is an explicit operation.** No round in the loop may decide on its own that a task is blocked — REPLAN reports stranded dependents and declines, because a blocker is a second entity's lifecycle. `Runner::raise_blocker`, `resolve_blocker`, and `obsolete_blocker` are where that decision becomes durable.
+- **Resolved and obsoleted are different histories.** Replaying the same clearing is a no-op that returns the row unchanged; asking for the *other* cleared state is a contradiction and is refused rather than silently overwriting. Two things standing in the way are two blockers, not one whose description quietly changed.
+- **An open blocker decides the resume verdict without touching task status.** A task whose checkpoint is current but which still has an open blocker reads `ResumeStatus::Blocked`; the task's own `status` is left alone, because REPLAN does not own another entity's lifecycle. Staleness still wins over blocking — a stale checkpoint has to be reconciled before its blocker means anything.
+
 ---
 
 ## The Control Loop
 
-Orqyn operates a continuous 7-step closed-loop lifecycle, with a checkpoint writer running inside OBSERVE and a recovery context assembled on demand to brief replacements:
+Orqyn operates a continuous 7-step closed-loop lifecycle, with a checkpoint writer running inside OBSERVE, an action log written by VERIFY, and a recovery context assembled on demand to brief replacements:
 
 ```mermaid
 flowchart TD
@@ -146,7 +158,7 @@ flowchart TD
     PLAN --> SCHED[3. SCHEDULE<br/>Match Ready Tasks to Eligible Agents<br/>+ attach recovery context]
     SCHED --> ASSIGN[4. ASSIGN<br/>Issue Atomic Leases & Move to In-Progress]
     ASSIGN --> MON[5. MONITOR<br/>Heartbeat TTLs, Lease Expiry & Progress Reports]
-    MON --> VERIFY{6. VERIFY<br/>Run Machine-Checkable Probes}
+    MON --> VERIFY{6. VERIFY<br/>Run Machine-Checkable Probes<br/>+ record what it observed}
     VERIFY -- Passed --> DONE((Task Done))
     VERIFY -- Failed / Stalled --> REPLAN[7. REPLAN<br/>Retry, Rework Contract, or Cancel]
     REPLAN --> SCHED
@@ -162,9 +174,10 @@ flowchart TD
 | **SCHEDULE** | `schedule::schedule` | Pairs unassigned `ready_tasks` with available agents using a 4-tier policy: eligibility, fresh-eyes (prioritizing new agents), specialist-first (conserving generalists), and deterministic tie-breaking. When it hands a task to a replacement agent, it attaches the recovery context built by `recovery::RecoveryBuilder`. |
 | **ASSIGN** | `assign::assign` | Acquires a claim-once lease for an agent, transitions task status to `in_progress`, and records the assignment transactionally. |
 | **MONITOR** | `monitor::monitor` | Checks heartbeat ages against TTL windows. Reclaims expired leases from vanished agents, handles progress reports, and moves finished work to `verification_pending`. |
-| **VERIFY** | `verify::verify` | Resolves machine-checkable criteria into probes (`Probe::Command`), executes them via `ExecutionProvider`, reads raw exit codes, and writes append-only `Verification` records. |
+| **VERIFY** | `verify::verify` / `verify_at` | Resolves machine-checkable criteria into probes (`Probe::Command`), executes them via `ExecutionProvider`, reads raw exit codes, and writes append-only `Verification` records. It then records what it observed as actions on the durable log — one per check that actually ran, keyed on the round's own verification id. |
 | **REPLAN** | `replan::replan` | Evaluates failed or stranded tasks and applies caller-specified remediations (`Retry`, `Rework`, or `Cancel`) while reporting any dependent tasks left stranded. |
-| **RECOVERY** | `recovery::RecoveryBuilder` | Assembles a complete continuation package (contracts, version history, previous verdicts, git checkpoint) in one place, so a replacement agent — or a driver briefing one — asks one question and gets one answer. |
+| **RECOVERY** | `recovery::RecoveryBuilder` | Assembles a complete continuation package (contracts, version history, previous verdicts, git checkpoint, recorded actions, blockers) in one place, so a replacement agent — or a driver briefing one — asks one question and gets one answer. It also reports the gaps by name, so an empty field is never read as a fact about the work. |
+| **BLOCKERS** *(operations, not a step)* | `Runner::raise_blocker` / `resolve_blocker` / `obsolete_blocker` | Persists the decision that something stands in the way of a task. Deliberately outside the loop: no round is allowed to make that call on its own, because a blocker is a second entity's lifecycle. |
 
 ---
 
@@ -255,8 +268,15 @@ cd orqynn
 # Build all workspace crates
 cargo build
 
-# Run the complete test suite (641 tests)
+# Run the complete test suite (727 tests pass; 14 live-MCP tests are #[ignore]d
+# because they spawn real `handoff-mcp` / `ai-memory` server binaries)
 cargo test --workspace
+
+# The same four gates CI runs on every push (see .github/workflows/ci.yml)
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace
+cargo test --workspace --all-targets && cargo test --workspace --doc
 ```
 
 > **Windows OneDrive Tip**: If building inside a OneDrive directory, Windows file-locking can intermittently interrupt target builds. Redirect the build directory:
@@ -277,15 +297,17 @@ use director_adapters::{InMemoryProvider, LocalExecutor};
 use director_app::observe::observe;
 use director_app::plan::{plan, PlanRequest, TaskSpec};
 use director_app::recovery::{RecoveryBuilder, RecoveryOutcome};
+use director_app::runner::Runner;
 use director_app::schedule::schedule;
 use director_app::verify::verify;
 use director_domain::agent::{Agent, Harness};
+use director_domain::blocker::BlockerKind;
 use director_domain::capability::Capability;
 use director_domain::ids::{
     AgentId, IdGenerator, MachineId, PlanId, ProjectId, RepositoryId, TaskId,
 };
 use director_domain::project::Project;
-use director_domain::{AgentRepository, ProjectRepository};
+use director_domain::{AgentRepository, BlockerRepository, ProjectRepository};
 use director_store::Store;
 use tempfile::tempdir;
 
@@ -401,14 +423,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scheduled.unassigned.len(),
     );
 
-    // 5. VERIFY: Orqyn judges the work itself. Nothing an agent reports can
+    // 5. The assigned agent gets as far as editing the working tree. The next
+    //    OBSERVE round sees a real change and checkpoints the in-flight task —
+    //    checkpoints are written from git evidence, never inferred from a report.
+    std::fs::write(
+        repo_dir.join("schema.sql"),
+        "create table users (id integer);\n",
+    )?;
+    observe(
+        &store,
+        &git,
+        &mut IdGenerator::new(),
+        &InMemoryProvider::new(),
+        &project,
+        &repository,
+        &local_path,
+    )
+    .await?;
+
+    // 6. VERIFY: Orqyn judges the work itself. Nothing an agent reports can
     //    reach `done` — a report of completion moves a task to
     //    `verification_pending`, and this step is the only thing that moves it
-    //    further, by executing the probes and reading the exit codes.
+    //    further, by executing the probes and reading the exit codes. What it
+    //    observed on the way is recorded on the durable action log.
     let report = verify(&store, &LocalExecutor::default(), &project, dir.path()).await?;
     println!("{} task(s) judged this round", report.judged.len());
 
-    // 6. When an agent vanishes mid-task, brief its replacement by asking one
+    // 7. When an agent vanishes mid-task, brief its replacement by asking one
     //    question. `RecoveryBuilder` assembles the continuation package — task
     //    contract, checkpoint lineage, prior verdicts — and is the same code
     //    SCHEDULE uses when it hands recovered work to a new agent.
@@ -420,11 +461,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match outcome {
         RecoveryOutcome::Built(recovery) => {
             println!("next action for a replacement: {}", recovery.next_action());
+            // The briefing says what it does not know, rather than reading an
+            // empty field as a fact about the work.
+            println!(
+                "actions recorded: yes={} complete={} provably-missing-part={}",
+                recovery.actions_available(),
+                recovery.actions_complete(),
+                recovery.gaps().actions_incomplete,
+            );
         }
         RecoveryOutcome::NoCheckpoint(_) => {
             println!("no checkpoint yet — nothing in flight to resume");
         }
         _ => println!("task unknown to Orqyn"),
+    }
+
+    // 8. Blockers are an explicit decision, so they are an explicit operation —
+    //    no round in the loop is allowed to make this call on its own. The row
+    //    is kept after it is cleared, so a replacement can see what stopped the
+    //    previous attempt.
+    let memory = InMemoryProvider::new();
+    let executor = LocalExecutor::default();
+    let mut runner = Runner::new(&store, &git, &memory, &executor, dir.path());
+    let now = chrono::Utc::now();
+    let blocker = runner
+        .raise_blocker(
+            &TaskId::from_string("MODEL"),
+            BlockerKind::External,
+            "waiting on a database credential",
+            Some("operator must grant access".into()),
+            now,
+        )
+        .await?;
+    println!("{} raised on MODEL", blocker.id);
+    // Resolving it is a distinct history from obsoleting it, so asking for the
+    // wrong one is refused instead of silently rewriting the row. The cleared row
+    // is kept either way, so a replacement can see what stopped the attempt.
+    runner.resolve_blocker(&blocker.id, now).await?;
+    for b in store
+        .blockers()
+        .blockers_for_task(&TaskId::from_string("MODEL"))
+        .await?
+    {
+        println!("  {} {:?} — {}", b.id, b.status, b.description);
     }
 
     Ok(())
@@ -448,6 +527,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | **11** | **Runtime & Recovery Validation** | Integration test suite proving crash survival, rebase tolerance, and replacement agent briefings. | ✅ Complete |
 | **12** | **Checkpointing & Recovery Context** | `checkpoint::checkpoint_round` derives evidence-backed checkpoints inside OBSERVE; `recovery::RecoveryBuilder` assembles a replacement agent's continuation package in one place, and SCHEDULE attaches it. | ✅ Complete |
 | **13** | **Deterministic Conflict Detection** | Normalized `scope_paths` compared as path prefixes; SCHEDULE refuses overlapping pairings and ASSIGN refuses the handoff, naming the task in the way and the ground in dispute. An undeclared scope is treated as unrestricted, not empty. | ✅ Complete |
+| **14** | **Recorded Events & Explicit Blockers** | VERIFY records the commands it ran and the exit codes it read as actions keyed on the round's own verification id, so the recovery log is a record of work rather than of claims. The one provable loss window is detected (`actions_incomplete`) instead of hidden. Blocker lifecycle becomes an explicit, replay-safe, contradiction-refusing operation, and an open blocker decides the resume verdict without mutating task status. | ✅ Complete |
 
 ---
 
