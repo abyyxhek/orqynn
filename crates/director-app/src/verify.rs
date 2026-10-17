@@ -169,6 +169,14 @@ pub struct Judged {
     /// The status the round wrote, if it wrote one. `None` for a task the round
     /// left awaiting verification.
     pub outcome: Option<TaskStatus>,
+    /// The verification the round persisted.
+    ///
+    /// Present for every judged task, including one the round could not judge: the
+    /// engine records an `Unverifiable` round's evidence rather than dropping it.
+    /// It is the round's stable identity, which is what makes anything derived
+    /// from this round — an action id, a reconciliation — reproducible across a
+    /// restart rather than a function of when the round happened to run.
+    pub verification_id: director_domain::ids::VerificationId,
 }
 
 /// The verdict one round reached about one task.
@@ -272,6 +280,27 @@ pub async fn verify<E>(
 where
     E: ExecutionProvider,
 {
+    verify_at(store, executor, project_id, working_dir, chrono::Utc::now()).await
+}
+
+/// [`verify`], with the round's instant supplied rather than read.
+///
+/// The `_at` form is the codebase's convention for every other step, and it
+/// exists here for the same reason: a round that stamps its own records from the
+/// wall clock cannot be replayed, so anything derived from a round — an action id,
+/// the timestamps on the actions a run recorded — could not be reproduced from
+/// the same inputs. [`engine::verify_task`] already took a pinned instant; this
+/// only threads it the rest of the way.
+pub async fn verify_at<E>(
+    store: &Store,
+    executor: &E,
+    project_id: &ProjectId,
+    working_dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<VerifyReport, VerifyError>
+where
+    E: ExecutionProvider,
+{
     let tasks = store.tasks().list_tasks(project_id).await?;
 
     let mut judged = Vec::new();
@@ -283,8 +312,7 @@ where
         // checks into probes, gathers the evidence through the executor,
         // reaches a verdict, and lands it — record, status move, and history
         // row — in one transaction. This step reports what came back.
-        let round =
-            engine::verify_task(store, executor, task, working_dir, chrono::Utc::now()).await?;
+        let round = engine::verify_task(store, executor, task, working_dir, now).await?;
 
         judged.push(Judged {
             task: task.id.clone(),
@@ -300,6 +328,7 @@ where
             // so the report and the store cannot disagree about what a `Passed`
             // verdict means.
             outcome: round.verification.status.task_status(),
+            verification_id: round.verification.id.clone(),
         });
     }
 
@@ -450,7 +479,7 @@ pub fn verdict_destination(verdict: &Verdict) -> Option<TaskStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use director_domain::ids::TaskId;
+    use director_domain::ids::{TaskId, VerificationId};
     use director_domain::task::ExpectedOutput;
 
     /// An expected output with a machine check.
@@ -734,18 +763,21 @@ mod tests {
                     verdict: Verdict::Passed,
                     checks: vec![],
                     outcome: Some(TaskStatus::Done),
+                    verification_id: VerificationId::from_string("VER-A-1"),
                 },
                 Judged {
                     task: TaskId::from_string("B"),
                     verdict: Verdict::Failed,
                     checks: vec![],
                     outcome: Some(TaskStatus::Failed),
+                    verification_id: VerificationId::from_string("VER-B-1"),
                 },
                 Judged {
                     task: TaskId::from_string("C"),
                     verdict: Verdict::Unverifiable(UnverifiableReason::NoChecks),
                     checks: vec![],
                     outcome: None,
+                    verification_id: VerificationId::from_string("VER-C-1"),
                 },
             ],
         };

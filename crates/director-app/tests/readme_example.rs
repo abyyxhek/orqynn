@@ -7,15 +7,17 @@ use director_adapters::{InMemoryProvider, LocalExecutor};
 use director_app::observe::observe;
 use director_app::plan::{plan, PlanRequest, TaskSpec};
 use director_app::recovery::{RecoveryBuilder, RecoveryOutcome};
+use director_app::runner::Runner;
 use director_app::schedule::schedule;
 use director_app::verify::verify;
 use director_domain::agent::{Agent, Harness};
+use director_domain::blocker::BlockerKind;
 use director_domain::capability::Capability;
 use director_domain::ids::{
     AgentId, IdGenerator, MachineId, PlanId, ProjectId, RepositoryId, TaskId,
 };
 use director_domain::project::Project;
-use director_domain::{AgentRepository, ProjectRepository};
+use director_domain::{AgentRepository, BlockerRepository, ProjectRepository};
 use director_store::Store;
 use tempfile::tempdir;
 
@@ -130,14 +132,33 @@ async fn readme_example_main() -> Result<(), Box<dyn std::error::Error>> {
         scheduled.unassigned.len(),
     );
 
-    // 5. VERIFY: Orqyn judges the work itself. Nothing an agent reports can
+    // 5. The assigned agent gets as far as editing the working tree. The next
+    //    OBSERVE round sees a real change and checkpoints the in-flight task —
+    //    checkpoints are written from git evidence, never inferred from a report.
+    std::fs::write(
+        repo_dir.join("schema.sql"),
+        "create table users (id integer);\n",
+    )?;
+    observe(
+        &store,
+        &git,
+        &mut IdGenerator::new(),
+        &InMemoryProvider::new(),
+        &project,
+        &repository,
+        &local_path,
+    )
+    .await?;
+
+    // 6. VERIFY: Orqyn judges the work itself. Nothing an agent reports can
     //    reach `done` — a report of completion moves a task to
     //    `verification_pending`, and this step is the only thing that moves it
-    //    further, by executing the probes and reading the exit codes.
+    //    further, by executing the probes and reading the exit codes. What it
+    //    observed on the way is recorded on the durable action log.
     let report = verify(&store, &LocalExecutor::default(), &project, dir.path()).await?;
     println!("{} task(s) judged this round", report.judged.len());
 
-    // 6. When an agent vanishes mid-task, brief its replacement by asking one
+    // 7. When an agent vanishes mid-task, brief its replacement by asking one
     //    question. `RecoveryBuilder` assembles the continuation package — task
     //    contract, checkpoint lineage, prior verdicts — and is the same code
     //    SCHEDULE uses when it hands recovered work to a new agent.
@@ -149,11 +170,49 @@ async fn readme_example_main() -> Result<(), Box<dyn std::error::Error>> {
     match outcome {
         RecoveryOutcome::Built(recovery) => {
             println!("next action for a replacement: {}", recovery.next_action());
+            // The briefing says what it does not know, rather than reading an
+            // empty field as a fact about the work.
+            println!(
+                "actions recorded: yes={} complete={} provably-missing-part={}",
+                recovery.actions_available(),
+                recovery.actions_complete(),
+                recovery.gaps().actions_incomplete,
+            );
         }
         RecoveryOutcome::NoCheckpoint(_) => {
             println!("no checkpoint yet — nothing in flight to resume");
         }
         _ => println!("task unknown to Orqyn"),
+    }
+
+    // 8. Blockers are an explicit decision, so they are an explicit operation —
+    //    no round in the loop is allowed to make this call on its own. The row
+    //    is kept after it is cleared, so a replacement can see what stopped the
+    //    previous attempt.
+    let memory = InMemoryProvider::new();
+    let executor = LocalExecutor::default();
+    let mut runner = Runner::new(&store, &git, &memory, &executor, dir.path());
+    let now = chrono::Utc::now();
+    let blocker = runner
+        .raise_blocker(
+            &TaskId::from_string("MODEL"),
+            BlockerKind::External,
+            "waiting on a database credential",
+            Some("operator must grant access".into()),
+            now,
+        )
+        .await?;
+    println!("{} raised on MODEL", blocker.id);
+    // Resolving it is a distinct history from obsoleting it, so asking for the
+    // wrong one is refused instead of silently rewriting the row. The cleared row
+    // is kept either way, so a replacement can see what stopped the attempt.
+    runner.resolve_blocker(&blocker.id, now).await?;
+    for b in store
+        .blockers()
+        .blockers_for_task(&TaskId::from_string("MODEL"))
+        .await?
+    {
+        println!("  {} {:?} — {}", b.id, b.status, b.description);
     }
 
     Ok(())

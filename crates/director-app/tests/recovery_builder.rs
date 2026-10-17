@@ -25,7 +25,7 @@
 use director_app::recovery::{recovery_context, RecoveryBuilder, RecoveryOutcome};
 use director_domain::action::{Action, ActionKind};
 use director_domain::assignment::ReleaseReason;
-use director_domain::blocker::{Blocker, BlockerKind};
+use director_domain::blocker::{Blocker, BlockerKind, BlockerStatus};
 use director_domain::checkpoint::{Checkpoint, ResumeStatus};
 use director_domain::ids::{
     ActionId, AgentId, AssignmentId, BlockerId, CheckpointId, DecisionId, MachineId, ProjectId,
@@ -1334,5 +1334,262 @@ async fn scope_survives_alongside_the_new_context() {
         parsed.scope_paths,
         vec!["src/auth".to_string()],
         "and everything earlier in the payload is intact"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Blockers decide the resume verdict: Ready must never mean "something is in
+// the way". These go through the real store, so they cover the query as well as
+// the verdict.
+// ---------------------------------------------------------------------------
+
+/// Build a briefing for `task` against a clean, unchanged `abc`.
+async fn verdict_for(store: &SqliteStore, task: &TaskId) -> director_app::recovery::Recovery {
+    RecoveryBuilder::new(store, task.clone())
+        .observed(observed("abc", "main", false), history(&["abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("an in-flight task with a checkpoint builds")
+}
+
+/// An in-flight task on a current checkpoint with no blockers is `Ready` — the
+/// baseline the blocker tests below are only meaningful against.
+#[tokio::test]
+async fn an_unblocked_task_is_still_ready() {
+    let (_dir, _path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    let package = verdict_for(&store, &task.id).await;
+    assert_eq!(
+        package.resume_status(),
+        ResumeStatus::Ready,
+        "the fix must not block a task that has nothing blocking it"
+    );
+}
+
+/// 1. A ready task with an open blocker cannot receive a `Ready` verdict.
+#[tokio::test]
+async fn an_open_blocker_stops_a_ready_verdict() {
+    let (_dir, _path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    let blocker = record_blocker(&store, &task.id, "BLK-1", "waiting on an API key").await;
+    assert!(
+        blocker.status.is_blocking(),
+        "the precondition: the blocker really is open"
+    );
+
+    let package = verdict_for(&store, &task.id).await;
+    assert_eq!(
+        package.resume_status(),
+        ResumeStatus::Blocked,
+        "an open blocker must not be reported as a task that can go"
+    );
+    // And the instruction has to match the verdict.
+    assert!(
+        package.package.next_action.contains("blocked"),
+        "a blocked verdict that tells the replacement to proceed anyway is worse than no verdict; got: {}",
+        package.package.next_action
+    );
+    // The blocker is still reported, not just the verdict.
+    assert_eq!(package.package.blocker_details.len(), 1);
+}
+
+/// 2. A cleared blocker alone does not block resumption — in either cleared
+/// state, since "we fixed it" and "we stopped trying" are different history but
+/// the same answer here.
+#[tokio::test]
+async fn a_cleared_blocker_alone_does_not_block_resumption() {
+    for (label, clear) in [
+        ("resolved", BlockerStatus::Resolved),
+        ("obsolete", BlockerStatus::Obsolete),
+    ] {
+        let (_dir, _path, store) = boot_at().await;
+        let task = task_in_progress(&store, TASK).await;
+        write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+        let mut blocker = record_blocker(&store, &task.id, "BLK-1", "waiting on review").await;
+        blocker.status = clear;
+        blocker.resolved_at = Some(chrono::Utc::now());
+        store
+            .blockers()
+            .update_blocker(&blocker)
+            .await
+            .expect("the blocker clears");
+
+        let package = verdict_for(&store, &task.id).await;
+        assert_eq!(
+            package.resume_status(),
+            ResumeStatus::Ready,
+            "a {label} blocker is history, not a hold on the work"
+        );
+        assert_eq!(
+            package.package.blocker_details.len(),
+            1,
+            "and the history is still carried in the briefing"
+        );
+    }
+}
+
+/// 3. An explicitly blocked task remains blocked — the task's own status decides
+/// that one, and no blocker row is needed for it to hold.
+#[tokio::test]
+async fn an_explicitly_blocked_task_remains_blocked() {
+    let (_dir, _path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    let task = move_task_to(&store, &task, TaskStatus::Blocked).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    // Deliberately no blocker rows: the status alone must decide this.
+    let package = verdict_for(&store, &task.id).await;
+    assert_eq!(
+        package.resume_status(),
+        ResumeStatus::Blocked,
+        "a blocked task is blocked by its own status"
+    );
+    assert!(package.package.blocker_details.is_empty());
+}
+
+/// 4. Stale and dirty-tree behaviour is untouched by blockers: a blocker is
+/// consulted only on the path to `Ready`, so it cannot mask staleness.
+#[tokio::test]
+async fn staleness_is_unaffected_by_an_open_blocker() {
+    let (_dir, _path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+    record_blocker(&store, &task.id, "BLK-1", "waiting on review").await;
+
+    // A dirty tree on the same commit: stale without the blocker ever being read.
+    let package = RecoveryBuilder::new(&store, task.id.clone())
+        .observed(observed("abc", "main", true), history(&["abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("built");
+    assert_eq!(
+        package.resume_status(),
+        ResumeStatus::Stale,
+        "a dirty tree still reads stale; an open blocker must not reorder that"
+    );
+
+    // An advanced head, likewise.
+    let package = RecoveryBuilder::new(&store, task.id.clone())
+        .observed(observed("def", "main", false), history(&["def", "abc"]))
+        .build()
+        .await
+        .expect("the build reads the store")
+        .package()
+        .expect("built");
+    assert_eq!(package.resume_status(), ResumeStatus::Stale);
+
+    // And a task that is not in flight is still insufficient, blocker or not.
+    let done = move_task_to(&store, &task, TaskStatus::Cancelled).await;
+    let package = verdict_for(&store, &done.id).await;
+    assert_eq!(
+        package.resume_status(),
+        ResumeStatus::Insufficient,
+        "a cancelled task has nothing to resume either way"
+    );
+}
+
+/// 5. Multiple blockers are handled by whether any one is still open, regardless
+/// of the order the store returned them in.
+#[tokio::test]
+async fn multiple_blockers_are_judged_by_whether_any_is_open() {
+    let (_dir, _path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+
+    // All cleared: nothing in the way.
+    for (id, status) in [
+        ("BLK-1", BlockerStatus::Resolved),
+        ("BLK-2", BlockerStatus::Obsolete),
+        ("BLK-3", BlockerStatus::Resolved),
+    ] {
+        let mut blocker = record_blocker(&store, &task.id, id, "something").await;
+        blocker.status = status;
+        blocker.resolved_at = Some(chrono::Utc::now());
+        store
+            .blockers()
+            .update_blocker(&blocker)
+            .await
+            .expect("clears");
+    }
+    assert_eq!(
+        verdict_for(&store, &task.id).await.resume_status(),
+        ResumeStatus::Ready
+    );
+
+    // One reopened among them is enough.
+    let mut reopened = store
+        .blockers()
+        .get_blocker(&BlockerId::from_string("BLK-2"))
+        .await
+        .expect("reads back");
+    reopened.status = BlockerStatus::Open;
+    reopened.resolved_at = None;
+    store
+        .blockers()
+        .update_blocker(&reopened)
+        .await
+        .expect("reopens");
+
+    let package = verdict_for(&store, &task.id).await;
+    assert_eq!(
+        package.resume_status(),
+        ResumeStatus::Blocked,
+        "one open blocker among cleared ones still holds"
+    );
+    assert_eq!(
+        package.package.blocker_details.len(),
+        3,
+        "all three stay on record — the verdict reads the list, it does not trim it"
+    );
+}
+
+/// 6. Recovery after reopening the store produces the same verdict: the blocker
+/// that decides it is a durable row, not writer memory.
+#[tokio::test]
+async fn the_verdict_survives_reopening_the_store() {
+    let (_dir, path, store) = boot_at().await;
+    let task = task_in_progress(&store, TASK).await;
+    write_checkpoint(&store, &checkpoint("CHK-1", &task, "abc"), None).await;
+    record_blocker(&store, &task.id, "BLK-1", "waiting on an API key").await;
+
+    let before = verdict_for(&store, &task.id).await;
+    assert_eq!(before.resume_status(), ResumeStatus::Blocked);
+
+    drop(store);
+    let reopened = SqliteStore::open(&path).await.expect("the store reopens");
+    let after = verdict_for(&reopened, &task.id).await;
+
+    assert_eq!(
+        after.resume_status(),
+        before.resume_status(),
+        "the verdict is rebuilt from durable rows, so it must not drift across a restart"
+    );
+    assert_eq!(after.resume_status(), ResumeStatus::Blocked);
+
+    // And clearing it durably changes the verdict on the next read, too.
+    let mut blocker = reopened
+        .blockers()
+        .get_blocker(&BlockerId::from_string("BLK-1"))
+        .await
+        .expect("reads back");
+    blocker.resolve();
+    reopened
+        .blockers()
+        .update_blocker(&blocker)
+        .await
+        .expect("clears");
+    assert_eq!(
+        verdict_for(&reopened, &task.id).await.resume_status(),
+        ResumeStatus::Ready,
+        "clearing a blocker durably releases the verdict"
     );
 }

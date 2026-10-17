@@ -53,10 +53,12 @@
 //!
 //! Fields that Orqyn cannot fill honestly are left at their defaults rather
 //! than invented: `test_results` is `None` because test outcomes are produced
-//! by verification, not by observation; `current_blocker` is `None` because
-//! `Blocker` is not persisted; `important_decisions` is empty because a
-//! decision is recorded by a caller's explicit choice, not inferred from a
-//! diff.
+//! by verification, not by observation; `current_blocker` is `None` because this
+//! step observes a repository rather than a task's blocker lifecycle — blockers
+//! are persisted, but they are raised by an explicit caller decision (see
+//! [`crate::runner::Runner::raise_blocker`]) and a git observation is not such a
+//! decision; `important_decisions` is empty because a decision is recorded by a
+//! caller's explicit choice, not inferred from a diff.
 //!
 //! [`SyncResult`]: director_domain::repository::SyncResult
 
@@ -970,7 +972,10 @@ mod tests {
             cp.test_results.is_none(),
             "test results come from verification"
         );
-        assert!(cp.current_blocker.is_none(), "blockers are not persisted");
+        assert!(
+            cp.current_blocker.is_none(),
+            "OBSERVE does not read a task's blocker lifecycle"
+        );
         assert!(
             cp.important_decisions.is_empty(),
             "decisions are recorded, not inferred"

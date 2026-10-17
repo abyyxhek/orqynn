@@ -119,8 +119,8 @@ use director_domain::ids::{
 use director_domain::project::Project;
 use director_domain::task::{ExpectedOutput, TaskStatus};
 use director_domain::{
-    AgentRepository, AssignmentRepository, CheckpointRepository, ProjectRepository, StoreError,
-    TaskRepository,
+    ActionRepository, AgentRepository, AssignmentRepository, CheckpointRepository,
+    ProjectRepository, StoreError, TaskRepository, VerificationRepository,
 };
 use director_store::Store;
 use serde_json::{json, Value};
@@ -186,6 +186,15 @@ enum KillPoint {
     AssignmentPersisted,
     /// A simulated agent reported finishing; verification has not run.
     AgentReportRecorded,
+    /// A VERIFY round committed its verdict and the task's move, and the process
+    /// died before the actions recording what the round observed were written.
+    ///
+    /// The one interruption point Orqyn cannot recover from by itself: the task
+    /// has left the survey set, so no later round will ever write those actions.
+    VerdictPersisted,
+    /// A VERIFY round committed its verdict *and* recorded its actions; the
+    /// process died with nothing outstanding.
+    ActionsRecorded,
 }
 
 impl KillPoint {
@@ -194,6 +203,8 @@ impl KillPoint {
             KillPoint::CheckpointPublished => "after_checkpoint",
             KillPoint::AssignmentPersisted => "after_assignment",
             KillPoint::AgentReportRecorded => "after_agent_report",
+            KillPoint::VerdictPersisted => "after_verdict",
+            KillPoint::ActionsRecorded => "after_actions",
         }
     }
 
@@ -202,6 +213,8 @@ impl KillPoint {
             "after_checkpoint" => KillPoint::CheckpointPublished,
             "after_assignment" => KillPoint::AssignmentPersisted,
             "after_agent_report" => KillPoint::AgentReportRecorded,
+            "after_verdict" => KillPoint::VerdictPersisted,
+            "after_actions" => KillPoint::ActionsRecorded,
             other => panic!("unknown kill point {other:?}"),
         }
     }
@@ -231,6 +244,7 @@ fn child_harness() {
         "phase" => run_phase_child(),
         "recover" => run_recover_child(),
         "assign" => run_assign_child(),
+        "verify" => run_verify_child(),
         other => panic!("unknown role {other:?}"),
     }
 }
@@ -483,6 +497,144 @@ fn run_phase_child() {
     std::process::exit(PARK_EXIT_CODE);
 }
 
+/// A process interrupted around VERIFY's action recording.
+///
+/// The kill points here are the two sides of the gap between a round committing
+/// its verdict and the actions recording what it observed being written. They are
+/// reached by doing *exactly* what the runner does, minus or plus the recording —
+/// so the window is real rather than simulated, and the child is killed inside it
+/// by `Child::kill` like every other harness here.
+fn run_verify_child() {
+    let db = PathBuf::from(required_env(DB_PATH));
+    let repo_dir = PathBuf::from(required_env(REPO_DIR));
+    let state_dir = PathBuf::from(required_env(STATE_DIR));
+    let marker_path = PathBuf::from(required_env(MARKER_PATH));
+    let kill_point = KillPoint::parse(&required_env(KILL_POINT));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    let marker = runtime.block_on(async move {
+        let store = Store::open(&db).await.expect("the store opens");
+        let git = GitService::new(&state_dir).expect("the git service");
+        let memory = InMemoryProvider::new();
+        let executor = LocalExecutor::default();
+
+        store
+            .agents()
+            .register_agent(&Agent::register(
+                AgentId::from_string("AGENT-1"),
+                "AGENT-1",
+                Harness::ClaudeCode,
+                MachineId::from_string("MACH-1"),
+                vec![Capability::Coding],
+            ))
+            .await
+            .expect("the agent registers");
+
+        let project = ProjectId::from_string(PROJECT);
+        let repository = RepositoryId::from_string(REPO);
+        let task = TaskId::from_string(TASK_ID);
+
+        let mut runner = Runner::new(&store, &git, &memory, &executor, &repo_dir);
+        runner
+            .observe(&project, &repository, &path_string(&repo_dir), stamp(1))
+            .await
+            .expect("the first observation");
+        runner
+            .plan(
+                PlanRequest {
+                    project_id: project.clone(),
+                    plan_id: PlanId::from_string("PLAN-1"),
+                    objective: "make the fixture verifiable".into(),
+                    rationale: "the process-kill harness's smallest path".into(),
+                    tasks: vec![{
+                        let mut spec = TaskSpec::new(task.clone(), "auth", "the endpoint answers");
+                        spec.expected_outputs = vec![ExpectedOutput {
+                            criterion: "the endpoint answers".into(),
+                            check: Some(PASSES.into()),
+                        }];
+                        spec
+                    }],
+                    authorized_by: AgentId::from_string("AGENT-planner"),
+                },
+                stamp(2),
+            )
+            .await
+            .expect("the plan lands");
+        let scheduled = runner
+            .schedule(&project, stamp(3))
+            .await
+            .expect("the scheduling round");
+        let assignment = scheduled
+            .assignment_for(&task)
+            .expect("the task was handed out")
+            .clone();
+        runner
+            .simulate_agent_turn(&assignment, stamp(4))
+            .await
+            .expect("the simulated agent turn");
+
+        // The two sides of the recording gap.
+        //
+        // `after_verdict` calls the step directly, which is what the runner does
+        // before it records anything: the verdict, the task's move and the history
+        // row commit inside the store's transaction, and nothing has written an
+        // action. Parking here and being killed reproduces the exact window.
+        //
+        // `after_actions` goes through the runner, so the recording has happened.
+        if kill_point == KillPoint::VerdictPersisted {
+            let report =
+                director_app::verify::verify_at(&store, &executor, &project, &repo_dir, stamp(5))
+                    .await
+                    .expect("the verification round commits");
+            assert_eq!(report.judged.len(), 1, "the task was judged");
+        } else {
+            let step = runner
+                .verify_at(&project, stamp(5))
+                .await
+                .expect("the verification round commits and records");
+            assert_eq!(step.judged.len(), 1, "the task was judged");
+        }
+
+        // Read the durable facts back: this is the dying process's own account of
+        // what it committed, taken before it is terminated.
+        let verifications = store
+            .verifications()
+            .verifications_for_task(&task)
+            .await
+            .expect("the verification history reads");
+        let stored = store.tasks().get_task(&task).await.expect("the task reads");
+        let actions = store
+            .actions()
+            .actions_for_task(&task)
+            .await
+            .expect("the action log reads");
+
+        json!({
+            "kill_point": kill_point.name(),
+            "task_id": TASK_ID,
+            "task_status": status_json(stored.status),
+            "verification_count": verifications.len(),
+            "verification_ids": verifications.iter().map(|v| v.id.to_string()).collect::<Vec<_>>(),
+            "action_count": actions.len(),
+            "action_ids": actions.iter().map(|a| a.id.to_string()).collect::<Vec<_>>(),
+        })
+    });
+
+    // Written only after the round has returned, so its existence is the proof the
+    // kill point was reached. The parent polls for this file.
+    std::fs::write(&marker_path, marker.to_string()).expect("the marker is written");
+
+    let deadline = Instant::now() + PARK_LIMIT;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::process::exit(PARK_EXIT_CODE);
+}
+
 /// The replacement process: a fresh handle on the same database, reconstructing
 /// everything from what survived.
 fn run_recover_child() {
@@ -694,7 +846,12 @@ impl KillHarness {
     /// returning if the child never reached the point or died early — a kill
     /// point that was not reached must never be reported as tested.
     fn kill_at(&self, kill_point: KillPoint) -> Value {
-        let mut child = self.spawn("phase", kill_point, &[]);
+        self.kill_role_at("phase", kill_point)
+    }
+
+    /// [`Self::kill_at`], for a role other than the default workflow.
+    fn kill_role_at(&self, role: &str, kill_point: KillPoint) -> Value {
+        let mut child = self.spawn(role, kill_point, &[]);
 
         let deadline = Instant::now() + REACH_TIMEOUT;
         let mut reached = false;
@@ -1036,6 +1193,150 @@ fn a_killed_process_does_not_reach_its_own_recovery_path() {
     assert_eq!(
         marker["assignment_history_len"], 1,
         "the tenure the dead process wrote is on record and nothing was cleaned up"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The action-recording window: both sides of a VERIFY round's commit
+// ---------------------------------------------------------------------------
+
+/// A kill after the actions were recorded loses nothing.
+///
+/// The unharmed side of the window, asserted first because it is what makes the
+/// other test meaningful: a round that finished its recording leaves a
+/// verification, a moved task and an action log that a fresh process reads back
+/// identically.
+#[test]
+fn a_kill_after_actions_are_recorded_loses_nothing() {
+    let harness = KillHarness::new();
+    let marker = harness.kill_role_at("verify", KillPoint::ActionsRecorded);
+
+    assert_eq!(
+        marker["task_status"], "done",
+        "the round passed and moved the task before the kill"
+    );
+    assert_eq!(marker["verification_count"], 1, "the verdict is durable");
+    assert_eq!(
+        marker["action_count"], 1,
+        "and so is the action recording what the round observed"
+    );
+
+    // A fresh handle on the same database, after the writer is gone.
+    let reopened = Store::open(&harness.db);
+    let task = TaskId::from_string(TASK_ID);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let (verifications, actions, status) = runtime.block_on(async move {
+        let store = reopened.await.expect("the store reopens");
+        (
+            store
+                .verifications()
+                .verifications_for_task(&task)
+                .await
+                .expect("verifications read"),
+            store
+                .actions()
+                .actions_for_task(&task)
+                .await
+                .expect("actions read"),
+            store
+                .tasks()
+                .get_task(&task)
+                .await
+                .expect("the task reads")
+                .status,
+        )
+    });
+
+    assert_eq!(
+        verifications.len(),
+        1,
+        "a committed verdict is not lost across the restart"
+    );
+    assert_eq!(
+        actions.len(),
+        1,
+        "and neither is the action recorded behind it"
+    );
+    assert_eq!(status, TaskStatus::Done);
+    assert_eq!(
+        actions[0].id.to_string(),
+        format!("ACT-{}-0", verifications[0].id),
+        "the action is keyed on the round that produced it, which is how a reader \
+         can tell that the two belong together"
+    );
+}
+
+/// A kill inside the recording window loses the actions — and is *detectable*.
+///
+/// This is the documented trade rather than a passing bill of health. A VERIFY
+/// round commits its verdict, the task's move and the history row in one
+/// transaction; the actions recording what it observed are written after that
+/// commit. A process killed in the gap leaves a durable verdict and no actions,
+/// and because the task has left the survey set no later round will write them.
+///
+/// What must hold is that the loss is *visible*. The gap is provable from the
+/// persisted data — a verification with no action keyed on it — so recovery
+/// reports it rather than letting a briefing imply a history Orqyn does not have.
+#[test]
+fn a_kill_inside_the_recording_window_is_reported_rather_than_hidden() {
+    let harness = KillHarness::new();
+    let marker = harness.kill_role_at("verify", KillPoint::VerdictPersisted);
+
+    assert_eq!(
+        marker["task_status"], "done",
+        "the verdict and the task's move committed atomically before the kill"
+    );
+    assert_eq!(
+        marker["verification_count"], 1,
+        "so the verdict survived the termination"
+    );
+    assert_eq!(
+        marker["action_count"], 0,
+        "and nothing had written the actions yet - this is the window, reached for real"
+    );
+
+    // The same loss, seen by a fresh process. It cannot be repaired: the task is
+    // `done`, so no round will ever survey it again.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let task = TaskId::from_string(TASK_ID);
+    let (actions, verifications, second_round) = runtime.block_on(async move {
+        let store = Store::open(&harness.db).await.expect("the store reopens");
+        let actions = store
+            .actions()
+            .actions_for_task(&task)
+            .await
+            .expect("actions read");
+        let verifications = store
+            .verifications()
+            .verifications_for_task(&task)
+            .await
+            .expect("verifications read");
+        // Would a later round repair it? No: the task has left the survey set.
+        let git = GitService::new(&harness.state_dir).expect("the git service");
+        let memory = InMemoryProvider::new();
+        let executor = LocalExecutor::default();
+        let mut runner = Runner::new(&store, &git, &memory, &executor, &harness.repo_dir);
+        let again = runner
+            .verify_at(&ProjectId::from_string(PROJECT), stamp(9))
+            .await
+            .expect("a recovery round runs");
+        (actions, verifications, again.judged.len())
+    });
+
+    assert!(
+        actions.is_empty(),
+        "the actions for that round are genuinely gone; this is the loss, stated plainly"
+    );
+    assert_eq!(verifications.len(), 1);
+    assert_eq!(
+        second_round, 0,
+        "and no later round will write them, because the task is done and no longer surveyed"
     );
 }
 

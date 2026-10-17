@@ -76,7 +76,7 @@ impl director_domain::BlockerRepository for SqliteBlockerRepository {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT {BLOCKER_COLUMNS} FROM blockers WHERE task_id = ?1 ORDER BY raised_at"
+                "SELECT {BLOCKER_COLUMNS} FROM blockers WHERE task_id = ?1 ORDER BY raised_at, id"
             ))
             .map_err(translate_error)?;
         let rows = stmt

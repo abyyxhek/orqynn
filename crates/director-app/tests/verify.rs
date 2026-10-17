@@ -28,7 +28,9 @@ use director_app::VerifyError;
 use director_domain::agent::{Agent, Harness};
 use director_domain::assignment::AssignmentStatus;
 use director_domain::capability::Capability;
-use director_domain::ids::{AgentId, AssignmentId, MachineId, PlanId, ProjectId, TaskId};
+use director_domain::ids::{
+    AgentId, AssignmentId, MachineId, PlanId, ProjectId, TaskId, VerificationId,
+};
 use director_domain::plan::Plan;
 use director_domain::project::Project;
 use director_domain::task::{ExpectedOutput, Task, TaskStatus};
@@ -575,12 +577,14 @@ fn an_empty_report_is_not_a_failure() {
                 verdict: Verdict::Passed,
                 checks: vec![],
                 outcome: Some(TaskStatus::Done),
+                verification_id: VerificationId::from_string("VER-A-1"),
             },
             Judged {
                 task: TaskId::from_string("B"),
                 verdict: Verdict::Failed,
                 checks: vec![],
                 outcome: Some(TaskStatus::Failed),
+                verification_id: VerificationId::from_string("VER-B-1"),
             },
         ],
     };

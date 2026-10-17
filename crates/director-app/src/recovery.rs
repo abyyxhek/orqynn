@@ -51,19 +51,22 @@
 //!
 //! Two honest limits remain, and neither is a missing table:
 //!
-//! - **No production execution path records actions yet.** The storage, ordering,
-//!   bounding, and restart-durability of action history are real; nothing in the
-//!   loop writes to it, because Orqynn has no agent driver to observe. An empty
-//!   window is therefore reported as *unavailable history* rather than as a
-//!   complete history: Orqynn cannot tell "an agent worked without recording" from
-//!   "nothing happened", and it does not guess.
-//! - **`ResumeStatus` derives its blocked verdict from task status, not from
-//!   blockers.** A persisted open blocker does not move a task to
-//!   [`TaskStatus::Blocked`], and nothing in the store or the loop ever writes
-//!   that status today - REPLAN deliberately declines to, so it does not own
-//!   another entity's lifecycle. A task can therefore carry an open blocker
-//!   while its resume verdict reads `Ready` or `Stale`. The blockers are in the
-//!   briefing either way.
+//! - **What an agent did between its reports is still invisible.** The storage, ordering,
+//!   bounding, and restart-durability of action history are real. VERIFY records
+//!   what it observes — the commands it ran and the exit codes it read — so the
+//!   window is a record of work rather than of claims. What Orqyn still cannot
+//!   see is what an agent did between its reports: there is no agent driver to
+//!   observe, and an agent's own report is a claim, so it is not recorded as
+//!   fact. A window with nothing in it is therefore reported as *unavailable
+//!   history* rather than as a complete history: Orqyn cannot tell "an agent
+//!   worked without recording" from "nothing happened", and it does not guess.
+//! - **`ResumeStatus` keeps task lifecycle and blocker lifecycle separate.** A
+//!   persisted open blocker does not move a task to [`TaskStatus::Blocked`], and
+//!   nothing in the store or the loop ever writes that status today — REPLAN
+//!   deliberately declines to, so it does not own another entity's lifecycle.
+//!   An open blocker does decide the verdict: a task that would otherwise be
+//!   `Ready` reads [`ResumeStatus::Blocked`] instead. The status is left alone;
+//!   only the briefing's claim changes.
 //!
 //! A gap is a statement about what could be reconstructed, never about the work:
 //! an empty window with `recent_context_unavailable` set means nothing was
@@ -73,6 +76,8 @@
 //! No field is invented. A fact that cannot be sourced is reported as absent, not
 //! with a guess.
 
+use director_domain::action::Action;
+use director_domain::blocker::Blocker;
 use director_domain::checkpoint::{Checkpoint, ContinuationPackage, ResumeStatus};
 use director_domain::context::RecentContext;
 use director_domain::ids::{AgentId, TaskId};
@@ -135,11 +140,33 @@ impl Recovery {
     ///
     /// `true` when at least one action was reconstructed from `task_actions`;
     /// `false` for an empty window. `false` is deliberately not read as "the agent
-    /// did nothing" - no production execution path records actions yet, so an
-    /// empty window means Orqynn has no record either way. See [`Self::gaps`]
-    /// for the full ledger.
+    /// did nothing" - VERIFY records what it observes, but no agent driver reports
+    /// what an agent actually did, so an empty window means Orqyn has no record
+    /// either way. See [`Self::gaps`] for the full ledger.
     pub fn actions_available(&self) -> bool {
         !self.gaps.recent_context_unavailable
+    }
+
+    /// Whether the action window is the *whole* history, rather than part of it.
+    ///
+    /// Always `false`, and it is a method rather than a field precisely so the
+    /// answer has to be written down: completeness cannot be established today,
+    /// so there is nothing a caller could set it from.
+    ///
+    /// Orqyn records what its own steps observe, and the only step that observes
+    /// commands is VERIFY. What an agent did between being handed a task and
+    /// reporting on it is invisible — there is no agent driver to observe it, and
+    /// the agent's own report is a claim about the work rather than evidence of
+    /// it. So a non-empty window is a real record of *something Orqyn ran*, which
+    /// is what [`Recovery::actions_available`] reports, and never a complete
+    /// account of the task's history.
+    ///
+    /// For the one gap that *is* provable — a verdict whose actions went missing —
+    /// see [`RecoveryGaps::actions_incomplete`]. That is a detected hole rather
+    /// than a standing limitation, and the two should not be read as the same
+    /// claim.
+    pub fn actions_complete(&self) -> bool {
+        false
     }
 
     /// Everything the build could not reconstruct, by name. Read this before
@@ -173,6 +200,19 @@ pub struct RecoveryGaps {
     /// in the type because a package serialized before blockers were recorded
     /// will deserialize without them, and a reader needs to be able to say so.
     pub blockers_unavailable: bool,
+    /// A verdict is on record whose actions are missing.
+    ///
+    /// The one gap Orqyn can *prove* rather than suspect. VERIFY commits its
+    /// verdict and the task's move atomically, and records what it observed
+    /// immediately afterwards; a process that dies between the two leaves a
+    /// durable verdict and no actions, and nothing later will fill them in. This
+    /// flag is how that becomes visible to a caller instead of a briefing quietly
+    /// reading as though it had the whole history.
+    ///
+    /// Distinct from `recent_context_unavailable`, which says a window is empty.
+    /// An empty window may simply mean nothing was recorded; this says a record
+    /// exists and part of it is missing.
+    pub actions_incomplete: bool,
 }
 
 impl RecoveryGaps {
@@ -184,19 +224,57 @@ impl RecoveryGaps {
     /// distinguish "an agent worked without recording" from "nothing happened",
     /// and the honest answer to that uncertainty is to say so rather than to
     /// present an empty window as a complete history.
-    fn observed(recent_context: &RecentContext) -> Self {
+    ///
+    /// `actions` is the whole durable log for the task rather than the bounded
+    /// window, because a gap has to be judged against everything on record: the
+    /// window is compacted on purpose and its absences mean nothing.
+    fn observed(
+        recent_context: &RecentContext,
+        actions: &[Action],
+        verifications: &[director_domain::verification::Verification],
+    ) -> Self {
         RecoveryGaps {
             recent_context_unavailable: recent_context.is_empty(),
             blockers_unavailable: false,
+            actions_incomplete: lost_action_records(actions, verifications),
         }
     }
 
-    /// True when nothing the build could have reconstructed was missing. False
-    /// for every build today, because both gaps are structural; it exists so a
-    /// caller that will be true for it later does not have to be written later.
+    /// True when nothing the build could have reconstructed was missing.
+    ///
+    /// Note what this does *not* mean: it is not a claim that the action window
+    /// is complete. Even a clean build says only that nothing Orqyn knows about
+    /// was missing — see [`Recovery::actions_complete`], which is `false` for
+    /// every build today and cannot honestly be otherwise while no agent driver
+    /// observes what an agent actually did.
     pub fn is_clean(&self) -> bool {
-        !self.recent_context_unavailable && !self.blockers_unavailable
+        !self.recent_context_unavailable && !self.blockers_unavailable && !self.actions_incomplete
     }
+}
+
+/// Whether a verification on record has no actions behind it.
+///
+/// A VERIFY round commits its verdict, the task's move and the history row in one
+/// transaction; the actions recording what the round *observed* are written after
+/// that commit. A process killed in the gap leaves a durable verdict with no
+/// actions, and because the task has left the survey set no later round will write
+/// them. That loss is not reconstructible — the round's commands survive only as
+/// prose in the verification's evidence — so the honest response is to notice it
+/// and say so rather than to let a briefing imply a history Orqyn does not have.
+///
+/// The test is the id: every action a round records is keyed on that round's
+/// verification, so a verification with no such key is a round whose actions are
+/// missing. No inference about what the round did is involved.
+fn lost_action_records(
+    actions: &[Action],
+    verifications: &[director_domain::verification::Verification],
+) -> bool {
+    verifications.iter().any(|verification| {
+        let key = format!("ACT-{}-", verification.id);
+        !actions
+            .iter()
+            .any(|action| action.id.as_str().starts_with(&key))
+    })
 }
 
 /// What a [`RecoveryBuilder`] produced — including the reasons it produced
@@ -486,9 +564,11 @@ impl<'s> RecoveryBuilder<'s> {
         // The resume verdict: the checkpoint's recorded world against the world
         // as it now stands. `resume_status_for` computes the comparison itself
         // rather than taking the one below, so a caller cannot hand it a state
-        // and a comparison that disagree — see its own docs.
+        // and a comparison that disagree — see its own docs. The blockers are the
+        // slice loaded above and carried into the package below, so this costs no
+        // second query and cannot disagree with the briefing about them.
         let comparison = checkpoint.compare_with(&observed, &history);
-        let resume_status = resume_status_for(&task, &checkpoint, &observed, &history);
+        let resume_status = resume_status_for(&task, &checkpoint, &observed, &history, &blockers);
 
         // The next action comes from the checkpoint — it was written by the
         // observation that saw the work, so it is derived rather than guessed
@@ -496,7 +576,7 @@ impl<'s> RecoveryBuilder<'s> {
         // about that instead of repeating a stale instruction.
         let next_action = next_action_for(&task, &checkpoint, resume_status);
 
-        let gaps = RecoveryGaps::observed(&recent_context);
+        let gaps = RecoveryGaps::observed(&recent_context, &actions, &verifications);
         let package = ContinuationPackage {
             task_id: task.id.clone(),
             task_state_version: task.state_version,
@@ -609,13 +689,18 @@ async fn read_task(store: &Store, task_id: &TaskId) -> Result<Option<Task>, Chec
 }
 
 /// The resume verdict, decided from the task's state, the checkpoint's
-/// staleness, and the observed project.
+/// staleness, the observed project, and the task's persisted blockers.
 ///
 /// This computes the comparison itself — the checkpoint against the observed
 /// state and history — rather than accepting a precomputed one, so a caller
 /// cannot pass a [`StateComparison`] derived from a *different* project state
 /// than the `observed` one it also passes. The two can drift apart silently, and
 /// a resume verdict built on a mismatched pair is worse than none.
+///
+/// `blockers` is the task's blocker rows as the builder already loaded them, so
+/// this adds no query of its own. The same slice is both read here and carried in
+/// the package, which is why a verdict and a briefing cannot disagree about
+/// whether something was in the way.
 ///
 /// The order of the checks is the order of the questions a replacement asks, and
 /// each one wins outright:
@@ -624,20 +709,40 @@ async fn read_task(store: &Store, task_id: &TaskId) -> Result<Option<Task>, Chec
 ///    reads `done` with no passing verdict, or `failed` with one that passed,
 ///    is in a state two sources disagree about; a replacement must not pick a
 ///    side, so this beats everything below it.
-/// 2. **Blocked** — the task itself is `blocked`. The blocker list is not
-///    persisted, but the status is, and it is the authoritative signal.
+/// 2. **Blocked** — the task's own *status* is `blocked`. Nothing in the store or
+///    the loop writes that status today (REPLAN declines to, so it does not own
+///    another entity's lifecycle), so this check is narrower than it looks; the
+///    persisted blocker list is consulted separately, at step 5.
 /// 3. **Insufficient** — the task is not in flight. Resumption is a question
 ///    about work in progress; a task that is `todo`, terminal, or awaiting
 ///    verification has nothing to resume.
 /// 4. **Stale** — the checkpoint describes a world that moved on, per
 ///    [`Checkpoint::compare_with`]. The replacement reconciles rather than
 ///    trusts.
-/// 5. **Ready** — the checkpoint is current and the task is in flight.
+/// 5. **Blocked** — the task is in flight and the checkpoint is current, but a
+///    persisted blocker is still open. A current checkpoint says *the recorded
+///    world still matches*; it says nothing about whether the work can proceed. A
+///    blocker is the record that it cannot, so the two disagree and the honest
+///    answer is the one that is safe. This is deliberately placed *after*
+///    `Stale` rather than beside step 2: staleness is a fact about the
+///    checkpoint that a replacement must handle first, and a blocked *and* stale
+///    task still needs reconciling before its blocker means anything.
+/// 6. **Ready** — the checkpoint is current, the task is in flight, and nothing
+///    recorded stands in the way.
+///
+/// ## Why blockers do not move task status
+///
+/// The two lifecycles stay separate. A blocker row is recorded against a task;
+/// the task's `status` is the loop's own conclusion about that task, and this
+/// function only *reads* both. Nothing here writes `TaskStatus::Blocked`, and
+/// REPLAN is not made responsible for it — an open blocker changes what a
+/// recovery briefing may claim, not what the planner recorded about the task.
 pub fn resume_status_for(
     task: &Task,
     checkpoint: &Checkpoint,
     observed: &ProjectState,
     history: &[director_domain::CommitInfo],
+    blockers: &[Blocker],
 ) -> ResumeStatus {
     use director_domain::StateComparison;
 
@@ -652,12 +757,11 @@ pub fn resume_status_for(
         return ResumeStatus::Conflicted;
     }
 
-    // 2. The task is blocked. This verdict comes from the *status*, not from the
-    //    persisted blocker list: nothing in the store or the loop ever writes
-    //    `TaskStatus::Blocked` (REPLAN declines to, so it does not own another
-    //    entity's lifecycle), so an open blocker can coexist with a non-blocked
-    //    status. The blockers are still in the briefing - the caller sees them -
-    //    but they do not decide this verdict.
+    // 2. The task is blocked *by status*. This is a lifecycle fact about the
+    //    task row, not about the blocker table: nothing in the store or the loop
+    //    ever writes `TaskStatus::Blocked` (REPLAN declines to, so it does not
+    //    own another entity's lifecycle), so a task can carry an open blocker
+    //    while its status still reads in-progress. That case is step 5.
     if task.status == TaskStatus::Blocked {
         return ResumeStatus::Blocked;
     }
@@ -667,11 +771,21 @@ pub fn resume_status_for(
         return ResumeStatus::Insufficient;
     }
 
-    // 4. and 5. The checkpoint's world against the observed one. A checkpoint
-    //    that cannot be compared — no recorded commit — is treated as needing
-    //    reconciliation rather than trusted.
+    // 4., 5. and 6. The checkpoint's world against the observed one. A
+    //    checkpoint that cannot be compared — no recorded commit — is treated as
+    //    needing reconciliation rather than trusted.
     match comparison {
-        StateComparison::Unchanged if !observed.is_dirty() => ResumeStatus::Ready,
+        StateComparison::Unchanged if !observed.is_dirty() => {
+            // 5. A current checkpoint and an open blocker disagree: the recorded
+            //    world still matches, but the work still cannot proceed. Only
+            //    `Open` counts — a resolved or obsoleted blocker is history, and
+            //    must not hold a task back on its own.
+            if blockers.iter().any(|blocker| blocker.status.is_blocking()) {
+                ResumeStatus::Blocked
+            } else {
+                ResumeStatus::Ready
+            }
+        }
         StateComparison::Unchanged => ResumeStatus::Stale,
         StateComparison::WorkingTreeChanged
         | StateComparison::HeadAdvanced
@@ -791,6 +905,34 @@ mod tests {
     use director_domain::state::{ChangedFile, CommitInfo, FileChange};
     use director_domain::task::Task;
 
+    use director_domain::blocker::{Blocker as DomainBlocker, BlockerKind, BlockerStatus};
+    use director_domain::ids::BlockerId;
+
+    /// A blocker row in the given state, as the store would hand it back.
+    fn blocker(id: &str, status: BlockerStatus) -> DomainBlocker {
+        let mut b = DomainBlocker::raise(
+            BlockerId::from_string(id),
+            TaskId::from_string("AUTH"),
+            BlockerKind::External,
+            "waiting on a credential",
+        );
+        b.status = status;
+        b
+    }
+
+    /// The verdict for an in-flight task on a current checkpoint — the only
+    /// situation in which blockers are consulted at all.
+    fn verdict_with(blockers: &[DomainBlocker]) -> ResumeStatus {
+        let cp = checkpoint(Some("abc"));
+        resume_status_for(
+            &task(TaskStatus::InProgress),
+            &cp,
+            &observed("abc"),
+            &history(&["abc"]),
+            blockers,
+        )
+    }
+
     fn task(status: TaskStatus) -> Task {
         let mut task = Task::new(TaskId::from_string("AUTH"), "auth", "the objective");
         task.status = status;
@@ -853,6 +995,7 @@ mod tests {
             &cp,
             &observed("abc"),
             &history(&["abc"]),
+            &[],
         );
         assert_eq!(status, ResumeStatus::Ready);
     }
@@ -865,6 +1008,7 @@ mod tests {
             &cp,
             &dirty("abc"),
             &history(&["abc"]),
+            &[],
         );
         assert_eq!(status, ResumeStatus::Stale);
     }
@@ -877,6 +1021,7 @@ mod tests {
             &cp,
             &observed("def"),
             &history(&["def", "abc"]),
+            &[],
         );
         assert_eq!(status, ResumeStatus::Stale);
     }
@@ -889,6 +1034,7 @@ mod tests {
             &cp,
             &observed("def"),
             &history(&["def"]),
+            &[],
         );
         assert_eq!(status, ResumeStatus::Stale);
     }
@@ -903,6 +1049,7 @@ mod tests {
             &cp,
             &state,
             &history(&["def", "abc"]),
+            &[],
         );
         assert_eq!(status, ResumeStatus::Stale);
     }
@@ -915,8 +1062,181 @@ mod tests {
             &cp,
             &observed("abc"),
             &history(&["abc"]),
+            &[],
         );
         assert_eq!(status, ResumeStatus::Blocked);
+    }
+
+    // -----------------------------------------------------------------------
+    // Blockers and the resume verdict: an open blocker must never read Ready.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_ready_task_with_an_open_blocker_cannot_be_told_to_go() {
+        // The whole point of this change. A current checkpoint says the recorded
+        // world still matches; an open blocker says the work cannot proceed.
+        // Reporting `Ready` here is the one answer that is certainly wrong.
+        let status = verdict_with(&[blocker("BLK-1", BlockerStatus::Open)]);
+        assert_eq!(status, ResumeStatus::Blocked);
+    }
+
+    #[test]
+    fn a_cleared_blocker_alone_does_not_block_resumption() {
+        // Both cleared states are history, not a hold on the work. A task whose
+        // only blocker was resolved or obsoleted is as resumable as one that
+        // never had a blocker.
+        assert_eq!(
+            verdict_with(&[blocker("BLK-1", BlockerStatus::Resolved)]),
+            ResumeStatus::Ready,
+            "a resolved blocker is history"
+        );
+        assert_eq!(
+            verdict_with(&[blocker("BLK-1", BlockerStatus::Obsolete)]),
+            ResumeStatus::Ready,
+            "an obsoleted blocker is history, and 'we fixed it' stays distinct"
+        );
+    }
+
+    #[test]
+    fn an_explicitly_blocked_task_stays_blocked_with_or_without_blocker_rows() {
+        // Step 2 reads the task's own status and is not affected by the blocker
+        // list at all — including when the table is empty, which is the state
+        // the world is actually in today.
+        for blockers in [
+            vec![],
+            vec![blocker("BLK-1", BlockerStatus::Open)],
+            vec![blocker("BLK-1", BlockerStatus::Resolved)],
+        ] {
+            let cp = checkpoint(Some("abc"));
+            let status = resume_status_for(
+                &task(TaskStatus::Blocked),
+                &cp,
+                &observed("abc"),
+                &history(&["abc"]),
+                &blockers,
+            );
+            assert_eq!(status, ResumeStatus::Blocked, "blockers: {blockers:?}");
+        }
+    }
+
+    #[test]
+    fn staleness_still_outranks_an_open_blocker() {
+        // The documented precedence, pinned: a blocked *and* stale task is still
+        // stale. Reconciliation of the checkpoint comes first, because a blocker
+        // is only meaningful against a checkpoint that describes the current
+        // world.
+        let cp = checkpoint(Some("abc"));
+        for observed in [observed("def"), dirty("abc")] {
+            let status = resume_status_for(
+                &task(TaskStatus::InProgress),
+                &cp,
+                &observed,
+                &history(&["def", "abc"]),
+                &[blocker("BLK-1", BlockerStatus::Open)],
+            );
+            assert_eq!(
+                status,
+                ResumeStatus::Stale,
+                "an open blocker must not mask staleness"
+            );
+        }
+    }
+
+    #[test]
+    fn several_blockers_are_judged_by_whether_any_one_is_still_open() {
+        // One open blocker is enough; a crowd of cleared ones is not.
+        assert_eq!(
+            verdict_with(&[
+                blocker("BLK-1", BlockerStatus::Resolved),
+                blocker("BLK-2", BlockerStatus::Obsolete),
+                blocker("BLK-3", BlockerStatus::Resolved),
+            ]),
+            ResumeStatus::Ready
+        );
+        assert_eq!(
+            verdict_with(&[
+                blocker("BLK-1", BlockerStatus::Resolved),
+                blocker("BLK-2", BlockerStatus::Open),
+                blocker("BLK-3", BlockerStatus::Obsolete),
+            ]),
+            ResumeStatus::Blocked
+        );
+        // And the order the store returned them in cannot change the answer.
+        assert_eq!(
+            verdict_with(&[
+                blocker("BLK-2", BlockerStatus::Open),
+                blocker("BLK-1", BlockerStatus::Resolved),
+            ]),
+            verdict_with(&[
+                blocker("BLK-1", BlockerStatus::Resolved),
+                blocker("BLK-2", BlockerStatus::Open),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_blocker_does_not_rescue_or_condemn_a_task_that_is_not_in_flight() {
+        // Blockers are consulted only on the path to `Ready`. A terminal task has
+        // nothing to resume either way, so an open blocker must not turn
+        // `Insufficient` into something that implies work could continue.
+        let cp = checkpoint(Some("abc"));
+        for status in [TaskStatus::Todo, TaskStatus::Cancelled, TaskStatus::Failed] {
+            let verdict = resume_status_for(
+                &task(status),
+                &cp,
+                &observed("abc"),
+                &history(&["abc"]),
+                &[blocker("BLK-1", BlockerStatus::Open)],
+            );
+            assert_eq!(
+                verdict,
+                ResumeStatus::Insufficient,
+                "{status:?} is not resumable regardless of blockers"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blocker_never_hides_a_conflict_between_status_and_evidence() {
+        // Conflicted is still first: a task whose status and evidence disagree
+        // needs adjudication, and reporting `Blocked` would hide that behind a
+        // reason the caller could act on and thereby miss the real problem.
+        use director_domain::state::TestResults;
+        let mut cp = checkpoint(Some("abc"));
+        cp.test_results = Some(TestResults {
+            passed: 10,
+            failed: 0,
+            skipped: 0,
+            failures: Vec::new(),
+            run_at: chrono::Utc::now(),
+        });
+        let status = resume_status_for(
+            &task(TaskStatus::Todo),
+            &cp,
+            &observed("abc"),
+            &history(&["abc"]),
+            &[blocker("BLK-1", BlockerStatus::Open)],
+        );
+        assert_eq!(status, ResumeStatus::Conflicted);
+    }
+
+    #[test]
+    fn a_blocked_verdict_tells_the_replacement_to_clear_the_blocker() {
+        // The verdict is only useful if the instruction matches it: this must not
+        // fall through to the `Ready` arm and repeat the checkpoint's next step.
+        let cp = checkpoint(Some("abc"));
+        let status = resume_status_for(
+            &task(TaskStatus::InProgress),
+            &cp,
+            &observed("abc"),
+            &history(&["abc"]),
+            &[blocker("BLK-1", BlockerStatus::Open)],
+        );
+        let next = next_action_for(&task(TaskStatus::InProgress), &cp, status);
+        assert!(
+            next.contains("blocked") && !next.contains("the next step"),
+            "expected a clear-the-blocker instruction, got: {next}"
+        );
     }
 
     #[test]
@@ -937,7 +1257,13 @@ mod tests {
             TaskStatus::Cancelled,
         ] {
             assert_eq!(
-                resume_status_for(&task(status), &cp, &observed("abc"), &history(&["abc"])),
+                resume_status_for(
+                    &task(status),
+                    &cp,
+                    &observed("abc"),
+                    &history(&["abc"]),
+                    &[],
+                ),
                 ResumeStatus::Insufficient,
                 "{status:?} is not resumable"
             );
@@ -955,6 +1281,7 @@ mod tests {
             &cp,
             &observed("abc"),
             &history(&["abc"]),
+            &[],
         );
         assert_eq!(status, ResumeStatus::Conflicted);
     }
@@ -972,6 +1299,7 @@ mod tests {
             &cp,
             &observed("def"),
             &history(&["def", "abc"]),
+            &[],
         );
         assert_eq!(status, ResumeStatus::Conflicted);
     }
@@ -992,6 +1320,7 @@ mod tests {
             &cp,
             &observed("abc"),
             &history(&["abc"]),
+            &[],
         );
         assert_eq!(status, ResumeStatus::Insufficient, "done and not in flight");
     }
@@ -1056,7 +1385,7 @@ mod tests {
         // the case that is now real: a task with nothing on record must not present an
         // empty window as though it were a complete history.
         let mut empty = RecentContext::for_task(TaskId::from_string("TASK-1"));
-        let gaps = RecoveryGaps::observed(&empty);
+        let gaps = RecoveryGaps::observed(&empty, &[], &[]);
         assert!(
             gaps.recent_context_unavailable,
             "no recorded actions means the briefing cannot say what happened"
@@ -1078,7 +1407,7 @@ mod tests {
         );
         recorded.task_id = Some(TaskId::from_string("TASK-1"));
         empty.push(recorded);
-        let gaps = RecoveryGaps::observed(&empty);
+        let gaps = RecoveryGaps::observed(&empty, &[], &[]);
         assert!(!gaps.recent_context_unavailable);
         assert!(
             gaps.is_clean(),

@@ -502,6 +502,9 @@ pub trait BlockerRepository: Store {
     /// Open **and** cleared: a replacement needs to know what stopped the
     /// previous attempt, which is the question a list of only-open blockers
     /// cannot answer.
+    ///
+    /// Ties on `raised_at` break on `id`, so two blockers raised in the same
+    /// round always read back in the same order.
     async fn blockers_for_task(&self, task: &TaskId) -> Result<Vec<Blocker>, Self::Error>;
 }
 
@@ -523,6 +526,11 @@ pub trait ActionRepository: Store {
     ///
     /// Unbounded: this is the durable log. Callers that need a window build one
     /// through [`crate::context::RecentContext`], which is where the bound lives.
+    ///
+    /// Ties on the timestamp break on `id`. Two actions recorded in the same
+    /// round can share a timestamp to the clock's resolution, and a window whose
+    /// order changed between two reads of the same rows would make a recovery
+    /// briefing disagree with itself for no reason.
     async fn actions_for_task(&self, task: &TaskId) -> Result<Vec<Action>, Self::Error>;
 }
 

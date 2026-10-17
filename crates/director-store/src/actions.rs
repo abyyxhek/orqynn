@@ -80,7 +80,7 @@ impl director_domain::ActionRepository for SqliteActionRepository {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT {ACTION_COLUMNS} FROM task_actions WHERE task_id = ?1 ORDER BY at"
+                "SELECT {ACTION_COLUMNS} FROM task_actions WHERE task_id = ?1 ORDER BY at, id"
             ))
             .map_err(translate_error)?;
         let rows = stmt

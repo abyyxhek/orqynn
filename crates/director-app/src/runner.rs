@@ -108,12 +108,17 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use director_adapters::git::GitService;
+use director_domain::action::{Action, ActionKind};
 use director_domain::agent::Liveness;
+use director_domain::blocker::{Blocker, BlockerKind, BlockerStatus};
 use director_domain::checkpoint::ResumeStatus;
-use director_domain::ids::{IdGenerator, ProjectId, RepositoryId, SessionId, TaskId};
+use director_domain::ids::{
+    ActionId, BlockerId, IdGenerator, ProjectId, RepositoryId, SessionId, TaskId,
+};
 use director_domain::providers::{ExecutionProvider, MemoryProvider};
 use director_domain::repository::SyncStatus;
 use director_domain::task::TaskStatus;
+use director_domain::{ActionRepository, BlockerRepository};
 use director_store::Store;
 use serde::Serialize;
 use thiserror::Error;
@@ -179,6 +184,25 @@ pub enum RunnerError {
     /// Building a recovery context failed.
     #[error("building a recovery context failed: {0}")]
     Checkpoint(#[from] CheckpointError),
+
+    /// A persistence failure outside any single step: recording a runtime event
+    /// as an action, or a blocker transition.
+    ///
+    /// These are never swallowed. A write that failed is a fact the caller has to
+    /// see, because the alternative — reporting success over a row that is not
+    /// there — is how a briefing ends up claiming history Orqyn does not have.
+    #[error("recording a runtime event failed: {0}")]
+    Record(#[from] director_domain::StoreError),
+
+    /// A blocker lifecycle operation was asked for something that contradicts
+    /// the blocker's recorded state, e.g. resolving a blocker that is already
+    /// obsolete.
+    ///
+    /// Deliberately an error rather than a silent overwrite: both cleared states
+    /// are history, and rewriting one would erase the difference between "we
+    /// fixed it" and "we stopped trying".
+    #[error("the blocker lifecycle request was contradictory: {0}")]
+    BlockerLifecycle(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +513,12 @@ pub struct JudgedTask {
     /// could not judge, which stays `verification_pending` and is surveyed
     /// again next round.
     pub outcome: Option<TaskStatus>,
+    /// The verification the round persisted, which identifies the round.
+    ///
+    /// Stable and derived from persisted state rather than from the clock, so
+    /// anything keyed on it — an action id — is reproducible from a restart and
+    /// cannot be minted twice for the same round.
+    pub verification_id: director_domain::ids::VerificationId,
 }
 
 /// What VERIFY did about one expected output.
@@ -590,8 +620,16 @@ pub struct RecoveryStep {
     /// [`Recovery::actions_available`], which was hardcoded `false` while
     /// nothing was persisted; it is now driven by what the store actually holds.
     pub actions_available: bool,
-    /// Whether every field was reconstructed. `false` today for every build,
-    /// because two gaps are structural limits of Orqyn's persistence.
+    /// Whether the action window is known to be missing part of what is on
+    /// record.
+    ///
+    /// Not a claim of completeness in either direction: a `false` means nothing
+    /// is *provably* missing, which is weaker than the window being whole. See
+    /// [`Recovery::actions_complete`] for why completeness cannot be established
+    /// today — no agent driver observes what an agent did between its reports, so
+    /// a window is always a partial account.
+    pub actions_incomplete: bool,
+    /// Whether every field was reconstructed.
     pub gaps_clean: bool,
     /// How many tenures the briefing carries.
     pub tenures: usize,
@@ -650,6 +688,7 @@ impl RecoveryStep {
             // the task claims, and comparison semantics belong to
             // `Task::scope_overlap` at enforcement time.
             scope_paths: recovery.package.scope_paths.clone(),
+            actions_incomplete: recovery.gaps().actions_incomplete,
             // The window is already bounded by `RecentContext`; the briefing
             // reports the summaries rather than re-deriving anything.
             recent_actions: recovery
@@ -982,9 +1021,30 @@ where
     /// variant, because the engine it delegates to timestamps its own attempt
     /// internally. Every other step here is caller-pinned.
     pub async fn verify(&mut self, project_id: &ProjectId) -> Result<VerifyStep, RunnerError> {
-        let report =
-            verify::verify(self.store, self.executor, project_id, &self.working_dir).await?;
-        Ok(VerifyStep {
+        self.verify_at(project_id, Utc::now()).await
+    }
+
+    /// [`Runner::verify`], with the round's instant supplied rather than read.
+    ///
+    /// Added alongside `verify` rather than in place of it, because `verify`'s
+    /// wall-clock behaviour is part of its existing contract and changing it
+    /// silently would alter every caller's records. A caller that needs the run to
+    /// be reproducible calls this one and gets an action log that is a function of
+    /// the inputs rather than of the day it was produced.
+    pub async fn verify_at(
+        &mut self,
+        project_id: &ProjectId,
+        now: DateTime<Utc>,
+    ) -> Result<VerifyStep, RunnerError> {
+        let report = verify::verify_at(
+            self.store,
+            self.executor,
+            project_id,
+            &self.working_dir,
+            now,
+        )
+        .await?;
+        let step = VerifyStep {
             judged: report
                 .judged
                 .iter()
@@ -994,9 +1054,78 @@ where
                     passed: matches!(judged.verdict, verify::Verdict::Passed),
                     checks: judged.checks.iter().map(render_check).collect(),
                     outcome: judged.outcome,
+                    verification_id: judged.verification_id.clone(),
                 })
                 .collect(),
-        })
+        };
+        // What the round observed, recorded as actions. Done after the step so a
+        // recording failure is reported as an error rather than folded into a
+        // verdict the caller already has.
+        self.record_verification_actions(&step, now).await?;
+        Ok(step)
+    }
+
+    /// Record what a VERIFY round observed as actions on the durable log.
+    ///
+    /// VERIFY is the only step whose events are *observed* rather than reported:
+    /// it runs the commands itself and reads the exit codes itself. That is what
+    /// makes these actions evidence — [`director_domain::action::Action`] is
+    /// documented as a record of work, not a record of claims — and it is why
+    /// nothing else here records one. An agent's own report (`acknowledge`,
+    /// `report_done`) is a claim about the work, and a simulated turn
+    /// ([`Runner::simulate_agent_turn`]) is not work at all.
+    ///
+    /// ## Why an unverifiable round records nothing
+    ///
+    /// A task Orqyn could not judge stays `verification_pending`, so the next
+    /// round surveys it again and runs the same commands again. Recording each
+    /// attempt would grow the action log by one copy of the same failed attempt
+    /// per tick — duplicates dressed as history, which is exactly what the log is
+    /// supposed to rule out. So the gate is the round's *outcome*: a task whose
+    /// status moved (`outcome.is_some()`) has left the survey set and cannot be
+    /// re-judged, so its round happened exactly once. A task whose outcome is
+    /// `None` is recorded nowhere, and that is a real limitation rather than a
+    /// claim that nothing ran.
+    ///
+    /// A criterion with no machine-checkable form records nothing either: Orqyn
+    /// ran no command for it, so there is no observation to keep.
+    ///
+    /// ## The loss window this cannot close
+    ///
+    /// The verdict is committed by [`engine::verify_task`] in one transaction
+    /// with the task's move and the history row. These inserts happen *after* that
+    /// commit, in their own transactions, so the two are not atomic and cannot be
+    /// made atomic without moving the action writes inside the store's
+    /// transaction. A process killed in between leaves a durable verdict with no
+    /// actions — and because the task has left the survey set, no later round will
+    /// ever write them.
+    ///
+    /// That is a deliberate, documented trade rather than a silent one: the gap is
+    /// *detectable*, because a verification id with no matching action is visible
+    /// in the persisted data, and recovery reports it through
+    /// [`crate::recovery::RecoveryGaps::actions_incomplete`] rather than letting a
+    /// briefing claim history it does not have. Closing the window entirely is
+    /// future work and needs a store-level change, not a runner-level one.
+    async fn record_verification_actions(
+        &mut self,
+        step: &VerifyStep,
+        at: DateTime<Utc>,
+    ) -> Result<(), RunnerError> {
+        for judged in &step.judged {
+            // A round that moved no status will be surveyed again; see above.
+            if judged.outcome.is_none() {
+                continue;
+            }
+            for (ordinal, check) in judged.checks.iter().enumerate() {
+                let Some(action) =
+                    action_for_check(&judged.task_id, &judged.verification_id, check, ordinal, at)
+                else {
+                    continue;
+                };
+                self.store.actions().record_action(&action).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Run one REPLAN round: apply the caller's decisions about the tasks the
@@ -1072,6 +1201,103 @@ where
         let recovery = recovery::recovery_context_from_store(self.store, task_id).await?;
         Ok(recovery.as_ref().map(RecoveryStep::from_recovery))
     }
+
+    /// Record that something is standing between a task and its progress.
+    ///
+    /// This is an explicit operation, not a step, and that is deliberate. No
+    /// round in the loop can decide on its own that a task is blocked:
+    /// [`crate::replan`] reports stranded dependents and declines to answer the
+    /// question, because a blocker is a second entity's lifecycle and REPLAN has
+    /// no business owning it. So the decision is the caller's — an operator, or
+    /// an agent driver once there is one — and this is where it becomes durable.
+    ///
+    /// `now` pins the instant, like every other step here.
+    ///
+    /// The blocker is `Open` on creation and never deleted afterwards, so the
+    /// row a replacement reads is the whole history. A second raise against the
+    /// same id is a write that cannot succeed, and the store's error is reported
+    /// rather than swallowed: two different things standing in the way are two
+    /// blockers, not one that quietly changed its description.
+    pub async fn raise_blocker(
+        &mut self,
+        task_id: &TaskId,
+        kind: BlockerKind,
+        description: impl Into<String>,
+        resolution: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<Blocker, RunnerError> {
+        let mut blocker = Blocker::raise(
+            self.ids.next::<BlockerId>("blocker"),
+            task_id.clone(),
+            kind,
+            description,
+        );
+        // `raised_at` is pinned to the caller's instant rather than the
+        // constructor's wall clock, like every other step here.
+        blocker.raised_at = now;
+        if let Some(resolution) = resolution {
+            blocker = blocker.resolvable_by(resolution);
+        }
+        let stored = self.store.blockers().create_blocker(&blocker).await?;
+        Ok(stored)
+    }
+
+    /// Record that a blocker was cleared, keeping the row.
+    ///
+    /// Replaying the same operation is a no-op that returns the blocker
+    /// unchanged, rather than re-stamping `resolved_at` and rewriting when the
+    /// thing was fixed. Asking for the *other* cleared state — resolving one that
+    /// is already obsolete — is a contradiction and is refused, because both
+    /// states are history and overwriting one erases the difference between "we
+    /// fixed it" and "we stopped trying".
+    pub async fn resolve_blocker(
+        &mut self,
+        blocker_id: &BlockerId,
+        now: DateTime<Utc>,
+    ) -> Result<Blocker, RunnerError> {
+        self.clear_blocker(blocker_id, BlockerStatus::Resolved, now)
+            .await
+    }
+
+    /// Record that a blocker no longer applies — the task was cancelled, or
+    /// replanned around it.
+    ///
+    /// The mirror of [`Runner::resolve_blocker`], with the same replay and
+    /// contradiction rules, and deliberately a different recorded state so the
+    /// distinction survives.
+    pub async fn obsolete_blocker(
+        &mut self,
+        blocker_id: &BlockerId,
+        now: DateTime<Utc>,
+    ) -> Result<Blocker, RunnerError> {
+        self.clear_blocker(blocker_id, BlockerStatus::Obsolete, now)
+            .await
+    }
+
+    /// Move a blocker to a cleared state, or explain why it cannot.
+    async fn clear_blocker(
+        &mut self,
+        blocker_id: &BlockerId,
+        target: BlockerStatus,
+        now: DateTime<Utc>,
+    ) -> Result<Blocker, RunnerError> {
+        let mut blocker = self.store.blockers().get_blocker(blocker_id).await?;
+        if !blocker.status.is_blocking() {
+            return if blocker.status == target {
+                // Already there: the replay returns the row it already wrote.
+                Ok(blocker)
+            } else {
+                Err(RunnerError::BlockerLifecycle(format!(
+                    "{blocker_id} is already {:?}, which is a different history from {:?}",
+                    blocker.status, target
+                )))
+            };
+        }
+        blocker.status = target;
+        blocker.resolved_at = Some(now);
+        let stored = self.store.blockers().update_blocker(&blocker).await?;
+        Ok(stored)
+    }
 }
 
 /// What an acknowledgment recorded.
@@ -1140,6 +1366,82 @@ fn render_check(check: &verify::CheckResult) -> CheckOutcome {
             criterion: criterion.clone(),
         },
     }
+}
+
+/// The action that records one observed check, or `None` when nothing ran.
+///
+/// The id is `ACT-{verification_id}-{ordinal}`: the round's own persisted
+/// identity plus the check's position in the task's contract. It is built rather
+/// than drawn from a generator, and never from the clock, for three reasons that
+/// all matter to reliability:
+///
+/// - A generator's counters restart with every runner, so two runs in one process
+///   would mint the same id for two different tasks and the second insert would
+///   fail the round.
+/// - A clock-derived id makes the same logical run produce a different log every
+///   time, so a run could not be compared with a later run of the same inputs.
+/// - Keyed on the verification, the id is the round's identity. A round cannot be
+///   recorded twice under one id, and a REPLAN retry that legitimately judges the
+///   same task again gets a new verification and therefore a new id — a real
+///   second event rather than a duplicate to be swallowed.
+fn action_for_check(
+    task_id: &TaskId,
+    verification_id: &director_domain::ids::VerificationId,
+    check: &CheckOutcome,
+    ordinal: usize,
+    at: DateTime<Utc>,
+) -> Option<Action> {
+    let (kind, summary, detail) = match check {
+        CheckOutcome::Passed { criterion, command } => (
+            ActionKind::Command,
+            format!("ran `{command}`: passed"),
+            format!("criterion: {criterion}"),
+        ),
+        CheckOutcome::Failed {
+            criterion,
+            command,
+            exit_code,
+            timed_out,
+            stderr,
+        } => {
+            let because = if *timed_out { "timed out" } else { "failed" };
+            let mut detail = format!("criterion: {criterion}; {because} with exit {exit_code}");
+            if !stderr.is_empty() {
+                detail.push_str("; stderr: ");
+                detail.push_str(stderr);
+            }
+            (
+                ActionKind::Error,
+                format!("ran `{command}`: {because}"),
+                detail,
+            )
+        }
+        CheckOutcome::Unrunnable {
+            criterion,
+            command,
+            error,
+        } => (
+            ActionKind::Error,
+            format!("could not run `{command}`"),
+            format!("criterion: {criterion}; {error}"),
+        ),
+        // Orqyn ran no command for this criterion, so there is nothing observed
+        // to record. Writing one would put a guess in a log of facts.
+        CheckOutcome::Unchecked { .. } => return None,
+    };
+
+    let mut action = Action::new(
+        ActionId::from_string(format!("ACT-{verification_id}-{ordinal}")),
+        kind,
+        summary,
+    )
+    .for_task(task_id.clone());
+    action.detail = Some(detail);
+    // The round's pinned instant, shared by every action from that round. Equal
+    // timestamps are therefore the normal case within a round, which is why the
+    // store's read order breaks ties on id rather than leaving it to chance.
+    action.at = at;
+    Some(action)
 }
 
 /// Render a survey condition as the stable string a serialized run carries.
