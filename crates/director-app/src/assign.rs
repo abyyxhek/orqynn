@@ -116,42 +116,13 @@ pub async fn assign_at(
     request: AssignRequest,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Assigned, AssignError> {
-    // 1. What is the project currently executing? Only the active plan's tasks
-    //    are Orqyn's current intention; a task a superseded plan named is
-    //    history, and handing one out would restart abandoned work.
-    let plan = store
-        .plans()
-        .active_plan_for_project(&request.project_id)
-        .await?;
-    let Some(plan) = plan else {
-        return Err(AssignError::NoActivePlan(request.project_id.clone()));
-    };
-
-    // 2. The task as it stands. Loaded before validation rather than trusted
-    //    from the request, because legality is a question about the world: the
-    //    task's real status and its real dependencies are what decide it.
-    let task = store.tasks().get_task(&request.task_id).await?;
-
-    // 3. Every other task in the project, to evaluate dependencies against.
-    //    Readiness asks whether each dependency is `done` — not which plan did
-    //    it — so work a superseded plan already finished still counts, and a
-    //    dependency that will never be done is what makes this a replanning
-    //    signal rather than an assignment.
-    let plan_tasks = store.tasks().list_tasks(&request.project_id).await?;
-
-    // 4. The agent as it stands, and whether anything is already holding the
-    //    task. Both are inputs to validation, so both are loaded before any
-    //    write.
-    let agent = store.agents().get_agent(&request.agent_id).await?;
-    let sitting = store
-        .assignments()
-        .active_assignment_for_task(&request.task_id)
-        .await?;
-
-    // 5. The legality checks. Pure, once the four loads have happened — this is
-    //    the half of the step that can be tested without a store, as
-    //    [`validate_assignment`].
-    validate_assignment(&plan, &plan_tasks, &task, &agent, sitting.as_ref())?;
+    check_assignment(
+        store,
+        &request.project_id,
+        &request.task_id,
+        &request.agent_id,
+    )
+    .await?;
 
     // 6. The handoff, atomic. Everything from here is one transaction in the
     //    store: release any sitting tenant, insert this assignment, move the
@@ -170,6 +141,87 @@ pub async fn assign_at(
         task,
         displaced,
     })
+}
+
+/// [`assign_at`], with the assignment id allocated by the store instead of named
+/// by the caller.
+///
+/// This is what SCHEDULE uses. It cannot build an [`AssignRequest`], because a
+/// request exists to name an id the caller chose; a scheduler has no such choice
+/// to make, and making one outside the write transaction is what produced the
+/// duplicate-id refusal this path replaces.
+///
+/// The validation is the *same* [`check_assignment`] the named-id path runs, and
+/// the store call is the same transaction, so the two paths cannot disagree about
+/// eligibility, scope, displacement, or the task's move. The only difference is
+/// where the id comes from.
+pub async fn assign_next_at(
+    store: &Store,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+    agent_id: &AgentId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Assigned, AssignError> {
+    check_assignment(store, project_id, task_id, agent_id).await?;
+
+    let (assignment, task, displaced) = store.assign_and_start_next(task_id, agent_id, now).await?;
+
+    Ok(Assigned {
+        assignment,
+        task,
+        displaced,
+    })
+}
+
+/// The legality checks every assignment shares, with the loads they need.
+///
+/// Split out so [`assign_at`] and [`assign_next_at`] run one implementation. That
+/// matters because these checks are what decide *whether* an assignment happens,
+/// and two copies of them could drift — the drift the codebase already guards
+/// against for the scope guard by sharing `guard_scope` in the store.
+///
+/// Every check here runs *before* the store's write transaction and is therefore
+/// an optimistic pre-check: the store re-reads authoritative state under the write
+/// lock, and that re-read is what decides.
+async fn check_assignment(
+    store: &Store,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+    agent_id: &AgentId,
+) -> Result<(), AssignError> {
+    // 1. What is the project currently executing? Only the active plan's tasks
+    //    are Orqyn's current intention; a task a superseded plan named is
+    //    history, and handing one out would restart abandoned work.
+    let plan = store.plans().active_plan_for_project(project_id).await?;
+    let Some(plan) = plan else {
+        return Err(AssignError::NoActivePlan(project_id.clone()));
+    };
+
+    // 2. The task as it stands. Loaded before validation rather than trusted
+    //    from the request, because legality is a question about the world: the
+    //    task's real status and its real dependencies are what decide it.
+    let task = store.tasks().get_task(task_id).await?;
+
+    // 3. Every other task in the project, to evaluate dependencies against.
+    //    Readiness asks whether each dependency is `done` — not which plan did
+    //    it — so work a superseded plan already finished still counts, and a
+    //    dependency that will never be done is what makes this a replanning
+    //    signal rather than an assignment.
+    let plan_tasks = store.tasks().list_tasks(project_id).await?;
+
+    // 4. The agent as it stands, and whether anything is already holding the
+    //    task. Both are inputs to validation, so both are loaded before any
+    //    write.
+    let agent = store.agents().get_agent(agent_id).await?;
+    let sitting = store
+        .assignments()
+        .active_assignment_for_task(task_id)
+        .await?;
+
+    // 5. The legality checks. Pure, once the four loads have happened — this is
+    //    the half of the step that can be tested without a store, as
+    //    [`validate_assignment`].
+    validate_assignment(&plan, &plan_tasks, &task, &agent, sitting.as_ref())
 }
 
 /// The tasks in the active plan that can be handed out right now, in the plan's

@@ -437,6 +437,36 @@ fn non_empty_sha(state: &StoredProjectState) -> Option<&str> {
 #[allow(clippy::too_many_arguments)]
 pub async fn checkpoint_round<M: MemoryProvider>(
     store: &Store,
+    ids: &mut IdGenerator,
+    memory: &M,
+    project: &ProjectId,
+    state: &StoredProjectState,
+    sync: &SyncResult,
+    worktree: &WorktreeState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<CheckpointRound, CheckpointError> {
+    checkpoint_round_bounded(
+        store,
+        ids,
+        memory,
+        project,
+        state,
+        sync,
+        worktree,
+        now,
+        MEMORY_PUBLISH_TIMEOUT,
+    )
+    .await
+}
+
+/// [`checkpoint_round`] with an explicit bound on each publication.
+///
+/// The limit is a parameter so the timeout path is testable in milliseconds
+/// rather than only in a ten-second test. [`checkpoint_round`] passes
+/// [`MEMORY_PUBLISH_TIMEOUT`], which is the production value.
+#[allow(clippy::too_many_arguments)]
+pub async fn checkpoint_round_bounded<M: MemoryProvider>(
+    store: &Store,
     _ids: &mut IdGenerator,
     memory: &M,
     project: &ProjectId,
@@ -444,6 +474,7 @@ pub async fn checkpoint_round<M: MemoryProvider>(
     sync: &SyncResult,
     worktree: &WorktreeState,
     now: chrono::DateTime<chrono::Utc>,
+    publish_limit: Duration,
 ) -> Result<CheckpointRound, CheckpointError> {
     let tasks = store.tasks().list_tasks(project).await?;
 
@@ -523,20 +554,34 @@ pub async fn checkpoint_round<M: MemoryProvider>(
             }
         };
 
-        // Best-effort publication. The checkpoint is already authoritative
-        // state, so a failure here is recorded for the caller and logged, and
-        // the round continues to the next task.
-        if let Err(err) = publish_checkpoint(memory, &stored).await {
-            tracing::warn!(
-                task = %stored.task_id.as_str(),
-                checkpoint = %stored.id.as_str(),
-                error = %err,
-                "semantic memory publication failed; the checkpoint is persisted in SQLite",
-            );
-            memory_failures.push(MemoryFailure {
-                task_id: stored.task_id.clone(),
-                error: err.to_string(),
-            });
+        // Best-effort publication, bounded by MEMORY_PUBLISH_TIMEOUT. The
+        // checkpoint is already authoritative state, so a failure here is
+        // recorded for the caller and logged, and the round continues to the
+        // next task.
+        //
+        // The bound exists so a slow substrate cannot hold the observation round
+        // open: the loop's other work is not a guest of the memory page. Two
+        // outcomes are kept apart deliberately — the substrate refusing, and the
+        // substrate not answering — because the second is the one an operator
+        // needs to know about and the first is often just a bad page.
+        match publish_checkpoint_bounded(memory, &stored, publish_limit).await {
+            PublishOutcome::Published => {}
+            outcome => {
+                let error = outcome
+                    .failure_text()
+                    .unwrap_or_else(|| "publication failed".to_string());
+                tracing::warn!(
+                    task = %stored.task_id.as_str(),
+                    checkpoint = %stored.id.as_str(),
+                    error = %error,
+                    timed_out = matches!(outcome, PublishOutcome::TimedOut),
+                    "semantic memory publication did not complete; the checkpoint is persisted in SQLite",
+                );
+                memory_failures.push(MemoryFailure {
+                    task_id: stored.task_id.clone(),
+                    error,
+                });
+            }
         }
 
         written.push(*stored);
@@ -621,9 +666,93 @@ async fn attempt_checkpoint(
 /// content can move a task to [`TaskStatus::Done`], because that is reachable
 /// only through independent verification in [`crate::verify`].
 ///
+/// How a single publication ended.
+///
+/// Three outcomes because "the substrate refused" and "the substrate did not
+/// answer" are different problems for an operator, and neither is a failure of
+/// the round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The substrate accepted the page.
+    Published,
+    /// The substrate answered, and the answer was an error.
+    Refused(String),
+    /// The substrate did not answer within the bound.
+    TimedOut,
+}
+
+impl PublishOutcome {
+    /// The text to record in [`MemoryFailure`], or `None` when it succeeded.
+    pub fn failure_text(&self) -> Option<String> {
+        match self {
+            PublishOutcome::Published => None,
+            PublishOutcome::Refused(message) => Some(message.clone()),
+            PublishOutcome::TimedOut => Some(MEMORY_PUBLISH_TIMED_OUT.to_string()),
+        }
+    }
+}
+
+/// Publish one checkpoint, bounded by `limit`.
+///
+/// The bound is a parameter rather than a hardcoded read of
+/// [`MEMORY_PUBLISH_TIMEOUT`] so the timeout path is testable in milliseconds
+/// instead of only in a ten-second test. [`MEMORY_PUBLISH_TIMEOUT`] is the value
+/// the checkpoint round passes.
+///
+/// Publication never returns an error: the caller records the outcome and
+/// continues, because the checkpoint is already committed and a round must not
+/// end over a memory page.
+pub async fn publish_checkpoint_bounded<M: MemoryProvider>(
+    memory: &M,
+    checkpoint: &Checkpoint,
+    limit: Duration,
+) -> PublishOutcome {
+    match tokio::time::timeout(limit, publish_checkpoint(memory, checkpoint)).await {
+        Ok(Ok(())) => PublishOutcome::Published,
+        Ok(Err(err)) => PublishOutcome::Refused(err.to_string()),
+        Err(_) => PublishOutcome::TimedOut,
+    }
+}
+
 /// This takes the domain [`MemoryProvider`] trait and nothing else, so Orqyn's
 /// loop never learns which substrate is answering. A substrate that cannot be
 /// reached reports its own error, and the caller decides what to do about it.
+///
+/// # Publication is synchronous, best-effort, and separately retryable
+///
+/// * **Synchronous**: the round awaits the write before moving to the next task,
+///   so a caller that inspects [`CheckpointRound::memory_failures`] after the
+///   round knows whether publication was attempted.
+/// * **Best-effort**: a failure never fails the round and never un-writes the
+///   checkpoint. SQLite is authoritative; the memory page is a copy.
+/// * **Separately retryable**: a failure is recorded per task and nothing in this
+///   crate retries it. The next round that produces a new checkpoint for that
+///   task publishes again, which is why the record is per-task rather than a
+///   single round-level flag.
+///
+/// # There is no distributed transaction here
+///
+/// SQLite and ai-memory are separate systems with no shared commit. The order is
+/// checkpoint-commits-then-publishes, which makes the window one-directional: a
+/// checkpoint can exist with no page (recorded, visible, retried), but a page
+/// can never exist for a checkpoint that was not committed, because the publish
+/// only runs after the write succeeded.
+///
+/// # Publication is overwrite-per-task, not append
+///
+/// [`memory_for`](self) derives the page path from the task id, so republishing
+/// replaces that task's page with the newer checkpoint. That is why a retried
+/// round does not accumulate duplicates — and also why nothing here claims
+/// exactly-once delivery: a retry republishes, and whether the substrate applied
+/// the first attempt before failing is not observable from here.
+///
+/// # Configure the substrate below this bound
+///
+/// [`MEMORY_PUBLISH_TIMEOUT`] is an outer bound on the whole call. If a provider's
+/// own request bound is longer, the outer bound cancels a request that is still
+/// in flight, and a cancelled MCP request leaves its connection ambiguous. Set
+/// the provider's per-call bound *below* this one so the provider times out and
+/// reports in its own terms first. `AiMemoryConfig::from_env` does this.
 pub async fn publish_checkpoint<M: MemoryProvider>(
     memory: &M,
     checkpoint: &Checkpoint,

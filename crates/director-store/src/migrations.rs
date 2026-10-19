@@ -94,6 +94,22 @@ pub fn migrations() -> BTreeMap<u32, Migration> {
             sql: include_str!("../migrations/0004_blockers_actions.sql"),
         },
     );
+    all.insert(
+        5,
+        Migration {
+            version: 5,
+            name: "handoffs",
+            sql: include_str!("../migrations/0005_handoffs.sql"),
+        },
+    );
+    all.insert(
+        6,
+        Migration {
+            version: 6,
+            name: "handoff_cause",
+            sql: include_str!("../migrations/0006_handoff_cause.sql"),
+        },
+    );
     all
 }
 

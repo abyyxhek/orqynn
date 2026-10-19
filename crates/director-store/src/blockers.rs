@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use director_domain::blocker::Blocker;
-use director_domain::ids::{AgentId, BlockerId, TaskId};
+use director_domain::ids::{AgentId, BlockerId, Id, TaskId};
 use director_domain::StoreError;
 
 use crate::connection::{translate_error, PooledConn};
@@ -33,6 +33,56 @@ impl SqliteBlockerRepository {
 
     fn conn(&self) -> PooledConn {
         self.pool.get()
+    }
+
+    /// Raise a blocker against `task`, allocating its id here rather than taking
+    /// one from the caller.
+    ///
+    /// [`BlockerRepository::create_blocker`] takes the id as part of the record,
+    /// which is right for a caller that has one and wrong for a caller that would
+    /// have to *choose* one. A caller choosing an id has to count the task's
+    /// existing blockers to pick a free ordinal, and that count read outside a
+    /// write transaction is a guess: two callers raising blockers against the same
+    /// task concurrently can read the same length, build the same
+    /// `BLK-{task}-{ordinal}`, and have the second one refused by the primary key
+    /// on `blockers.id`. Nothing about either blocker was wrong; only the names
+    /// collided.
+    ///
+    /// So the allocation happens here, in one transaction that takes the write lock
+    /// *before* it reads, counts the task's blockers, constructs the id, and
+    /// inserts the row before releasing it. A competing caller cannot interleave:
+    /// it would need the same reserved write lock, which is held until this
+    /// transaction commits or rolls back. The count the ordinal comes from
+    /// therefore includes every blocker committed before this one and none
+    /// committed after it.
+    ///
+    /// The count is over *all* of the task's rows, cleared ones included, because
+    /// blockers are never deleted — so the ordinal is monotonic and an id freed by
+    /// a `Resolved` or `Obsolete` transition is never handed to a different
+    /// blocker.
+    ///
+    /// This is additive. [`BlockerRepository::create_blocker`] keeps its
+    /// signature and its caller-chosen-id behaviour, and the domain trait is
+    /// unchanged: allocation is a store concern, so it is offered as an inherent
+    /// method on the SQLite repository rather than as a new trait obligation every
+    /// implementation would have to satisfy.
+    pub async fn create_blocker_next(
+        &self,
+        task_id: &TaskId,
+        kind: director_domain::blocker::BlockerKind,
+        description: impl Into<String>,
+        resolution: Option<String>,
+        raised_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Blocker, StoreError> {
+        create_next(
+            &self.pool,
+            task_id,
+            kind,
+            description.into(),
+            resolution,
+            raised_at,
+        )
+        .await
     }
 }
 
@@ -88,6 +138,77 @@ impl director_domain::BlockerRepository for SqliteBlockerRepository {
         }
         Ok(all)
     }
+}
+
+/// Raise a blocker against `task`, allocating the id inside the write
+/// transaction.
+///
+/// The transaction is `IMMEDIATE` rather than deferred, and that is the whole
+/// point. A deferred transaction does not take the write lock until its first
+/// *write*, so its earlier reads come from a snapshot taken before any competing
+/// writer committed — exactly the window this operation exists to close. Taking
+/// the reserved write lock up front means the `COUNT` and the `INSERT` are
+/// serialized against every other writer, not merely adjacent.
+///
+/// Nothing else is written: a raised blocker is one row, and its status stays
+/// `Open`. This deliberately does not touch the task's status — a blocker is its
+/// own lifecycle, and the task's is the loop's to decide.
+pub async fn create_next(
+    pool: &crate::connection::ConnectionPool,
+    task_id: &TaskId,
+    kind: director_domain::blocker::BlockerKind,
+    description: String,
+    resolution: Option<String>,
+    raised_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Blocker, StoreError> {
+    let mut conn = pool.get();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(translate_error)?;
+
+    let blocker = next_blocker(&tx, task_id, kind, description, resolution, raised_at)?;
+    insert_blocker(&tx, &blocker)?;
+    tx.commit().map_err(translate_error)?;
+    drop(conn);
+
+    let conn = pool.get();
+    load_blocker(&conn, &blocker.id)
+}
+
+/// Build the next blocker for `task`, counting inside `tx`.
+///
+/// Every row for the task counts, cleared ones included, because blockers are
+/// never deleted. That is what makes the ordinal monotonic and stops a resolved
+/// blocker's id from being handed out again.
+fn next_blocker(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &TaskId,
+    kind: director_domain::blocker::BlockerKind,
+    description: String,
+    resolution: Option<String>,
+    raised_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Blocker, StoreError> {
+    let prior: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM blockers WHERE task_id = ?1",
+            [task_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(translate_error)?;
+
+    let mut blocker = director_domain::blocker::Blocker::raise(
+        BlockerId::from_string(format!("{}-{task_id}-{}", BlockerId::PREFIX, prior + 1)),
+        task_id.clone(),
+        kind,
+        description,
+    );
+    // `raised_at` is the caller's instant rather than the constructor's wall
+    // clock, so a caller can pin it.
+    blocker.raised_at = raised_at;
+    if let Some(resolution) = resolution {
+        blocker = blocker.resolvable_by(resolution);
+    }
+    Ok(blocker)
 }
 
 fn insert_blocker(tx: &rusqlite::Transaction<'_>, blocker: &Blocker) -> Result<(), StoreError> {

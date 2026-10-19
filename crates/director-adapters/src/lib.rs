@@ -38,12 +38,15 @@ pub mod aimemory;
 pub mod executor;
 pub mod git;
 pub mod handoff;
+pub mod harness;
 pub mod memory;
 pub mod stdio_mcp;
 
 pub use executor::LocalExecutor;
 pub use memory::InMemoryError;
 pub use memory::InMemoryProvider;
+/// The one timeout configuration for the whole MCP substrate path.
+pub use stdio_mcp::{McpTimeouts, Phase as McpPhase};
 
 // The git observation layer, re-exported flat: callers say `GitService`, not
 // `git::service::GitService`.
@@ -65,3 +68,4 @@ pub use handoff::wire;
 // substrate's stays reachable as `aimemory::wire`.
 pub use aimemory::adapter::{AiMemoryAdapter, AiMemoryAdapterError, AiMemoryWire};
 pub use aimemory::transport::{MemoryTransport, TransportError as AiMemoryTransportError};
+pub use aimemory::AiMemoryConfig;

@@ -70,6 +70,7 @@ use crate::aimemory::transport::MemoryTransport;
 use crate::aimemory::wire::{
     MemoryQueryResponse, MemoryRecentResponse, PageHit, ReadPageReply, WritePageReply, KNOWN_TIERS,
 };
+use crate::stdio_mcp::McpTimeouts;
 
 /// Which of its two meanings a [`PageHit`]'s `rank` carries, per the tool that
 /// produced it. See the [`wire`] module docs for why the split is load-bearing.
@@ -112,6 +113,19 @@ pub enum AiMemoryAdapterError {
         /// Why parsing failed.
         message: String,
     },
+    /// Another caller is using the connection and this one waited too long for
+    /// its turn.
+    ///
+    /// Distinct from a tool-call timeout, and deliberately so: nothing went
+    /// wrong with the server, no request was sent on this caller's behalf, and
+    /// the in-flight request belongs to somebody else and is unaffected. The
+    /// connection is untouched, so the call can be retried once the holder
+    /// finishes.
+    #[error("another caller has held the ai-memory connection for over {waited:?}")]
+    LockTimeout {
+        /// How long this caller waited for its turn.
+        waited: std::time::Duration,
+    },
 }
 
 /// A connection that can call ai-memory tools.
@@ -125,6 +139,16 @@ pub trait AiMemoryWire: Send {
         name: &str,
         arguments: Value,
     ) -> Result<String, AiMemoryAdapterError>;
+
+    /// The server's most recent stderr, when this wire is backed by a real
+    /// child process.
+    ///
+    /// Defaults to `None` so a fake wire needs nothing. Callers must treat it as
+    /// diagnostic text: it is arbitrary output from a third party and is never
+    /// part of a protocol reply.
+    fn stderr_tail(&self) -> Option<String> {
+        None
+    }
 }
 
 #[async_trait]
@@ -138,6 +162,11 @@ impl AiMemoryWire for MemoryTransport {
         MemoryTransport::call_tool(self, name, arguments)
             .await
             .map_err(AiMemoryAdapterError::from)
+    }
+
+    /// A real child process, so there is a stderr to report.
+    fn stderr_tail(&self) -> Option<String> {
+        Some(MemoryTransport::stderr_tail(self))
     }
 }
 
@@ -153,6 +182,12 @@ pub struct AiMemoryAdapter<T = MemoryTransport> {
     workspace: String,
     /// Project name, sent with every call.
     project: String,
+    /// How long a caller waits for its turn at [`Self::transport`].
+    ///
+    /// Separate from the transport's own bounds on purpose: failing to get the
+    /// lock says nothing about the server, so it must not produce a
+    /// tool-call-style error or reach the transport at all.
+    lock_timeout: std::time::Duration,
 }
 
 impl<T: AiMemoryWire> AiMemoryAdapter<T> {
@@ -162,12 +197,59 @@ impl<T: AiMemoryWire> AiMemoryAdapter<T> {
     /// test can construct the adapter and arrange state through the fake first.
     /// The first `save_memory` creates the project; reads of a missing project
     /// fail closed, and the adapter propagates that rather than masking it.
+    ///
+    /// Uses [`McpTimeouts::default`]'s lock bound. Use
+    /// [`Self::new_with_timeouts`] to change it.
     pub fn new(transport: T, workspace: impl Into<String>, project: impl Into<String>) -> Self {
+        AiMemoryAdapter::new_with_timeouts(transport, workspace, project, McpTimeouts::default())
+    }
+
+    /// [`Self::new`] with explicit bounds.
+    ///
+    /// Only [`McpTimeouts::lock`] is read here: the rest belong to the
+    /// transport, which the caller already built. Passing the whole struct keeps
+    /// one configuration type in play rather than introducing a second one.
+    pub fn new_with_timeouts(
+        transport: T,
+        workspace: impl Into<String>,
+        project: impl Into<String>,
+        timeouts: McpTimeouts,
+    ) -> Self {
         AiMemoryAdapter {
             transport: Mutex::new(transport),
             workspace: workspace.into(),
             project: project.into(),
+            lock_timeout: timeouts.lock,
         }
+    }
+
+    /// Wait this caller's turn to use the connection.
+    ///
+    /// `tokio::sync::Mutex::lock` is cancel-safe: dropping this future while it
+    /// waits removes the caller from the queue without acquiring the guard. So a
+    /// timeout here — and an outright cancellation — cannot take the guard from
+    /// the caller that holds it, cannot cancel the request already in flight,
+    /// and cannot leave the lock held by nobody.
+    async fn lock_transport(&self) -> Result<tokio::sync::MutexGuard<'_, T>, AiMemoryAdapterError> {
+        match tokio::time::timeout(self.lock_timeout, self.transport.lock()).await {
+            Ok(guard) => Ok(guard),
+            Err(_) => Err(AiMemoryAdapterError::LockTimeout {
+                waited: self.lock_timeout,
+            }),
+        }
+    }
+
+    /// The server's most recent stderr, kept out of the JSON-RPC stream.
+    ///
+    /// `None` when the wire is a fake with no process behind it, or when another
+    /// caller currently holds the connection: this deliberately uses a
+    /// non-blocking attempt at the lock so that diagnostics stay available
+    /// exactly when a busy server is what you want to look at.
+    pub fn stderr_tail(&self) -> Option<String> {
+        self.transport
+            .try_lock()
+            .ok()
+            .and_then(|guard| AiMemoryWire::stderr_tail(&*guard))
     }
 
     /// Call an ai-memory tool directly, bypassing the mapping.
@@ -182,7 +264,7 @@ impl<T: AiMemoryWire> AiMemoryAdapter<T> {
         name: &str,
         arguments: Value,
     ) -> Result<String, AiMemoryAdapterError> {
-        let mut transport = self.transport.lock().await;
+        let mut transport = self.lock_transport().await?;
         transport.call_tool(name, arguments).await
     }
 
@@ -204,7 +286,7 @@ impl<T: AiMemoryWire> AiMemoryAdapter<T> {
             obj.entry("project")
                 .or_insert(Value::String(self.project.clone()));
         }
-        let mut transport = self.transport.lock().await;
+        let mut transport = self.lock_transport().await?;
         transport
             .call_tool(tool, arguments)
             .await
@@ -369,8 +451,33 @@ impl AiMemoryAdapter<MemoryTransport> {
         workspace: impl Into<String>,
         project: impl Into<String>,
     ) -> Result<Self, AiMemoryAdapterError> {
-        let transport = MemoryTransport::spawn(binary, data_dir).await?;
-        Ok(AiMemoryAdapter::new(transport, workspace, project))
+        Self::connect_with_timeouts(binary, data_dir, workspace, project, McpTimeouts::default())
+            .await
+    }
+
+    /// [`Self::connect`] with explicit bounds on every blocking operation.
+    ///
+    /// The whole [`McpTimeouts`] is applied, not just part of it:
+    ///
+    /// * `handshake` bounds this method's own spawn and `initialize`, so a
+    ///   server that never answers fails to connect rather than hanging here.
+    /// * `tool_call`, `write` and `shutdown` are carried by the transport and
+    ///   apply to every later request and to cleanup.
+    /// * `lock` becomes this adapter's wait bound for its own mutex.
+    ///
+    /// Nothing else changes: same binary, same argv, same environment, same
+    /// scoping, same tool names.
+    pub async fn connect_with_timeouts(
+        binary: &str,
+        data_dir: &std::path::Path,
+        workspace: impl Into<String>,
+        project: impl Into<String>,
+        timeouts: McpTimeouts,
+    ) -> Result<Self, AiMemoryAdapterError> {
+        let transport = MemoryTransport::spawn_with_timeouts(binary, data_dir, timeouts).await?;
+        Ok(AiMemoryAdapter::new_with_timeouts(
+            transport, workspace, project, timeouts,
+        ))
     }
 }
 

@@ -5,6 +5,7 @@ members = [
     "crates/director-adapters",
     "crates/director-store",
     "crates/director-app",
+    "crates/orqynn",
 ]
 
 [workspace.package]
@@ -20,6 +21,7 @@ authors = ["Orqyn contributors"]
 director-domain = { path = "crates/director-domain" }
 director-adapters = { path = "crates/director-adapters" }
 director-store = { path = "crates/director-store" }
+director-app = { path = "crates/director-app" }
 
 # Shared runtime + serialization.
 tokio = { version = "1", features = ["full"] }

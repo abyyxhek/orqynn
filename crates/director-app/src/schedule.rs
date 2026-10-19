@@ -108,13 +108,13 @@ use std::collections::{HashMap, HashSet};
 
 use director_domain::agent::Agent;
 use director_domain::assignment::AgentAssignment;
-use director_domain::ids::{AgentId, AssignmentId, IdGenerator, ProjectId, TaskId};
+use director_domain::ids::{AgentId, IdGenerator, ProjectId, TaskId};
 use director_domain::task::Task;
 use director_domain::{AgentRepository, AssignmentRepository};
 
 use director_store::Store;
 
-use crate::assign::{self, AssignRequest};
+use crate::assign;
 use crate::{AssignError, ScheduleError};
 
 /// Run the SCHEDULE step: hand every ready task in the active plan to the best
@@ -125,8 +125,12 @@ use crate::{AssignError, ScheduleError};
 /// without an agent — is reported. The round writes only through `assign`, so a
 /// refused or unassigned task is exactly where the round found it.
 ///
-/// `ids` mints the assignment ids, since this step is the one deciding who gets
-/// what and there is no caller to name them.
+/// `ids` is no longer where assignment ids come from: a per-instance counter
+/// cannot stay unique across two Runners over one store, so ids are derived from
+/// each task's persisted history instead (see [`next_assignment_id`]). The
+/// parameter is kept so this signature — and the README example that calls it —
+/// stays as published; the step no longer reads it, and a caller should not rely
+/// on its counters having advanced.
 pub async fn schedule(
     store: &Store,
     ids: &mut IdGenerator,
@@ -140,7 +144,7 @@ pub async fn schedule(
 /// [`chrono::Utc::now`].
 pub async fn schedule_at(
     store: &Store,
-    ids: &mut IdGenerator,
+    _ids: &mut IdGenerator,
     project_id: &ProjectId,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ScheduleReport, ScheduleError> {
@@ -209,13 +213,14 @@ pub async fn schedule_at(
         // 5. Apply the pairing through ASSIGN, which re-checks legality against
         //    the live store and does the write. A proposal is a snapshot; the
         //    write is live, and a stale proposal is refused rather than applied.
-        let request = AssignRequest {
-            project_id: project_id.clone(),
-            task_id: task.id.clone(),
-            agent_id: agent_id.clone(),
-            assignment_id: ids.next::<AssignmentId>("sched"),
-        };
-
+        //
+        //    The assignment id is allocated inside that write rather than chosen
+        //    here. SCHEDULE has no id of its own to offer — the pairing it just
+        //    made is a proposal, not a record — and a count of the task's tenures
+        //    taken out here would be a guess that another round could match, which
+        //    is what used to end as a duplicate-id refusal. See
+        //    `assign::assign_next_at`.
+        //
         // 6. If this task has a checkpoint, the agent about to receive it is
         //    inheriting work, and the continuation package is its briefing.
         //    Built *before* the assignment lands, so a read that fails leaves
@@ -224,7 +229,7 @@ pub async fn schedule_at(
         //    A fresh task reads no checkpoint and yields `None` here.
         let recovery = crate::recovery::recovery_context_from_store(store, &task.id).await?;
 
-        match assign::assign_at(store, request, now).await {
+        match assign::assign_next_at(store, project_id, &task.id, &agent_id, now).await {
             Ok(assigned) => {
                 committed.insert(agent_id.clone());
                 committed_scopes.push(assigned.task);
@@ -249,6 +254,29 @@ pub async fn schedule_at(
     Ok(report)
 }
 
+/// Assignment ids are no longer minted here.
+///
+/// They used to be `ids.next::<AssignmentId>("sched")`, and both of the ways
+/// that could go wrong have since been fixed — but in different places, and it is
+/// worth saying where.
+///
+/// A per-instance counter cannot stay unique across two Runners over one store:
+/// the second began at one again and produced an id the first had already used,
+/// so a legitimate assignment was refused by the primary key on
+/// `agent_assignments.id`. The fix was to derive the id from the task's own
+/// persisted history instead of from a counter.
+///
+/// That fixed the cross-Runner case but left a second one, because the count was
+/// still taken *here* — outside the transaction that inserts the row. Two racing
+/// rounds on the very same task could therefore propose the same ordinal, and
+/// `guard_scope` does not catch that case (a task does not conflict with itself).
+/// So the allocation itself moved into the store's write transaction, where the
+/// count and the `INSERT` are protected by the same reserved write lock: see
+/// `director_store::assignments::assign_and_start_next` and
+/// [`assign::assign_next_at`].
+///
+/// This step therefore has no id to offer, which is also why it does not build an
+/// [`AssignRequest`] — a request exists to name an id the caller chose.
 /// How many tenures each agent has already had on a task, from its assignment
 /// history. Zero for an agent who has never held it — the preferred pairing.
 fn count_tenures(history: &[AgentAssignment]) -> HashMap<AgentId, usize> {
@@ -449,7 +477,7 @@ mod tests {
     use super::*;
     use director_domain::agent::{Agent, AgentStatus, Harness};
     use director_domain::capability::Capability;
-    use director_domain::ids::{AgentId, MachineId, ProjectId, TaskId};
+    use director_domain::ids::{AgentId, AssignmentId, MachineId, ProjectId, TaskId};
     use director_domain::task::Task;
 
     /// An agent named `id`, `Available`, with `caps` and no current task.

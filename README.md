@@ -139,9 +139,10 @@ Every task declares what it may touch, and no two tasks with overlapping scope a
 ### 9. A Log Records Work, and a Gap Is Announced — Never Papered Over
 The recovery briefing distinguishes *nothing happened* from *Orqyn has no record either way*, and refuses to invent the difference.
 - **VERIFY is the only step that records actions**, because it is the only one whose events are *observed*: it runs the commands and reads the exit codes itself. An agent's report of what it did is a claim about the work, and a claim is not written to a log of facts.
-- **An action id is derived, not drawn.** `ACT-{verification_id}-{ordinal}` is built from the round's own persisted identity, never from a counter or the clock — so a restart cannot re-mint it, one round cannot be recorded twice, and the same inputs produce the same log.
+- **An action id is derived, not drawn.** `ACT-{verification_id}-{ordinal}` is built from the round's own persisted identity, never from a counter or the clock — so a restart cannot re-mint it and the same inputs produce the same log. Note what the derivation does *not* buy: it does not dedupe. A second attempt at the same round hits the `tasks.state_version` compare-and-set first and is refused before any action is written; if one ever slipped past, the duplicate id would be a loud primary-key failure, not a silently skipped row.
 - **A round that changed nothing records nothing.** A task left `verification_pending` is surveyed again next tick, so recording each attempt would grow the log by one duplicate of the same failure per tick. Duplicates dressed as history are what the log exists to rule out.
-- **The one provable hole is reported.** The verdict commits before its actions are written, so a process killed in between leaves a durable verdict with no actions — and no later round will fill them, because the task has left the survey set. `RecoveryGaps::actions_incomplete` detects exactly that (a verification id with no matching action) and `RecoveryStep::actions_incomplete` carries it to the caller.
+- **The verdict and the actions it recorded are one write.** The round's verdict, the task's move, the status-history row and every action the round observed commit inside a single SQLite transaction, so a process killed at any point either has the whole round or none of it. There is no window in which a durable verdict exists with no actions.
+- **The gap detector is a canary, not a repair.** `RecoveryGaps::actions_incomplete` still reports a verification id with no matching action, and `RecoveryStep::actions_incomplete` still carries it to the caller — but after the transactional change it is evidence of a row written by an older build or by hand, not of a hole Orqyn can still fall into. It is kept because it is the cheapest way to notice if that ever stops being true.
 - **A blocker is a decision, so it is an explicit operation.** No round in the loop may decide on its own that a task is blocked — REPLAN reports stranded dependents and declines, because a blocker is a second entity's lifecycle. `Runner::raise_blocker`, `resolve_blocker`, and `obsolete_blocker` are where that decision becomes durable.
 - **Resolved and obsoleted are different histories.** Replaying the same clearing is a no-op that returns the row unchanged; asking for the *other* cleared state is a contradiction and is refused rather than silently overwriting. Two things standing in the way are two blockers, not one whose description quietly changed.
 - **An open blocker decides the resume verdict without touching task status.** A task whose checkpoint is current but which still has an open blocker reads `ResumeStatus::Blocked`; the task's own `status` is left alone, because REPLAN does not own another entity's lifecycle. Staleness still wins over blocking — a stale checkpoint has to be reconciled before its blocker means anything.
@@ -174,7 +175,7 @@ flowchart TD
 | **SCHEDULE** | `schedule::schedule` | Pairs unassigned `ready_tasks` with available agents using a 4-tier policy: eligibility, fresh-eyes (prioritizing new agents), specialist-first (conserving generalists), and deterministic tie-breaking. When it hands a task to a replacement agent, it attaches the recovery context built by `recovery::RecoveryBuilder`. |
 | **ASSIGN** | `assign::assign` | Acquires a claim-once lease for an agent, transitions task status to `in_progress`, and records the assignment transactionally. |
 | **MONITOR** | `monitor::monitor` | Checks heartbeat ages against TTL windows. Reclaims expired leases from vanished agents, handles progress reports, and moves finished work to `verification_pending`. |
-| **VERIFY** | `verify::verify` / `verify_at` | Resolves machine-checkable criteria into probes (`Probe::Command`), executes them via `ExecutionProvider`, reads raw exit codes, and writes append-only `Verification` records. It then records what it observed as actions on the durable log — one per check that actually ran, keyed on the round's own verification id. |
+| **VERIFY** | `verify::verify` / `verify_at` | Resolves machine-checkable criteria into probes (`Probe::Command`), executes them via `ExecutionProvider`, reads raw exit codes, and writes append-only `Verification` records. It records what it observed as actions in the same transaction as that verdict — one per check that actually ran, keyed on the round's own verification id. |
 | **REPLAN** | `replan::replan` | Evaluates failed or stranded tasks and applies caller-specified remediations (`Retry`, `Rework`, or `Cancel`) while reporting any dependent tasks left stranded. |
 | **RECOVERY** | `recovery::RecoveryBuilder` | Assembles a complete continuation package (contracts, version history, previous verdicts, git checkpoint, recorded actions, blockers) in one place, so a replacement agent — or a driver briefing one — asks one question and gets one answer. It also reports the gaps by name, so an empty field is never read as a fact about the work. |
 | **BLOCKERS** *(operations, not a step)* | `Runner::raise_blocker` / `resolve_blocker` / `obsolete_blocker` | Persists the decision that something stands in the way of a task. Deliberately outside the loop: no round is allowed to make that call on its own, because a blocker is a second entity's lifecycle. |
@@ -284,6 +285,253 @@ cargo test --workspace --all-targets && cargo test --workspace --doc
 > $env:CARGO_TARGET_DIR = "$HOME\.orqyn-target"
 > cargo test --workspace
 > ```
+
+---
+
+## The `orqynn` CLI
+
+One command drives one task through the whole loop. It is a thin shell: every step
+below is a call into `director-app`, so nothing about scheduling, verification,
+checkpointing or recovery is reimplemented here.
+
+```text
+orqynn run --repo <path> --task <description> --check <command> [--check <command>]... [options]
+```
+
+### Build
+
+```bash
+cargo build --workspace
+# the binary is target/debug/orqynn  (target/release/orqynn with --release)
+```
+
+### Options
+
+| Option | Meaning | Default |
+|---|---|---|
+| `--repo <path>` | git repository to observe and work in (required) | — |
+| `--task <description>` | the task, in your words (required) | — |
+| `--check <command>` | a command VERIFY runs; repeat for several. Required unless `--dry-run` | — |
+| `--task-id <id>` | task identifier | derived from `--task` |
+| `--db <path>` | SQLite state | `<repo>/.orqynn/orqynn.db` |
+| `--agent-binary <path>` | the agent executable | `claude` from `PATH` |
+| `--permission-mode <mode>` | passed to the harness | the harness's own default |
+| `--model <model>` | passed to the harness | — |
+| `--add-dir <path>` | an extra directory the agent may reach; repeatable | — |
+| `--agent-timeout <seconds>` | wall-clock limit for the agent | `1800` |
+| `--memory-timeout <seconds>` | limit on memory retrieval | `5` |
+| `--memory` | enable the ai-memory substrate | off (local-only) |
+| `--dry-run` | report what would happen; start nothing | off |
+
+### Environment variables
+
+Arguments win over the environment; the environment wins over the defaults.
+
+| Variable | Sets |
+|---|---|
+| `ORQYNN_REPO` | `--repo` |
+| `ORQYNN_TASK` | `--task` |
+| `ORQYNN_DB` | `--db` |
+| `ORQYNN_AGENT_BINARY` | `--agent-binary` |
+| `ORQYNN_AGENT_PERMISSION_MODE` | `--permission-mode` |
+| `ORQYNN_AGENT_MODEL` | `--model` |
+| `AI_MEMORY_BINARY` | ai-memory server executable (**required** for `--memory`) | — |
+| `AI_MEMORY_DATA_DIR` | ai-memory data directory (**required** for `--memory`) | — |
+| `AI_MEMORY_WORKSPACE` | ai-memory workspace (memory only) | `orqyn` |
+| `AI_MEMORY_PROJECT` | ai-memory project (memory only) | `orqyn` |
+
+`ANTHROPIC_API_KEY` and other credentials are deliberately **not** read. The agent
+authenticates itself; Orqyn never copies a credential into its configuration or
+prints one.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | verification passed |
+| 2 | bad configuration (missing flag, bad path, no check given) |
+| 3 | a step of the loop failed (observe, plan, schedule, storage) |
+| 4 | the agent did not run, or reported an error in its own output |
+| 5 | verification ran and did not pass — **the task is NOT done** |
+| 6 | the agent ran but the result could not be judged |
+| 7 | a dry run; nothing was executed |
+| 8 | `resume` refused: the task's state does not permit a safe resume |
+
+Code 8 is deliberately distinct from 3 and 4. A refusal means nothing was
+attempted: no process was launched, nothing was written, and no agent was
+involved. Conflating it with an execution failure would send you to debug an
+agent that was never running.
+
+### Recovering an interrupted task
+
+```bash
+orqynn resume --repo /path/to/your/repo --task-id ADD-A-GREETING
+```
+
+`resume` decides from persisted state rather than re-running the lifecycle. It
+loads the task, its assignments, sessions, blockers, verification history and
+recovery package, and then does exactly one of three things:
+
+| Task state | What `resume` does |
+|---|---|
+| `verification_pending` | **Re-verifies** against the current working tree using the persisted criteria. Launches nothing. |
+| `failed`, or `in_progress` with no active assignment | **Refuses** unless you pass `--remediate`. With `--remediate retry` it surveys via REPLAN, validates the decision, creates one new tenure, drives the agent and re-verifies. |
+| `in_progress` with an **active** assignment | **Refuses.** An agent already holds it; a second tenure would be two agents on the same ground. |
+| `blocked`, or an open blocker stands | **Refuses.** Clearing a blocker is a decision about the work. |
+| `done` or `cancelled` | **Refuses.** Terminal states are never silently reopened. |
+| Unknown task, or a broken premise | **Refuses**, naming what is missing. |
+
+Resume never retries a task on its own initiative: without `--remediate` it
+reports what it found and changes nothing.
+
+**A passing verdict is not reused.** Re-verification re-runs the task's persisted
+checks against the working tree *as it is now*. A verdict recorded against an
+earlier tree proves nothing about this one.
+
+**`--check` is optional.** With no `--check`, the task's recorded
+`ExpectedOutput` criteria are used. Supplying `--check` asserts agreement with
+them; if they differ, the resume is refused with both lists shown, and the
+recorded criteria are never modified.
+
+```bash
+# re-verify only — no agent is launched
+orqynn resume --repo . --task-id ADD-A-GREETING
+
+# authorise a retry of a failed task
+orqynn resume --repo . --task-id ADD-A-GREETING --remediate retry
+
+# abandon a task instead
+orqynn resume --repo . --task-id ADD-A-GREETING --remediate cancel
+```
+
+**Plan continuity.** If the project is already executing a plan, a new
+`orqynn run` adds its task to that plan rather than replacing it. The plan keeps
+its identity and history; only its task list grows. Superseding a plan therefore
+stays a deliberate act of replanning, and every task in the active plan remains
+resumable.
+
+**Objective vs. scope.** A plan's `objective` records *why the plan was created* —
+the goal it decomposes — and extending a plan never rewrites it. The scope a plan
+now covers is recorded additively, as its own line in the plan's rationale:
+
+```
+one task, requested explicitly on the command line - decomposed from observation 1 at abc123def456 on main
++ scope extended: this plan now also covers task FAREWELL ("make the farewell say goodbye")
+```
+
+Each extension appends one line, so the originating request and every task added
+since stay auditable. The extension is written in the same transaction as the task
+row and the membership append, so concurrent extensions cannot lose one another.
+
+A task is never made eligible by rewriting what Orqyn is executing against:
+`resume` does not replan, reactivate, or supersede a plan to reach a task, and it
+refuses a task its plan does not name.
+
+### A local-only example
+
+No external memory, no network substrate. Point it at any git repository:
+
+```bash
+orqynn run \
+  --repo /path/to/your/repo \
+  --task "add a greeting to the top of README.md" \
+  --check "grep -q '^# Hello' README.md"
+```
+
+Dry-run it first. `--dry-run` opens nothing, spawns nothing, and writes nothing:
+
+```bash
+orqynn run --repo /path/to/your/repo --task "..." --check "..." --dry-run
+```
+
+### With `ai-memory` enabled
+
+`--memory` publishes checkpoints to the `ai-memory` MCP substrate and retrieves
+context from it at briefing time. Its configuration is validated *before* anything
+launches, and the run refuses to start if the substrate cannot be reached:
+
+```bash
+export AI_MEMORY_BINARY=/path/to/ai-memory
+export AI_MEMORY_DATA_DIR=/path/to/ai-memory-data
+
+orqynn run \
+  --repo /path/to/your/repo \
+  --task "..." \
+  --check "..." \
+  --memory
+```
+
+External memory is **advisory**. It is copied into the briefing as context and
+cannot override the authoritative recovery state held in SQLite.
+
+### Configuring the Claude Code driver
+
+Orqyn launches the agent binary as a subprocess. By default that is `claude` from
+`PATH`; override it with `--agent-binary` or `ORQYNN_AGENT_BINARY`. Orqyn does not
+log in on your behalf — the binary must already be authenticated, and the presence
+of an executable is **not** evidence that it is.
+
+No permissive permission mode is ever chosen for you. With no `--permission-mode`,
+the harness applies its own default; a harness that waits for interactive approval
+will hit `--agent-timeout` rather than prompt.
+
+### How verification determines success
+
+Verification is the only thing that decides whether a task is done. Orqyn runs each
+`--check` command and reads its exit code; nothing an agent reports about its own
+work is treated as evidence.
+
+- Every check exits zero → the task is **done** (exit 0).
+- Any check fails → the task is **not done** (exit 5), whatever the agent said.
+- A check cannot be run at all → no verdict; the task stays awaiting verification
+  (exit 6).
+- The agent reported an error in its own output → execution failure (exit 4), even
+  if every check passed.
+
+### Where state lives
+
+| What | Where |
+|---|---|
+| SQLite task state | `<repo>/.orqynn/orqynn.db` (override with `--db`) |
+| git observation state | `<db-parent>/git-state` |
+| Diagnostics | printed to stdout/stderr; verdicts and observed actions are persisted to SQLite |
+
+### Inspecting and recovering an interrupted run
+
+An interrupted run leaves its records in SQLite. Re-running the same command with
+the same `--task-id` refuses to plan the task a second time and tells you so —
+nothing is duplicated. To re-attempt the work, use a different `--task-id`, or
+point `--db` at a fresh database to start over.
+
+The CLI reports whether the database was fresh or already in use, so you can tell a
+first run from a resumption.
+
+```bash
+# see what is recorded
+sqlite3 .orqynn/orqynn.db "SELECT id, status FROM tasks;"
+
+# start clean rather than resuming
+orqynn run --repo . --task "..." --check "..." --db ./.orqynn/new.db
+```
+
+### Current limitations
+
+- **No automatic reconnection or retries.** A failed MCP transport, a crashed
+  agent, or a timed-out check ends the run. `orqynn resume` recovers a task by
+  decision, but it never retries on its own initiative.
+- **Tasks join one plan per project.** A CLI-driven plan accumulates every task
+  the project was asked for, so a genuinely unrelated piece of work shares a plan
+  with the first. Real replanning — which supersedes — is not reachable from the
+  CLI.
+- **Plan scope is recorded in the rationale.** Accumulated scope is a list of
+  appended lines, not a structured field. It is deterministic and auditable, but
+  querying "which tasks does this plan cover" means reading `task_ids` rather
+  than parsing prose.
+- **No handoff.** `HandoffAdapter` is not wired into the CLI; cross-agent
+  continuation is not available through this command.
+- **No automatic scope planning.** The task is exactly what `--task` says.
+- Exit code 4 covers both "the agent could not start" and "the agent reported an
+  error".
 
 ---
 
@@ -527,7 +775,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | **11** | **Runtime & Recovery Validation** | Integration test suite proving crash survival, rebase tolerance, and replacement agent briefings. | ✅ Complete |
 | **12** | **Checkpointing & Recovery Context** | `checkpoint::checkpoint_round` derives evidence-backed checkpoints inside OBSERVE; `recovery::RecoveryBuilder` assembles a replacement agent's continuation package in one place, and SCHEDULE attaches it. | ✅ Complete |
 | **13** | **Deterministic Conflict Detection** | Normalized `scope_paths` compared as path prefixes; SCHEDULE refuses overlapping pairings and ASSIGN refuses the handoff, naming the task in the way and the ground in dispute. An undeclared scope is treated as unrestricted, not empty. | ✅ Complete |
-| **14** | **Recorded Events & Explicit Blockers** | VERIFY records the commands it ran and the exit codes it read as actions keyed on the round's own verification id, so the recovery log is a record of work rather than of claims. The one provable loss window is detected (`actions_incomplete`) instead of hidden. Blocker lifecycle becomes an explicit, replay-safe, contradiction-refusing operation, and an open blocker decides the resume verdict without mutating task status. | ✅ Complete |
+| **14** | **Recorded Events & Explicit Blockers** | VERIFY records the commands it ran and the exit codes it read as actions in the same transaction as the verdict, so the recovery log is a record of work rather than of claims, and a verdict can no longer outlive its actions. `actions_incomplete` remains as a canary for rows written by an older build. Blocker lifecycle becomes an explicit, replay-safe, contradiction-refusing operation, and an open blocker decides the resume verdict without mutating task status. | ✅ Complete |
 
 ---
 

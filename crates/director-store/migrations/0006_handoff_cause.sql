@@ -1,0 +1,12 @@
+-- Handoff cause: why responsibility for a task moved between agents.
+--
+-- Additive and nullable. `NULL` means the cause could not be established from
+-- persisted rows, which is different from every cause this column can name - and
+-- deliberately different from "the agent offered to hand it on", because Orqyn
+-- cannot prove that and will not assert it. Records written before this
+-- migration keep `NULL` and are never rewritten.
+--
+-- The cause is decided inside the same transaction that performs the
+-- displacement, from the released tenure's own `release_reason`. It is therefore
+-- a fact about what the store did, not a guess about intent.
+ALTER TABLE handoffs ADD COLUMN cause TEXT;

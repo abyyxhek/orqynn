@@ -322,6 +322,91 @@ pub async fn create_active_plan(
     Ok((stored_plan, stored_tasks))
 }
 
+/// Add one task to an existing **active** plan.
+///
+/// The plan keeps its identity, its objective and its supersession history; only
+/// its task list and its scope note grow. The task row, the membership append and
+/// the scope note are written in one transaction, so the store never holds a plan
+/// naming a task that does not exist, nor a task that belongs to no plan.
+///
+/// `extension_note` is a *suffix*, not a replacement value. The caller composes the
+/// line describing what was added; this function appends it to the rationale it
+/// read inside the transaction. That ordering is what makes concurrent extensions
+/// safe: two callers that both saw the same rationale still produce a rationale
+/// carrying both notes, because neither overwrites the other's.
+///
+/// Refuses a plan that is not the one being executed against. A historical plan is
+/// a record of what Orqyn once intended, and adding to it would rewrite that
+/// record — which is exactly what supersession exists to prevent.
+pub async fn append_task_to_plan(
+    pool: &crate::connection::ConnectionPool,
+    plan_id: &PlanId,
+    task: &Task,
+    extension_note: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(Plan, Task), StoreError> {
+    let mut conn = pool.get();
+    let tx = conn.transaction().map_err(translate_error)?;
+
+    // The plan as it stands *inside this transaction*, not as the caller last saw
+    // it, so two concurrent appends cannot lose one another's task or note.
+    let mut plan: Plan = tx
+        .query_row(
+            &format!("SELECT {PLAN_COLUMNS} FROM plans WHERE id = ?1"),
+            [plan_id.as_str()],
+            row_to_plan,
+        )
+        .map_err(translate_error)?;
+
+    if !plan.status.is_authoritative() {
+        return Err(StoreError::ConstraintViolation(format!(
+            "plan {} is {:?}, so it is not the plan Orqyn is executing against",
+            plan_id, plan.status
+        )));
+    }
+    // Checked before anything is written, so a refused duplicate leaves neither a
+    // task row nor a scope note behind.
+    if plan.task_ids.iter().any(|id| id == &task.id) {
+        return Err(StoreError::ConstraintViolation(format!(
+            "task {} is already in plan {}",
+            task.id, plan_id
+        )));
+    }
+
+    crate::tasks::insert_task(&tx, task)?;
+    plan.task_ids.push(task.id.clone());
+    if !extension_note.trim().is_empty() {
+        // Appended to what this transaction read, so a concurrent append's note
+        // survives.
+        let separator = if plan.rationale.trim().is_empty() {
+            String::new()
+        } else {
+            "\n".to_string()
+        };
+        plan.rationale = format!("{}{separator}{}", plan.rationale, extension_note.trim());
+    }
+
+    tx.execute(
+        "UPDATE plans
+            SET task_ids = ?2, rationale = ?3, updated_at = ?4,
+                state_version = state_version + 1
+          WHERE id = ?1",
+        rusqlite::params![
+            plan.id.as_str(),
+            json::to_json(&plan.task_ids)?,
+            plan.rationale,
+            json::timestamp(now),
+        ],
+    )
+    .map_err(translate_error)?;
+
+    tx.commit().map_err(translate_error)?;
+
+    let stored_plan = load_plan(&conn, &plan.id)?;
+    let stored_task = crate::tasks::load_task(&conn, &task.id)?;
+    Ok((stored_plan, stored_task))
+}
+
 /// The columns every plan query selects, in order. One place, so the SELECTs
 /// and the row mapper cannot drift apart.
 const PLAN_COLUMNS: &str = "id, project_id, objective, task_ids, rationale, status, supersedes,

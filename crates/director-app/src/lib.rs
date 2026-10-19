@@ -43,9 +43,13 @@
 //! real store, without a process boundary in the way. All six are landed; what
 //! is missing is a driver. Until one exists, the tests are the caller.
 
+pub mod agent;
 pub mod assign;
+pub mod brief;
 pub mod checkpoint;
 pub mod engine;
+pub mod handoff;
+pub mod memory;
 pub mod monitor;
 pub mod observe;
 pub mod plan;
@@ -178,6 +182,20 @@ pub enum PlanError {
     /// audit trail. Replanning means a new plan id.
     #[error("a plan with id {0} already exists")]
     DuplicatePlan(String),
+
+    /// The project has no active plan to extend.
+    #[error("project {0} has no active plan to extend")]
+    NoActivePlan(String),
+
+    /// A task already belongs to the active plan, so extending it would either
+    /// duplicate it or silently widen its membership.
+    #[error("task {task} is already in the active plan {plan}")]
+    TaskAlreadyPlanned {
+        /// The task that would have been added twice.
+        task: TaskId,
+        /// The plan it already belongs to.
+        plan: PlanId,
+    },
 
     /// A task depends on something that cannot be a dependency — itself.
     #[error("task {task} has an invalid dependency: {problem}")]

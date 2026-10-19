@@ -62,6 +62,8 @@ use crate::assignment::AgentAssignment;
 use crate::blocker::Blocker;
 use crate::checkpoint::Checkpoint;
 use crate::decision::Decision;
+use crate::handoff::Handoff;
+use crate::ids::HandoffId;
 use crate::ids::{
     ActionId, AgentId, AssignmentId, BlockerId, CheckpointId, DecisionId, PlanId, ProjectId,
     RepositoryId, SessionId, TaskId, VerificationId,
@@ -484,6 +486,59 @@ pub trait DecisionRepository: Store {
 /// distinguishable from "we stopped trying" and a replacement agent can read the
 /// resolution history rather than only the current state.
 #[async_trait]
+/// Persistence for handoffs - an auditable record that one agent transferred
+/// continuation responsibility for a task to another.
+///
+/// Narrow on purpose. A handoff records **attribution** - who passed what to
+/// whom, and when - and nothing more:
+///
+///   * It does not grant execution authority. That is [`AssignmentRepository`],
+///     under the lease and scope guards. Accepting a handoff grants nothing.
+///   * It does not carry or decide task state. That is the task row and its
+///     verification evidence; a handoff's narrative is what an outgoing agent
+///     *said*, which is context and never proof of completion.
+///   * It never marks a task complete. Only verification does that.
+///
+/// The continuation narrative is stored as an immutable snapshot taken at
+/// creation, so the record stays auditable after the task moves on. Acceptance
+/// updates only the lifecycle fields: `state`, `accepted_at` and
+/// `accepted_by_session`.
+#[async_trait]
+pub trait HandoffRepository: Store {
+    /// Persist a new handoff. A duplicate id is a constraint violation, and
+    /// nothing is written when the task or the source agent does not exist.
+    async fn open_handoff(&self, handoff: &Handoff) -> Result<Handoff, Self::Error>;
+
+    /// Load a handoff by id, or [`StoreError::NotFound`].
+    async fn get_handoff(&self, id: &HandoffId) -> Result<Handoff, Self::Error>;
+
+    /// Accept as the intended agent.
+    ///
+    /// Claim-once: only [`Handoff::to_agent`] may accept, and only while the
+    /// handoff is still open. Concurrent attempts must resolve to exactly one
+    /// winner, and a refused attempt writes nothing.
+    async fn accept_handoff(
+        &self,
+        id: &HandoffId,
+        acceptor: &AgentId,
+        session: &SessionId,
+        accepted_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Handoff, Self::Error>;
+
+    /// Every handoff still waiting to be claimed, newest first.
+    async fn open_handoffs(&self) -> Result<Vec<Handoff>, Self::Error>;
+
+    /// Every handoff for a task, newest first - the attribution history.
+    async fn handoffs_for_task(&self, task: &TaskId) -> Result<Vec<Handoff>, Self::Error>;
+}
+
+/// Persistence for blockers - what is standing in a task's way.
+///
+/// A blocker is retained after it stops blocking. Clearing one moves its `status`
+/// and stamps `resolved_at`; nothing is deleted, so "we fixed it" stays
+/// distinguishable from "we stopped trying" and a replacement agent can read the
+/// resolution history rather than only the current state.
+#[async_trait]
 pub trait BlockerRepository: Store {
     /// Record a newly raised blocker.
     async fn create_blocker(&self, blocker: &Blocker) -> Result<Blocker, Self::Error>;
@@ -527,10 +582,18 @@ pub trait ActionRepository: Store {
     /// Unbounded: this is the durable log. Callers that need a window build one
     /// through [`crate::context::RecentContext`], which is where the bound lives.
     ///
-    /// Ties on the timestamp break on `id`. Two actions recorded in the same
-    /// round can share a timestamp to the clock's resolution, and a window whose
-    /// order changed between two reads of the same rows would make a recovery
-    /// briefing disagree with itself for no reason.
+    /// Ties on the timestamp break on the order the actions were recorded, which
+    /// an implementation must make deterministic and stable across repeated
+    /// reads of the same rows. Two actions recorded in the same round can share a
+    /// timestamp to the clock's resolution, and a window whose order changed
+    /// between two reads of the same rows would make a recovery briefing disagree
+    /// with itself for no reason.
+    ///
+    /// Record order is the tie-break rather than `id` because an action id
+    /// encodes the round and the check within it as text, and lexical order over
+    /// that text does not track time: unpadded counters put round ten ahead of
+    /// round two. Implementations that can establish a recorded order — a log
+    /// that is only appended to can — should use it.
     async fn actions_for_task(&self, task: &TaskId) -> Result<Vec<Action>, Self::Error>;
 }
 

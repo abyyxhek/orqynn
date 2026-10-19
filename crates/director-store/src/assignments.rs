@@ -34,7 +34,9 @@ use rusqlite::OptionalExtension;
 
 use director_domain::agent::AgentStatus;
 use director_domain::assignment::{AgentAssignment, AssignmentStatus, ReleaseReason};
-use director_domain::ids::{AgentId, AssignmentId, SessionId, TaskId};
+use director_domain::handoff::{HandoffCause, HandoffState};
+use director_domain::ids::{AgentId, AssignmentId, HandoffId, Id, SessionId, TaskId};
+use director_domain::plan::PlanStatus;
 use director_domain::session::{AgentSession, SessionEnd, SessionStatus};
 use director_domain::task::{Task, TaskStatus};
 use director_domain::StoreError;
@@ -207,15 +209,23 @@ fn handoff(
     // 1. Who is being displaced, if anyone? This has to be learned *before* the
     //    release in step 2, because afterwards the row no longer carries the
     //    `active` status that identifies it as the sitting tenant.
-    let sitting: Option<AgentId> = tx
+    let sitting: Option<(AgentId, Option<SessionId>)> = tx
         .query_row(
-            "SELECT agent_id FROM agent_assignments
+            "SELECT agent_id, session_id FROM agent_assignments
               WHERE task_id = ?1 AND status = ?2",
             rusqlite::params![task_id.as_str(), json::to_json(&AssignmentStatus::Active)?],
-            |row| row.get::<_, String>(0).map(AgentId::from_string),
+            |row| {
+                let agent: String = row.get(0)?;
+                let session: Option<String> = row.get(1)?;
+                Ok((
+                    AgentId::from_string(agent),
+                    session.map(SessionId::from_string),
+                ))
+            },
         )
         .optional()
         .map_err(translate_error)?;
+    let sitting_agent = sitting.as_ref().map(|(agent, _)| agent.clone());
 
     // 2. Release the sitting tenant, if there is one. Its tenure is retained —
     //    the row is marked, never deleted — so the history stays complete.
@@ -242,8 +252,59 @@ fn handoff(
     //    agent's is set. The order matters for the same-agent case: clear, then
     //    point at the task. Clearing only if the view still names this task
     //    keeps a late release of an older assignment from undoing a newer move.
-    if let Some(departing) = &sitting {
+    if let Some(departing) = &sitting_agent {
         clear_current_task_if_still(tx, departing, task_id)?;
+    }
+
+    // 3b. The auditable record that responsibility actually changed hands.
+    //
+    // Written here, inside this transaction, so a displacement and its handoff
+    // commit together or not at all: there is no window in which one is recorded
+    // and the other is not, which is what would make an audit of "who was
+    // working this" lie.
+    //
+    // Only a genuine transfer qualifies, and the *cause* is decided from what the
+    // store can prove. Two proven cases, and no third:
+    //
+    //   * An **active** holder displaced by a different agent. Proven by the
+    //     sitting tenure having been `active` a moment ago.
+    //   * A task whose previous tenure **lease-expired** and is being reclaimed.
+    //     Proven by that released tenure's own `release_reason`.
+    //
+    // A first-time assignment has nobody to hand off from, and a re-assignment to
+    // the same agent is a new tenure rather than a change of responsibility.
+    // Neither records anything.
+    //
+    // There is deliberately no "voluntary" case: nothing in the persisted record
+    // distinguishes an agent that offered to hand work on from one that stopped
+    // answering, and an audit record must not assert what cannot be shown.
+    if let Some((from_agent, from_session)) = &sitting {
+        if from_agent != agent_id {
+            record_displacement(
+                tx,
+                task_id,
+                from_agent,
+                from_session,
+                agent_id,
+                HandoffCause::Displaced,
+                now,
+            )?;
+        }
+    } else if let Some((from_agent, from_session)) = last_expired_tenure(tx, task_id)? {
+        // The expiry already released the assignment, so this reclaim finds no
+        // *active* holder. It is still a change of responsibility, and the
+        // released tenure is the proof of what happened.
+        if &from_agent != agent_id {
+            record_displacement(
+                tx,
+                task_id,
+                &from_agent,
+                &from_session,
+                agent_id,
+                HandoffCause::LeaseExpiredReclaimed,
+                now,
+            )?;
+        }
     }
 
     // 4. The new assignment. Status is `active`: this operation is the handoff.
@@ -273,7 +334,127 @@ fn handoff(
     )
     .map_err(translate_error)?;
 
-    Ok(sitting)
+    Ok(sitting_agent)
+}
+
+/// The most recent tenure of this task that ended because its lease expired.
+///
+/// `None` when the task has never had one, or its last release was for some other
+/// reason. Read inside the caller's transaction so it describes the same moment
+/// the reclaim does.
+fn last_expired_tenure(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &TaskId,
+) -> Result<Option<(AgentId, Option<SessionId>)>, StoreError> {
+    tx.query_row(
+        "SELECT agent_id, session_id FROM agent_assignments
+          WHERE task_id = ?1 AND release_reason = ?2
+          ORDER BY released_at DESC LIMIT 1",
+        rusqlite::params![
+            task_id.as_str(),
+            json::to_json(&ReleaseReason::LeaseExpired)?,
+        ],
+        |row| {
+            let agent: String = row.get(0)?;
+            let session: Option<String> = row.get(1)?;
+            Ok((
+                AgentId::from_string(agent),
+                session.map(SessionId::from_string),
+            ))
+        },
+    )
+    .optional()
+    .map_err(translate_error)
+}
+
+/// Record the transfer of a task from one agent to another.
+///
+/// **Attribution only.** The row says who passed the task to whom, when, and what
+/// the task looked like at that moment. It grants nothing: no assignment is
+/// created by it, no task status moves because of it, and nothing about it is a
+/// completion claim. A receiver still needs an assignment before it may act, and
+/// still needs the recovery package for what is true *now*.
+///
+/// The snapshot is deliberately minimal. It records what the store knows
+/// authoritatively at this instant - the task's project and state version, and
+/// the latest checkpoint if one exists - and nothing it would have to invent. A
+/// task with no checkpoint yet records `NULL`, which
+/// [`director_domain::handoff::Handoff::is_current_for`] treats as stale, so a
+/// thin snapshot can never be mistaken for a complete one.
+fn record_displacement(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &TaskId,
+    from_agent: &AgentId,
+    from_session: &Option<SessionId>,
+    to_agent: &AgentId,
+    cause: HandoffCause,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), StoreError> {
+    // What the task looked like *before* the status move this transaction is
+    // about to make. That is exactly the state the outgoing agent was working
+    // against, so it is the right provenance for its snapshot.
+    let (project_id, task_version): (Option<String>, i64) = tx
+        .query_row(
+            "SELECT project_id, state_version FROM tasks WHERE id = ?1",
+            [task_id.as_str()],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(translate_error)?;
+
+    // The latest checkpoint, if the task has ever been checkpointed. Absent is a
+    // normal answer, not a failure, and is recorded as such.
+    let checkpoint: Option<String> = tx
+        .query_row(
+            "SELECT id FROM checkpoints
+              WHERE task_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            [task_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(translate_error)?;
+
+    // Allocated from a count taken on this same transaction, so two concurrent
+    // displacements cannot both build the same id - the reservation problem
+    // `assign_and_start_next` already solves for assignment ids.
+    let ordinal: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM handoffs WHERE task_id = ?1",
+            [task_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(translate_error)?;
+    let id = HandoffId::from_string(format!("HO-{}-{ordinal}", task_id.as_str()));
+
+    tx.execute(
+        "INSERT INTO handoffs
+            (id, task_id, project_id, from_agent, from_session, to_agent, state,
+             summary, open_questions, next_steps, files_touched,
+             source_checkpoint, source_task_version,
+             created_at, accepted_at, accepted_by_session, cause)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,?15)",
+        rusqlite::params![
+            id.as_str(),
+            task_id.as_str(),
+            project_id,
+            from_agent.as_str(),
+            from_session.as_ref().map(|id| id.as_str()),
+            to_agent.as_str(),
+            json::to_json(&HandoffState::Open)?,
+            format!("{from_agent} was holding this task and {to_agent} has taken it over"),
+            json::to_json(&Vec::<String>::new())?,
+            json::to_json(&vec![
+                "obtain current state from the recovery package before acting".to_string(),
+                "this record is attribution, not authority".to_string(),
+            ])?,
+            json::to_json(&Vec::<String>::new())?,
+            checkpoint,
+            task_version.max(0),
+            json::timestamp(now),
+            json::to_json(&cause)?,
+        ],
+    )
+    .map_err(translate_error)?;
+    Ok(())
 }
 
 /// The assignment row as [`handoff`] leaves it: active, with no session yet,
@@ -349,6 +530,34 @@ fn guard_scope(tx: &rusqlite::Transaction<'_>, task_id: &TaskId) -> Result<(), S
     })
 }
 
+/// The next assignment id for `task`, counted inside the caller's transaction.
+///
+/// `ASG-{task}-{n}`: the task's own id, which is unique, and an ordinal over its
+/// tenures. The id is self-describing — `ASG-AUTH-3` is the third assignment
+/// `AUTH` has had — and it is unique for a reason that survives a process
+/// restart, because nothing about it depends on a process-local counter.
+///
+/// The count is deliberately `COUNT(*)` over every row rather than over the
+/// active one: rows are never deleted, so this is monotonic, and an id freed by a
+/// release is never handed to a different tenure.
+fn next_assignment_id(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &TaskId,
+) -> Result<AssignmentId, StoreError> {
+    let prior: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM agent_assignments WHERE task_id = ?1",
+            [task_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(translate_error)?;
+    Ok(AssignmentId::from_string(format!(
+        "{}-{task_id}-{}",
+        AssignmentId::PREFIX,
+        prior + 1
+    )))
+}
+
 /// The atomic assignment operation: release any sitting tenant, insert the new
 /// assignment as active, and move the agent's `current_task` view — one
 /// transaction, all or nothing.
@@ -381,11 +590,107 @@ pub async fn assign_task(
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(translate_error)?;
+    guard_plan_membership(&tx, task_id)?;
     guard_scope(&tx, task_id)?;
     handoff(&tx, task_id, agent_id, assignment_id, now)?;
     tx.commit().map_err(translate_error)?;
 
     Ok(assignment_row(task_id, agent_id, assignment_id, now))
+}
+
+/// Refuse to create an assignment for a task the project's *current* plan does
+/// not name.
+///
+/// # Why this lives here and not only in the application layer
+///
+/// `assign::check_assignment` reads the active plan and validates the task
+/// against it, but that read and this write are separate operations. A plan
+/// supersession landing between them would let a task be assigned under a plan
+/// that no longer exists — the store would commit an assignment whose eligibility
+/// was decided against stale authority.
+///
+/// Re-reading inside this transaction closes that window, because the reserved
+/// write lock is already held: a supersession cannot interleave between this read
+/// and the commit. This is the same ordering argument [`guard_scope`] already
+/// makes, applied to a second eligibility input.
+///
+/// # What is and is not checked
+///
+/// Exactly the two conditions the application layer derives plan membership from:
+/// if the project has expressed a plan at all, the *currently active* one must
+/// name this task. Deliberately not requiring the same plan id the caller
+/// validated against — a replan that supersedes and re-admits the same task leaves
+/// it eligible, and refusing that would change existing replanning behaviour. No
+/// policy about how many tasks a plan may hold is introduced here.
+///
+/// # Why a project with no plans at all is let through
+///
+/// The guard exists to close a window in which an eligibility decision made
+/// against one plan is committed against another. That window only exists once a
+/// project has planned something. A project with no plan has expressed no
+/// intention to violate, and the store's lower-level `assign_task` has always been
+/// callable for such a project — the application layer is what refuses those with
+/// [`NoActivePlan`](director_app::assign::AssignError::NoActivePlan). Refusing
+/// here too would be a behavioural change to that API rather than a fix to a
+/// race, so the guard is scoped to projects that actually have plans.
+fn guard_plan_membership(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &TaskId,
+) -> Result<(), StoreError> {
+    let project: Option<String> = tx
+        .query_row(
+            "SELECT project_id FROM tasks WHERE id = ?1",
+            [task_id.as_str()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(translate_error)?
+        .flatten();
+
+    let Some(project) = project else {
+        // A task with no project is not the store's to hand out; the foreign key
+        // on the assignment insert would fail anyway.
+        return Ok(());
+    };
+
+    let active: Option<(String, String)> = tx
+        .query_row(
+            "SELECT id, task_ids FROM plans
+              WHERE project_id = ?1 AND status = ?2
+              LIMIT 1",
+            rusqlite::params![project, json::to_json(&PlanStatus::Active)?],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(translate_error)?;
+
+    let Some((plan_id, task_ids_json)) = active else {
+        // No *active* plan. Only refuse if the project has ever planned - that is
+        // the supersession window. Otherwise there was no plan to race against.
+        let planned: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM plans WHERE project_id = ?1",
+                [&project],
+                |row| row.get(0),
+            )
+            .map_err(translate_error)?;
+        if planned == 0 {
+            return Ok(());
+        }
+        return Err(StoreError::ConstraintViolation(format!(
+            "project {project} has no active plan, so task {} cannot be assigned",
+            task_id.as_str()
+        )));
+    };
+
+    let task_ids: Vec<director_domain::ids::TaskId> = json::from_json(&task_ids_json)?;
+    if !task_ids.iter().any(|id| id == task_id) {
+        return Err(StoreError::ConstraintViolation(format!(
+            "task {} is not named by the project's active plan {plan_id}",
+            task_id.as_str()
+        )));
+    }
+    Ok(())
 }
 
 /// [`assign_task`], and the task starts: the same atomic handoff, plus the
@@ -406,6 +711,58 @@ pub async fn assign_and_start(
     task_id: &TaskId,
     agent_id: &AgentId,
     assignment_id: &AssignmentId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(AgentAssignment, Task, Option<AgentId>), StoreError> {
+    assign_and_start_resolved(pool, task_id, agent_id, Some(assignment_id.clone()), now).await
+}
+
+/// [`assign_and_start`], with the assignment id allocated inside the transaction
+/// instead of supplied.
+///
+/// The id cannot honestly be chosen by the caller *and* be free of a race: any
+/// count of a task's existing tenures read before the write lock is a guess, and
+/// two writers holding the same guess produce the same id. [`guard_scope`] does
+/// not save that case either — it deliberately ignores the task being assigned
+/// (`other.id != this_task.id`), because a task is not in conflict with itself.
+/// So the loser used to reach the `INSERT` and be refused by the primary key on
+/// `agent_assignments.id`: a bare `UNIQUE constraint failed` for what was, in
+/// fact, a legitimate reassignment.
+///
+/// Allocating here fixes the ordering rather than the arithmetic. The ordinal is
+/// counted by a query on the *same* `IMMEDIATE` transaction — and therefore the
+/// same reserved write lock — that performs the `INSERT` a few lines later. A
+/// competing writer cannot interleave between them, because it would have to
+/// take that same write lock to do so, and it cannot until this transaction has
+/// committed or rolled back. The count the id is derived from therefore includes
+/// every row committed before this one and none committed after it.
+///
+/// The outcome for a racing pair is the semantics the store already had: both
+/// assignments are recorded in order, and the later handoff displaces the earlier
+/// one, reported through the returned `displaced`. Nothing is refused, and no row
+/// is overwritten.
+///
+/// This is additive. [`assign_and_start`] keeps its signature and its
+/// caller-chosen-id behaviour for every existing caller.
+pub async fn assign_and_start_next(
+    pool: &crate::connection::ConnectionPool,
+    task_id: &TaskId,
+    agent_id: &AgentId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(AgentAssignment, Task, Option<AgentId>), StoreError> {
+    assign_and_start_resolved(pool, task_id, agent_id, None, now).await
+}
+
+/// The shared body of [`assign_and_start`] and [`assign_and_start_next`].
+///
+/// `caller_id` is `Some` when the caller named the assignment and `None` when the
+/// id has to be allocated here. Everything past the allocation is identical,
+/// which is the point: the two paths cannot drift apart on scope, displacement,
+/// the task's move, or the history row.
+async fn assign_and_start_resolved(
+    pool: &crate::connection::ConnectionPool,
+    task_id: &TaskId,
+    agent_id: &AgentId,
+    caller_id: Option<AssignmentId>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(AgentAssignment, Task, Option<AgentId>), StoreError> {
     let mut conn = pool.get();
@@ -449,9 +806,21 @@ pub async fn assign_and_start(
     // pure and cheap, and refusing before paying for a write is worth it - but it
     // read that state before this transaction opened, so it may be stale. This is
     // the check that decides.
+    guard_plan_membership(&tx, task_id)?;
     guard_scope(&tx, task_id)?;
 
-    let sitting = handoff(&tx, task_id, agent_id, assignment_id, now)?;
+    // The id, when the caller did not name one. Counted here, on this
+    // transaction, while the reserved write lock is held — so the count and the
+    // `INSERT` below cannot be separated by a competing writer. Released tenures
+    // are rows like any other and are counted, which is what makes the ordinal
+    // monotonic across a task's whole history rather than just its current
+    // holder's.
+
+    let assignment_id = match caller_id {
+        Some(id) => id,
+        None => next_assignment_id(&tx, task_id)?,
+    };
+    let sitting = handoff(&tx, task_id, agent_id, &assignment_id, now)?;
 
     // The task reflects the assignment: an agent is expected to be working it.
     // Version is bumped by the write itself, the way `update_task` does it, so
@@ -487,7 +856,7 @@ pub async fn assign_and_start(
 
     tx.commit().map_err(translate_error)?;
 
-    let assignment = load_assignment(&conn, assignment_id)?;
+    let assignment = load_assignment(&conn, &assignment_id)?;
     let task = crate::tasks::load_task(&conn, task_id)?;
     Ok((assignment, task, sitting))
 }

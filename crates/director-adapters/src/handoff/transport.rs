@@ -26,7 +26,7 @@ use std::path::Path;
 
 use director_domain::ids::AgentId;
 
-use crate::stdio_mcp::StdioMcpTransport;
+use crate::stdio_mcp::{McpTimeouts, StdioMcpTransport};
 
 // Re-exported so the handoff adapter's error type and its callers can name the
 // transport's failure vocabulary without reaching into the shared module.
@@ -70,7 +70,21 @@ impl McpTransport {
         agent_id: AgentId,
         project_dir: &Path,
     ) -> Result<Self, crate::stdio_mcp::TransportError> {
-        let transport = StdioMcpTransport::spawn(
+        Self::spawn_with_timeouts(binary, agent_id, project_dir, McpTimeouts::default()).await
+    }
+
+    /// [`Self::spawn`] with explicit bounds on every blocking operation.
+    ///
+    /// Additive: the argv (empty), the identity environment, and the client name
+    /// are all unchanged, so nothing about how Orqyn talks to handoff-mcp differs
+    /// here. Only the bounds move.
+    pub async fn spawn_with_timeouts(
+        binary: &str,
+        agent_id: AgentId,
+        project_dir: &Path,
+        timeouts: McpTimeouts,
+    ) -> Result<Self, crate::stdio_mcp::TransportError> {
+        let transport = StdioMcpTransport::spawn_with_timeouts(
             binary,
             &[],
             &[(SESSION_ID_ENV.to_string(), agent_id.as_str().to_string())],
@@ -81,6 +95,7 @@ impl McpTransport {
             &[SESSION_ID_ENV.to_string()],
             project_dir,
             "director-brain-handoff",
+            timeouts,
         )
         .await?;
 
@@ -88,6 +103,11 @@ impl McpTransport {
             inner: transport,
             agent_id,
         })
+    }
+
+    /// The child's most recent stderr, kept out of the JSON-RPC stream.
+    pub fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
     }
 
     /// Call a handoff-mcp tool by name with the given JSON arguments.

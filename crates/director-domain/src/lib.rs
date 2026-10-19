@@ -57,6 +57,7 @@ pub mod context;
 pub mod decision;
 pub mod graph;
 pub mod handoff;
+pub mod harness;
 pub mod ids;
 pub mod plan;
 pub mod project;
@@ -83,6 +84,7 @@ pub use context::{ContextSnapshot, RecentContext, DEFAULT_MAX_ACTIONS};
 pub use decision::{Decision, DecisionStatus};
 pub use graph::{order as order_plan, GraphError, PlanNode};
 pub use handoff::{Handoff, HandoffError, HandoffState};
+pub use harness::{HarnessDriver, HarnessError, HarnessOutcome, HarnessRun};
 pub use ids::{
     ActionId, AgentId, AssignmentId, BlockerId, CheckpointId, DecisionId, EventId, HandoffId, Id,
     IdGenerator, MachineId, PlanId, ProjectId, RepositoryId, SessionId, SubtaskId, TaskId,
@@ -110,7 +112,7 @@ pub use verification::{
 // not `store::TaskRepository`.
 pub use store::{
     ActionRepository, AgentRepository, AssignmentRepository, BlockerRepository,
-    CheckpointRepository, DecisionRepository, PlanRepository, ProjectRepository,
+    CheckpointRepository, DecisionRepository, HandoffRepository, PlanRepository, ProjectRepository,
     ProjectStateRepository, ProviderSync, ProviderSyncRepository, SessionRepository, Store,
     StoreError, StoredProjectState, TaskRepository, TaskStatusTransition, VerificationRepository,
 };

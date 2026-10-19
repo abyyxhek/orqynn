@@ -27,7 +27,7 @@
 
 use std::path::Path;
 
-use crate::stdio_mcp::StdioMcpTransport;
+use crate::stdio_mcp::{McpTimeouts, StdioMcpTransport};
 
 /// Re-exported so the adapter's error vocabulary and its callers can name the
 /// transport's failure type without reaching into the shared module.
@@ -63,17 +63,35 @@ impl MemoryTransport {
     /// config outside the CLI sees, so setting only one leaves the other half
     /// of the server looking at a different directory.
     pub async fn spawn(binary: &str, data_dir: &Path) -> Result<Self, TransportError> {
+        Self::spawn_with_timeouts(binary, data_dir, McpTimeouts::default()).await
+    }
+
+    /// [`Self::spawn`] with explicit bounds on every blocking operation.
+    ///
+    /// Additive: the spawn shape, the environment, and the client name are
+    /// unchanged, so nothing about how Orqyn talks to ai-memory differs here.
+    pub async fn spawn_with_timeouts(
+        binary: &str,
+        data_dir: &Path,
+        timeouts: McpTimeouts,
+    ) -> Result<Self, TransportError> {
         let data_dir_str = data_dir.to_string_lossy().into_owned();
-        let inner = StdioMcpTransport::spawn(
+        let inner = StdioMcpTransport::spawn_with_timeouts(
             binary,
             &SERVE_ARGS,
             &[(DATA_DIR_ENV.to_string(), data_dir_str)],
             &[],
             data_dir,
             "director-brain-aimemory",
+            timeouts,
         )
         .await?;
         Ok(MemoryTransport { inner })
+    }
+
+    /// The child's most recent stderr, kept out of the JSON-RPC stream.
+    pub fn stderr_tail(&self) -> String {
+        self.inner.stderr_tail()
     }
 
     /// Call an ai-memory tool by name with the given JSON arguments.

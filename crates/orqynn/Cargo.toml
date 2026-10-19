@@ -1,0 +1,30 @@
+[package]
+name = "orqynn"
+description = "Orqynn's command-line entry point: one explicit command that drives one task lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors = ["Orqyn contributors"]
+
+[[bin]]
+name = "orqynn"
+path = "src/main.rs"
+
+[dependencies]
+director-domain = { workspace = true }
+director-adapters = { workspace = true }
+director-store = { workspace = true }
+director-app = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"

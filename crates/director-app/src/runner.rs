@@ -108,17 +108,14 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use director_adapters::git::GitService;
-use director_domain::action::{Action, ActionKind};
 use director_domain::agent::Liveness;
 use director_domain::blocker::{Blocker, BlockerKind, BlockerStatus};
 use director_domain::checkpoint::ResumeStatus;
-use director_domain::ids::{
-    ActionId, BlockerId, IdGenerator, ProjectId, RepositoryId, SessionId, TaskId,
-};
+use director_domain::ids::{BlockerId, IdGenerator, ProjectId, RepositoryId, SessionId, TaskId};
 use director_domain::providers::{ExecutionProvider, MemoryProvider};
 use director_domain::repository::SyncStatus;
 use director_domain::task::TaskStatus;
-use director_domain::{ActionRepository, BlockerRepository};
+use director_domain::BlockerRepository;
 use director_store::Store;
 use serde::Serialize;
 use thiserror::Error;
@@ -180,6 +177,15 @@ pub enum RunnerError {
     /// The REPLAN step failed.
     #[error("the REPLAN step failed: {0}")]
     Replan(#[from] ReplanError),
+
+    /// Driving a real agent harness failed before it produced evidence.
+    ///
+    /// Separate from the harness's own failures, which are not errors here at
+    /// all: a harness that ran and exited non-zero is a completed drive whose
+    /// verdict belongs to VERIFY. This variant is for a drive that could not
+    /// happen — no binary, no context, a refused write.
+    #[error("driving a real agent failed: {0}")]
+    AgentDrive(#[from] crate::agent::AgentDriveError),
 
     /// Building a recovery context failed.
     #[error("building a recovery context failed: {0}")]
@@ -480,6 +486,21 @@ pub struct AgentTurn {
     pub simulated: bool,
 }
 
+/// One real agent drive, followed by the verification it earned.
+///
+/// The two halves are kept separate because they answer different questions and
+/// carry different authority. `drive` says *what the harness did*, which is an
+/// observation. `verify` says *whether the task's own checks pass*, which is the
+/// only thing in the runner that can move a task to `Done`.
+#[derive(Debug)]
+pub struct DrivenStep {
+    /// The execution: the briefing, the harness's output, and whether it ran.
+    pub drive: crate::agent::AgentDrive,
+    /// The verdict, present only when a harness actually ran. `None` means no
+    /// evidence existed to judge, which is different from a task that failed.
+    pub verify: Option<VerifyStep>,
+}
+
 /// What one VERIFY round concluded.
 ///
 /// A task reaches `Done` through this record and through nothing else in the
@@ -721,11 +742,15 @@ impl RecoveryStep {
 
 /// The driver that walks the loop.
 ///
-/// Holds the injected dependencies and the [`IdGenerator`] that mints assignment
-/// and session ids, and exposes one method per step. It is constructed once and
-/// used across ticks: the `&mut self` on the id-minting steps is the only
-/// interior state, and it is deliberately the only state the runner keeps — the
-/// store is the record of what happened.
+/// Holds the injected dependencies and exposes one method per step. It is
+/// constructed once and used across ticks, and the store is the record of what
+/// happened.
+///
+/// The struct still carries an [`IdGenerator`], but it mints nothing: assignment,
+/// blocker and session ids are now allocated by the store, inside the transaction
+/// that writes the row, so two runners cannot collide on a counter. The generator
+/// is retained because the step signatures below take one, and those parameters
+/// are part of the published surface. Treat it as reserved, not as live state.
 ///
 /// Nothing is read from the wall clock. Each step method takes the instant it
 /// should act as though it is running at, which is what makes a run reproducible
@@ -986,15 +1011,138 @@ where
     /// task to `Done`; only [`Runner::verify`] does, and only from exit codes the
     /// executor observed.
     ///
-    /// The session id is minted from the runner's generator so a simulated turn
-    /// is as auditable as a real one: "which invocation of which agent did this
-    /// task" stays answerable.
+    /// The session id is derived from the tenure it belongs to, not from the
+    /// runner's generator.
+    ///
+    /// A generator's counter resets with every `Runner`, so a second runner in the
+    /// same process began at one again and proposed `SESS-session-1` for a
+    /// *different* assignment — an id the first runner had already written.
+    /// `agent_sessions.id` is a PRIMARY KEY, so a legitimate acknowledgment was
+    /// refused with a bare constraint violation.
+    ///
+    /// The tenure is a sound anchor because the domain already forbids the
+    /// alternative: [`crate::monitor::validate_acknowledgment`] refuses a second
+    /// session on one assignment (`AlreadyAcknowledged`), so there is exactly one
+    /// session per tenure and the assignment id *is* the session's identity. That
+    /// costs no extra read — the assignment id is already in hand.
+    ///
+    /// If sessions are ever allowed to branch under one tenure — `AgentSession`
+    /// carries a `parent_session_id` for exactly that future — this id needs an
+    /// ordinal, because the 1:1 it relies on would no longer hold.
+    /// Drive a real agent harness, then verify whatever it left behind.
+    ///
+    /// The production counterpart to [`Self::simulate_agent_turn`], and the
+    /// ordering is the point: the harness runs first, verification runs second,
+    /// and neither can stand in for the other. A harness that exits zero having
+    /// changed nothing produces a successful `AgentDrive` and then a *failed*
+    /// verification, because the verdict comes from the task's own checks run
+    /// against the repository afterwards.
+    ///
+    /// Verification is skipped in exactly one case: when no harness process ran.
+    /// Reporting a verdict for work that never started would be fabricating
+    /// evidence, so a drive that could not launch returns with `verify` absent
+    /// and the task left `in_progress` for MONITOR to expire.
+    pub async fn drive_agent_at<D: director_domain::harness::HarnessDriver>(
+        &mut self,
+        driver: &D,
+        task_id: &TaskId,
+        assignment_id: &director_domain::ids::AssignmentId,
+        options: &crate::agent::DriveOptions,
+        now: DateTime<Utc>,
+    ) -> Result<DrivenStep, RunnerError> {
+        let drive =
+            crate::agent::drive_at(self.store, driver, task_id, assignment_id, options, now)
+                .await?;
+
+        // Only a drive that actually launched an agent has produced something a
+        // verdict could be about.
+        let verify = if drive.executed() {
+            let project_id = drive.project_id.clone();
+            Some(self.verify_at(&project_id, now).await?)
+        } else {
+            None
+        };
+
+        Ok(DrivenStep { drive, verify })
+    }
+
+    /// Drive a real agent harness, then verify whatever it left behind.
+    ///
+    /// [`Self::drive_agent_at`] with the wall clock read here, the way every
+    /// other step's non-`_at` form does.
+    pub async fn drive_agent<D: director_domain::harness::HarnessDriver>(
+        &mut self,
+        driver: &D,
+        task_id: &TaskId,
+        assignment_id: &director_domain::ids::AssignmentId,
+        options: &crate::agent::DriveOptions,
+    ) -> Result<DrivenStep, RunnerError> {
+        self.drive_agent_at(driver, task_id, assignment_id, options, Utc::now())
+            .await
+    }
+
+    /// Drive a real agent harness with this runner's memory provider consulted
+    /// for the briefing, then verify whatever it left behind.
+    ///
+    /// The only difference from [`Self::drive_agent`] is that the briefing gains a
+    /// clearly-labelled external-copy section. SQLite state, the harness
+    /// invocation, and verification are identical, and an unreachable substrate
+    /// does not fail the drive.
+    ///
+    /// No memory parameter is taken because the runner already holds one: a
+    /// runner constructed with a real substrate consults it here, and a runner
+    /// holding [`InMemoryProvider`](director_adapters::InMemoryProvider) resolves
+    /// to "nothing published", which is the same answer as having no substrate.
+    pub async fn drive_agent_with_memory_at<D: director_domain::harness::HarnessDriver>(
+        &mut self,
+        driver: &D,
+        task_id: &TaskId,
+        assignment_id: &director_domain::ids::AssignmentId,
+        options: &crate::agent::DriveOptions,
+        now: DateTime<Utc>,
+    ) -> Result<DrivenStep, RunnerError> {
+        // Copied out before the `&mut self` below, so the borrow does not span
+        // the verification call.
+        let memory = self.memory;
+        let drive = crate::agent::drive_at_with_memory(
+            self.store,
+            driver,
+            task_id,
+            assignment_id,
+            options,
+            memory,
+            now,
+        )
+        .await?;
+
+        let verify = if drive.executed() {
+            let project_id = drive.project_id.clone();
+            Some(self.verify_at(&project_id, now).await?)
+        } else {
+            None
+        };
+
+        Ok(DrivenStep { drive, verify })
+    }
+
+    /// [`Self::drive_agent_with_memory_at`] with the wall clock read here.
+    pub async fn drive_agent_with_memory<D: director_domain::harness::HarnessDriver>(
+        &mut self,
+        driver: &D,
+        task_id: &TaskId,
+        assignment_id: &director_domain::ids::AssignmentId,
+        options: &crate::agent::DriveOptions,
+    ) -> Result<DrivenStep, RunnerError> {
+        self.drive_agent_with_memory_at(driver, task_id, assignment_id, options, Utc::now())
+            .await
+    }
+
     pub async fn simulate_agent_turn(
         &mut self,
         assignment_id: &director_domain::ids::AssignmentId,
         now: DateTime<Utc>,
     ) -> Result<AgentTurn, RunnerError> {
-        let session_id = self.ids.next::<SessionId>("session");
+        let session_id = SessionId::from_string(format!("SESS-{assignment_id}"));
         self.acknowledge(assignment_id, session_id.clone(), now)
             .await?;
         let reported = self.report_done(assignment_id, now).await?;
@@ -1058,76 +1206,28 @@ where
                 })
                 .collect(),
         };
-        // What the round observed, recorded as actions. Done after the step so a
-        // recording failure is reported as an error rather than folded into a
-        // verdict the caller already has.
-        self.record_verification_actions(&step, now).await?;
+        // No recording pass here. The step already wrote the round's observations
+        // inside the transaction that committed its verdict, so there is nothing
+        // left for the runner to append — and nothing left that could be lost if
+        // this process were killed between the two.
         Ok(step)
     }
 
-    /// Record what a VERIFY round observed as actions on the durable log.
+    /// Where a VERIFY round's observations are recorded.
     ///
-    /// VERIFY is the only step whose events are *observed* rather than reported:
-    /// it runs the commands itself and reads the exit codes itself. That is what
-    /// makes these actions evidence — [`director_domain::action::Action`] is
-    /// documented as a record of work, not a record of claims — and it is why
-    /// nothing else here records one. An agent's own report (`acknowledge`,
-    /// `report_done`) is a claim about the work, and a simulated turn
-    /// ([`Runner::simulate_agent_turn`]) is not work at all.
+    /// Not here. `verify_at` returns after [`crate::verify::verify_at`], and that
+    /// step writes each round's actions inside the *same* transaction that
+    /// commits the verdict — see [`crate::engine::verify_task`]. Recording them
+    /// afterwards, as this method used to, could only ever be a second transaction,
+    /// and left a window in which a killed process held a durable verdict with no
+    /// record of what it had run.
     ///
-    /// ## Why an unverifiable round records nothing
-    ///
-    /// A task Orqyn could not judge stays `verification_pending`, so the next
-    /// round surveys it again and runs the same commands again. Recording each
-    /// attempt would grow the action log by one copy of the same failed attempt
-    /// per tick — duplicates dressed as history, which is exactly what the log is
-    /// supposed to rule out. So the gate is the round's *outcome*: a task whose
-    /// status moved (`outcome.is_some()`) has left the survey set and cannot be
-    /// re-judged, so its round happened exactly once. A task whose outcome is
-    /// `None` is recorded nowhere, and that is a real limitation rather than a
-    /// claim that nothing ran.
-    ///
-    /// A criterion with no machine-checkable form records nothing either: Orqyn
-    /// ran no command for it, so there is no observation to keep.
-    ///
-    /// ## The loss window this cannot close
-    ///
-    /// The verdict is committed by [`engine::verify_task`] in one transaction
-    /// with the task's move and the history row. These inserts happen *after* that
-    /// commit, in their own transactions, so the two are not atomic and cannot be
-    /// made atomic without moving the action writes inside the store's
-    /// transaction. A process killed in between leaves a durable verdict with no
-    /// actions — and because the task has left the survey set, no later round will
-    /// ever write them.
-    ///
-    /// That is a deliberate, documented trade rather than a silent one: the gap is
-    /// *detectable*, because a verification id with no matching action is visible
-    /// in the persisted data, and recovery reports it through
-    /// [`crate::recovery::RecoveryGaps::actions_incomplete`] rather than letting a
-    /// briefing claim history it does not have. Closing the window entirely is
-    /// future work and needs a store-level change, not a runner-level one.
-    async fn record_verification_actions(
-        &mut self,
-        step: &VerifyStep,
-        at: DateTime<Utc>,
-    ) -> Result<(), RunnerError> {
-        for judged in &step.judged {
-            // A round that moved no status will be surveyed again; see above.
-            if judged.outcome.is_none() {
-                continue;
-            }
-            for (ordinal, check) in judged.checks.iter().enumerate() {
-                let Some(action) =
-                    action_for_check(&judged.task_id, &judged.verification_id, check, ordinal, at)
-                else {
-                    continue;
-                };
-                self.store.actions().record_action(&action).await?;
-            }
-        }
-        Ok(())
-    }
-
+    /// The gap flag that made that window *visible* stays, deliberately:
+    /// [`crate::recovery::RecoveryGaps::actions_incomplete`] still reports a
+    /// verification whose actions are missing. It should never fire now, and that
+    /// is exactly why it is worth keeping — it is the assertion that the atomic
+    /// write is doing its job, and it would fire again if a future path committed
+    /// a verdict without them.
     /// Run one REPLAN round: apply the caller's decisions about the tasks the
     /// loop stopped on.
     ///
@@ -1218,6 +1318,33 @@ where
     /// same id is a write that cannot succeed, and the store's error is reported
     /// rather than swallowed: two different things standing in the way are two
     /// blockers, not one that quietly changed its description.
+    ///
+    /// ## The id, and why the store allocates it
+    ///
+    /// The blocker id is its position in the task's own blocker history, the same
+    /// way a checkpoint id is its position in the task's checkpoint lineage (see
+    /// [`crate::checkpoint`]). A generator's counter resets with every `Runner`, so
+    /// a second runner proposed `BLK-blocker-1` for a *different* task — an id the
+    /// first had already written. `blockers.id` is a PRIMARY KEY, so raising a
+    /// perfectly legitimate blocker was refused with a bare constraint violation.
+    ///
+    /// Deriving from persisted state makes the id self-describing and unique for a
+    /// reason that survives a restart: `BLK-AUTH-1` is the first blocker raised
+    /// against `AUTH`, whichever process raised it. A cleared blocker keeps its row
+    /// and therefore its ordinal, so the count only ever grows and an id is never
+    /// reused for a second blocker.
+    ///
+    /// The *count* is taken by the store, inside the transaction that inserts the
+    /// row. Counting it here instead was the second half of the defect: two callers
+    /// raising blockers against one task could read the same length here and build
+    /// the same id, and the loser was refused for a name rather than for anything
+    /// wrong with the blocker. See
+    /// `SqliteBlockerRepository::create_blocker_next`.
+    ///
+    /// Raising a blocker does not touch the task's status: this records what is in
+    /// the way, and the two lifecycles stay separate. Nor is it REPLAN's to decide —
+    /// this stays an explicit operation, called by whoever actually knows what is
+    /// in the way.
     pub async fn raise_blocker(
         &mut self,
         task_id: &TaskId,
@@ -1226,19 +1353,11 @@ where
         resolution: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<Blocker, RunnerError> {
-        let mut blocker = Blocker::raise(
-            self.ids.next::<BlockerId>("blocker"),
-            task_id.clone(),
-            kind,
-            description,
-        );
-        // `raised_at` is pinned to the caller's instant rather than the
-        // constructor's wall clock, like every other step here.
-        blocker.raised_at = now;
-        if let Some(resolution) = resolution {
-            blocker = blocker.resolvable_by(resolution);
-        }
-        let stored = self.store.blockers().create_blocker(&blocker).await?;
+        let stored = self
+            .store
+            .blockers()
+            .create_blocker_next(task_id, kind, description, resolution, now)
+            .await?;
         Ok(stored)
     }
 
@@ -1366,82 +1485,6 @@ fn render_check(check: &verify::CheckResult) -> CheckOutcome {
             criterion: criterion.clone(),
         },
     }
-}
-
-/// The action that records one observed check, or `None` when nothing ran.
-///
-/// The id is `ACT-{verification_id}-{ordinal}`: the round's own persisted
-/// identity plus the check's position in the task's contract. It is built rather
-/// than drawn from a generator, and never from the clock, for three reasons that
-/// all matter to reliability:
-///
-/// - A generator's counters restart with every runner, so two runs in one process
-///   would mint the same id for two different tasks and the second insert would
-///   fail the round.
-/// - A clock-derived id makes the same logical run produce a different log every
-///   time, so a run could not be compared with a later run of the same inputs.
-/// - Keyed on the verification, the id is the round's identity. A round cannot be
-///   recorded twice under one id, and a REPLAN retry that legitimately judges the
-///   same task again gets a new verification and therefore a new id — a real
-///   second event rather than a duplicate to be swallowed.
-fn action_for_check(
-    task_id: &TaskId,
-    verification_id: &director_domain::ids::VerificationId,
-    check: &CheckOutcome,
-    ordinal: usize,
-    at: DateTime<Utc>,
-) -> Option<Action> {
-    let (kind, summary, detail) = match check {
-        CheckOutcome::Passed { criterion, command } => (
-            ActionKind::Command,
-            format!("ran `{command}`: passed"),
-            format!("criterion: {criterion}"),
-        ),
-        CheckOutcome::Failed {
-            criterion,
-            command,
-            exit_code,
-            timed_out,
-            stderr,
-        } => {
-            let because = if *timed_out { "timed out" } else { "failed" };
-            let mut detail = format!("criterion: {criterion}; {because} with exit {exit_code}");
-            if !stderr.is_empty() {
-                detail.push_str("; stderr: ");
-                detail.push_str(stderr);
-            }
-            (
-                ActionKind::Error,
-                format!("ran `{command}`: {because}"),
-                detail,
-            )
-        }
-        CheckOutcome::Unrunnable {
-            criterion,
-            command,
-            error,
-        } => (
-            ActionKind::Error,
-            format!("could not run `{command}`"),
-            format!("criterion: {criterion}; {error}"),
-        ),
-        // Orqyn ran no command for this criterion, so there is nothing observed
-        // to record. Writing one would put a guess in a log of facts.
-        CheckOutcome::Unchecked { .. } => return None,
-    };
-
-    let mut action = Action::new(
-        ActionId::from_string(format!("ACT-{verification_id}-{ordinal}")),
-        kind,
-        summary,
-    )
-    .for_task(task_id.clone());
-    action.detail = Some(detail);
-    // The round's pinned instant, shared by every action from that round. Equal
-    // timestamps are therefore the normal case within a round, which is why the
-    // store's read order breaks ties on id rather than leaving it to chance.
-    action.at = at;
-    Some(action)
 }
 
 /// Render a survey condition as the stable string a serialized run carries.

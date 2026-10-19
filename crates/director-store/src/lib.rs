@@ -65,6 +65,7 @@ mod blockers;
 mod checkpoints;
 mod connection;
 mod decisions;
+mod handoffs;
 mod json;
 mod migrations;
 mod plans;
@@ -78,7 +79,7 @@ use std::path::Path;
 
 use director_domain::assignment::AgentAssignment;
 use director_domain::decision::Decision;
-use director_domain::ids::{AgentId, AssignmentId, TaskId};
+use director_domain::ids::{AgentId, AssignmentId, PlanId, TaskId};
 use director_domain::plan::Plan;
 use director_domain::session::AgentSession;
 use director_domain::task::Task;
@@ -99,6 +100,7 @@ pub use assignments::SqliteAssignmentRepository;
 pub use blockers::SqliteBlockerRepository;
 pub use checkpoints::SqliteCheckpointRepository;
 pub use decisions::SqliteDecisionRepository;
+pub use handoffs::SqliteHandoffRepository;
 pub use plans::SqlitePlanRepository;
 pub use projects::SqliteProjectRepository;
 pub use sessions::SqliteSessionRepository;
@@ -205,6 +207,22 @@ impl Store {
         assignments::assign_and_start(&self.pool, task_id, agent_id, assignment_id, now).await
     }
 
+    /// [`Self::assign_and_start`], with the assignment id allocated inside the
+    /// write transaction rather than supplied by the caller.
+    ///
+    /// The caller-facing counterpart of [`assignments::assign_and_start_next`].
+    /// A caller that has an id it means to keep should keep using
+    /// [`Self::assign_and_start`]; this exists for the scheduler, which has no id
+    /// to choose and cannot choose one safely outside the lock.
+    pub async fn assign_and_start_next(
+        &self,
+        task_id: &TaskId,
+        agent_id: &AgentId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(AgentAssignment, Task, Option<AgentId>), StoreError> {
+        assignments::assign_and_start_next(&self.pool, task_id, agent_id, now).await
+    }
+
     /// Create a plan, persist every task it decomposes into, and activate it:
     /// one transaction, all or nothing. The project's sitting active plan is
     /// superseded — marked and linked, never deleted — inside the same
@@ -221,6 +239,26 @@ impl Store {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(Plan, Vec<Task>), StoreError> {
         plans::create_active_plan(&self.pool, plan, tasks, authorized_by, now).await
+    }
+
+    /// Add one task to a plan that is already active, without superseding it.
+    ///
+    /// The counterpart to [`Self::create_active_plan`] for the case where the
+    /// project is already executing a plan and the new work belongs inside it
+    /// rather than replacing it. The plan's identity, objective and supersession
+    /// history are untouched; only its task list and the `extension_note` appended
+    /// to its rationale grow, in one transaction with the task row.
+    ///
+    /// The note is a suffix the store appends to the rationale it reads inside the
+    /// transaction, so concurrent extensions cannot overwrite one another.
+    pub async fn append_task_to_plan(
+        &self,
+        plan_id: &PlanId,
+        task: &Task,
+        extension_note: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(Plan, Task), StoreError> {
+        plans::append_task_to_plan(&self.pool, plan_id, task, extension_note, now).await
     }
 
     /// Reclaim a task whose holder has gone quiet: release the assignment as
@@ -338,6 +376,13 @@ impl Store {
         SqliteActionRepository::new(self.pool.clone())
     }
 
+    /// Handoffs - the auditable record that one agent transferred continuation
+    /// responsibility for a task to another. Attribution only: it assigns
+    /// nothing, moves no task status, and completes nothing.
+    pub fn handoffs(&self) -> SqliteHandoffRepository {
+        SqliteHandoffRepository::new(self.pool.clone())
+    }
+
     /// Normalized project state — what Orqyn currently believes about a
     /// project, as distinct from what git said just now.
     pub fn project_state(&self) -> SqliteProjectStateRepository {
@@ -386,5 +431,30 @@ impl Store {
     ) -> Result<(Verification, Task), StoreError> {
         verifications::apply_verification(&self.pool, verification, expected_task_version, now)
             .await
+    }
+
+    /// [`Self::apply_verification`], with the actions a round observed written in
+    /// the same transaction as the verdict.
+    ///
+    /// The caller-facing counterpart of
+    /// [`verifications::apply_verification_with_actions`]. A verdict and the
+    /// record of what it ran now commit together or not at all, which is what
+    /// stops a recovery briefing from inheriting a decision it cannot account
+    /// for.
+    pub async fn apply_verification_with_actions(
+        &self,
+        verification: &Verification,
+        actions: &[director_domain::action::Action],
+        expected_task_version: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(Verification, Task), StoreError> {
+        verifications::apply_verification_with_actions(
+            &self.pool,
+            verification,
+            actions,
+            expected_task_version,
+            now,
+        )
+        .await
     }
 }

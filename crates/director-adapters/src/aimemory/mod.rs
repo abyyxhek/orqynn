@@ -17,6 +17,7 @@
 //! [`MemoryProvider`]: director_domain::providers::MemoryProvider
 
 pub mod adapter;
+pub mod config;
 pub mod transport;
 pub mod wire;
 
@@ -25,3 +26,4 @@ pub mod wire;
 // (`aimemory::transport`, `aimemory::wire`) so the two substrates' internals do
 // not collide at any namespace they share.
 pub use adapter::{AiMemoryAdapter, AiMemoryAdapterError, AiMemoryWire};
+pub use config::AiMemoryConfig;

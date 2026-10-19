@@ -649,3 +649,124 @@ mod tests {
         ));
     }
 }
+
+/// A request to add one task to the plan a project is already executing.
+///
+/// The counterpart to [`PlanRequest`] for the case where the plan is not being
+/// replaced. Everything PLAN guarantees for a new plan holds here too: the task is
+/// validated before anything is written, and the task row and the plan's membership
+/// commit together.
+#[derive(Debug, Clone)]
+pub struct ExtendRequest {
+    /// The project whose active plan receives the task.
+    pub project_id: ProjectId,
+    /// The task to add, in the same shape a plan request would carry it.
+    pub task: TaskSpec,
+    /// The agent authorising the addition. Provenance only.
+    pub authorized_by: AgentId,
+    /// Where to read the clock from. Unused today; present so a caller testing
+    /// this can pin it the way [`plan_at`] allows.
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+/// One round of EXTEND: the plan as it now stands, and the task that joined it.
+#[derive(Debug, Clone)]
+pub struct Extended {
+    /// The plan, still active, with the new task in its membership.
+    pub plan: Plan,
+    /// The task, persisted.
+    pub task: Task,
+}
+
+/// Add one task to the project's active plan, or report that there is none.
+///
+/// This does **not** supersede, reactivate, or create a plan. If the project has
+/// no active plan the caller is told so and can decide what to do; extending is
+/// never a way to make a task eligible by rewriting what Orqyn is executing
+/// against.
+///
+/// The single-task rules [`validate_request`] enforces are re-applied to the one
+/// task, because a task added to a live plan must be as well-formed as one that
+/// arrives with a new plan.
+pub async fn extend_active_plan(
+    store: &Store,
+    request: ExtendRequest,
+) -> Result<Extended, PlanError> {
+    extend_active_plan_at(store, request).await
+}
+
+/// [`extend_active_plan`], with the store read separated for the tests that pin a
+/// clock.
+pub async fn extend_active_plan_at(
+    store: &Store,
+    request: ExtendRequest,
+) -> Result<Extended, PlanError> {
+    let now = request.now;
+
+    let plan = store
+        .plans()
+        .active_plan_for_project(&request.project_id)
+        .await
+        .map_err(PlanError::from)?
+        .ok_or_else(|| PlanError::NoActivePlan(request.project_id.to_string()))?;
+
+    // Reuse the request validator rather than re-deriving its rules, so a task
+    // added to a live plan is held to exactly the standard a new plan is.
+    validate_request(&PlanRequest {
+        project_id: request.project_id.clone(),
+        plan_id: plan.id.clone(),
+        objective: request.task.objective.clone(),
+        rationale: String::new(),
+        tasks: vec![request.task.clone()],
+        authorized_by: request.authorized_by.clone(),
+    })?;
+
+    // The task must not already be somewhere Orqyn knows, or this would be a
+    // second row claiming an identity that already exists.
+    if plan.task_ids.contains(&request.task.id) {
+        return Err(PlanError::TaskAlreadyPlanned {
+            task: request.task.id.clone(),
+            plan: plan.id.clone(),
+        });
+    }
+
+    let mut task = Task::for_project(
+        request.project_id.clone(),
+        request.task.id.clone(),
+        request.task.title.trim(),
+        request.task.objective.trim(),
+    );
+    task.status = TaskStatus::Todo;
+    task.dependencies = request.task.depends_on.clone();
+    task.expected_outputs = request.task.expected_outputs.clone();
+    task.priority = request.task.priority;
+    task.complexity = request.task.complexity;
+    task.scope_paths = request.task.scope_paths.clone();
+    task.created_at = now;
+    task.updated_at = now;
+
+    let (plan, task) = store
+        .append_task_to_plan(&plan.id, &task, &extension_note(&request.task), now)
+        .await
+        .map_err(|err| PlanError::Store(err.to_string()))?;
+
+    Ok(Extended { plan, task })
+}
+
+/// The line an extension appends to the plan's rationale.
+///
+/// A **suffix**, deliberately. The plan's objective is left exactly as it was — it
+/// records the goal the plan was created for, and rewriting it would destroy the
+/// reason the plan exists. The scope this plan now covers is a different fact, and
+/// a different field's job, so it is stated here as its own line rather than
+/// folded into the objective a reader would take to be the original request.
+///
+/// Deterministic: the same task always produces the same line, so a test can
+/// assert on it and a reader can grep for it.
+pub fn extension_note(spec: &TaskSpec) -> String {
+    format!(
+        "+ scope extended: this plan now also covers task {} (\"{}\")",
+        spec.id.as_str(),
+        spec.objective.trim()
+    )
+}

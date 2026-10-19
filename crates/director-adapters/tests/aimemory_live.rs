@@ -251,3 +251,153 @@ async fn reading_a_project_that_was_never_written_fails_closed() {
         "a read of a project that was never written is an error, not an empty list"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The checkpoint publication path, against the live server
+// ---------------------------------------------------------------------------
+
+/// Orqyn's own checkpoint payload lands on the real substrate and reads back.
+///
+/// This is the one place the two halves meet: the application builds the payload
+/// and calls the adapter, and the substrate stores it. Everything above proves
+/// the adapter in isolation; this proves the application path against the real
+/// server rather than a double.
+///
+/// Requires the `ai-memory` binary and nothing else — no credentials.
+#[tokio::test]
+#[ignore = "spawns the real ai-memory server"]
+async fn a_checkpoint_payload_survives_the_real_substrate() {
+    let dir = data_dir("checkpoint_payload");
+    let adapter = AiMemoryAdapter::connect(&binary(), &dir, "director-workspace", "checkpointing")
+        .await
+        .expect("connect to the live server");
+
+    // Exactly the record `checkpoint::memory_for` builds for a task checkpoint.
+    let page = memory(
+        "checkpoints/auth.md",
+        "Checkpoint: AUTH",
+        "**Resume status evidence for AUTH**\n\n- objective: implement auth\n- branch: main\n- head: abc123\n- progress: wrote the middleware\n- next action: run the tests\n- changed files: src/auth/mod.rs",
+    );
+
+    let written = adapter
+        .save_memory(page.clone())
+        .await
+        .expect("the page writes");
+
+    assert_eq!(
+        written.id, page.id,
+        "the substrate stores the path Orqyn derived from the task id"
+    );
+
+    // The narrative is findable by its own content, which is how a replacement
+    // would actually look for it.
+    let hits = adapter
+        .query_memories(&MemoryQuery::new("Resume status evidence for AUTH", 10))
+        .await
+        .expect("query");
+    let found = hits
+        .iter()
+        .find(|m| m.id == "checkpoints/auth.md")
+        .expect("the checkpoint page is findable by content");
+    assert!(
+        found.body.contains("next action: run the tests"),
+        "the next action survived, because that is what a replacement needs: {}",
+        found.body
+    );
+
+    // Republishing the same path replaces rather than duplicates - the reason a
+    // retried round cannot accumulate one page per attempt.
+    adapter.save_memory(page).await.expect("republish");
+    let after = adapter
+        .query_memories(&MemoryQuery::new("Resume status evidence for AUTH", 50))
+        .await
+        .expect("query");
+    assert_eq!(
+        after
+            .iter()
+            .filter(|m| m.id == "checkpoints/auth.md")
+            .count(),
+        1,
+        "a republish overwrites the same page instead of duplicating it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Retrieval: what publication wrote comes back
+// ---------------------------------------------------------------------------
+
+/// Orqyn publishes a checkpoint page, queries for it the way the briefing does,
+/// and the page comes back with its path and tags intact.
+///
+/// This is the read half of the write/read loop. Phase 6A proved the write
+/// reaches the substrate; this proves the retrieval path Orqyn will actually use
+/// finds it again — the query text and the association check are the two places
+/// where a mismatch between write and read would silently break the feature.
+#[tokio::test]
+#[ignore = "spawns the real ai-memory server"]
+async fn a_published_checkpoint_is_retrievable_by_the_briefings_own_query() {
+    let dir = data_dir("checkpoint_retrieval");
+    let adapter = AiMemoryAdapter::connect(&binary(), &dir, "director-workspace", "retrieval")
+        .await
+        .expect("connect to the live server");
+
+    let task = "AUTH";
+    let path = format!("checkpoints/{}.md", task.to_lowercase());
+
+    // Exactly what `checkpoint::memory_for` writes: the same path, the same
+    // title, the same narrative, and the same two tags. The tags matter as much
+    // as the body — they are one of the two signals the retrieval path uses to
+    // decide a page belongs to this task.
+    let mut page = memory(
+        &path,
+        &format!("Checkpoint: {task}"),
+        "**Resume status evidence for AUTH**\n\n- objective: implement auth\n- branch: main\n- head: abc123\n- progress: wrote the middleware\n- next action: run the tests",
+    );
+    page.tags = vec!["orqyn-checkpoint".into(), task.to_lowercase()];
+    adapter
+        .save_memory(page)
+        .await
+        .expect("the checkpoint page writes");
+
+    // Exactly what the briefing asks for: the same header text, derived from the
+    // task id on both sides.
+    let hits = adapter
+        .query_memories(&MemoryQuery::new(
+            format!("Resume status evidence for {task}"),
+            10,
+        ))
+        .await
+        .expect("query");
+
+    let found = hits
+        .iter()
+        .find(|m| m.id == path)
+        .expect("the published page is found again by the briefing's own query");
+
+    assert!(
+        found.body.contains("next action: run the tests"),
+        "the narrative survived the round trip: {}",
+        found.body
+    );
+
+    // Both association signals survive, because either alone is accepted and the
+    // check is what stops another task's page being presented as this one's.
+    assert!(
+        found.tags.iter().any(|t| t == "orqyn-checkpoint"),
+        "the checkpoint tag survived: {:?}",
+        found.tags
+    );
+    assert!(
+        found.tags.iter().any(|t| t == "auth"),
+        "the task tag survived: {:?}",
+        found.tags
+    );
+
+    // And a different task's page must not match this one's path or tags.
+    let unrelated = hits.iter().filter(|m| m.id != path).count();
+    assert_eq!(
+        unrelated,
+        hits.len() - 1,
+        "no extra page was created by the write"
+    );
+}

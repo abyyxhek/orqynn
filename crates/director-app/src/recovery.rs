@@ -161,10 +161,11 @@ impl Recovery {
     /// is what [`Recovery::actions_available`] reports, and never a complete
     /// account of the task's history.
     ///
-    /// For the one gap that *is* provable — a verdict whose actions went missing —
-    /// see [`RecoveryGaps::actions_incomplete`]. That is a detected hole rather
-    /// than a standing limitation, and the two should not be read as the same
-    /// claim.
+    /// [`RecoveryGaps::actions_incomplete`] reports the one shape this build can
+    /// no longer produce on its own — a verdict whose actions went missing. The
+    /// verdict and its actions commit in one transaction, so a true here means a
+    /// row written by an older build or by hand. It is kept as a canary, and it
+    /// is not the same claim as the limit described above.
     pub fn actions_complete(&self) -> bool {
         false
     }
@@ -202,12 +203,16 @@ pub struct RecoveryGaps {
     pub blockers_unavailable: bool,
     /// A verdict is on record whose actions are missing.
     ///
-    /// The one gap Orqyn can *prove* rather than suspect. VERIFY commits its
-    /// verdict and the task's move atomically, and records what it observed
-    /// immediately afterwards; a process that dies between the two leaves a
-    /// durable verdict and no actions, and nothing later will fill them in. This
-    /// flag is how that becomes visible to a caller instead of a briefing quietly
-    /// reading as though it had the whole history.
+    /// The one gap Orqyn can *prove* rather than suspect.
+    ///
+    /// A verdict and the actions recording what it ran now commit in one
+    /// transaction, so this should never fire: the pair is all-or-nothing. It is
+    /// kept because it is the assertion that the atomic write is doing its job,
+    /// and because a verdict can still arrive without observations — a caller
+    /// using the store's no-actions `apply_verification` is one, and an older
+    /// database written before the atomic path is another. Either way the flag
+    /// makes the hole visible to a caller instead of letting a briefing quietly
+    /// read as though it had the whole history.
     ///
     /// Distinct from `recent_context_unavailable`, which says a window is empty.
     /// An empty window may simply mean nothing was recorded; this says a record

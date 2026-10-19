@@ -70,6 +70,66 @@ pub struct Handoff {
     pub accepted_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The session that accepted it, if any.
     pub accepted_by_session: Option<SessionId>,
+    /// The project this handoff belongs to, when Orqyn knows one.
+    ///
+    /// Optional and additive: a handoff recorded before the project was observed
+    /// still has a task and an attribution worth keeping, and inventing a project
+    /// for it would be a fabrication. `None` reads as "no project was named",
+    /// which is different from "no project applies".
+    pub project_id: Option<crate::ids::ProjectId>,
+    /// The checkpoint the continuation narrative was derived from.
+    ///
+    /// The point a snapshot stops being current can only be asked about if the
+    /// point it was taken at is recorded. `None` means the narrative was not
+    /// derived from a checkpoint - a task observed before it was ever in progress
+    /// has none - and such a snapshot reads as **stale**, never as current. No
+    /// checkpoint is ever invented to fill this.
+    pub source_checkpoint: Option<crate::ids::CheckpointId>,
+    /// The task's `state_version` when the narrative was taken.
+    ///
+    /// The cheap half of staleness detection: if this no longer matches the task
+    /// row, the world moved after the snapshot and the narrative is context
+    /// rather than a description of now.
+    pub source_task_version: Option<u64>,
+    /// Why responsibility moved, when the store could prove it.
+    ///
+    /// `None` on a record written before causes existed, and on any record whose
+    /// cause cannot be established from persisted rows. It reads as *unknown*, not
+    /// as *voluntary* - the distinction matters, because "we do not know why" and
+    /// "the agent offered" are very different things to rely on.
+    pub cause: Option<HandoffCause>,
+}
+
+/// Why responsibility for a task moved from one agent to another.
+///
+/// Every variant is something the store can **prove** from persisted rows. A cause
+/// is never inferred from a missing session, from a gap in the log, or from what
+/// an agent probably intended - so there is deliberately no "voluntary" variant:
+/// Orqyn cannot distinguish an agent that asked to hand work on from one that
+/// stopped answering, and guessing between them would put an unverified claim
+/// into an audit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffCause {
+    /// An agent holding an active assignment was displaced by another agent's
+    /// assignment. Proven by the released tenure carrying
+    /// [`ReleaseReason::Reassigned`](crate::assignment::ReleaseReason::Reassigned)
+    /// while active.
+    Displaced,
+    /// The previous tenure's lease expired with no heartbeat and the task was
+    /// reclaimed. Proven by the released tenure carrying
+    /// [`ReleaseReason::LeaseExpired`](crate::assignment::ReleaseReason::LeaseExpired).
+    LeaseExpiredReclaimed,
+}
+
+impl HandoffCause {
+    /// A phrase a reader can act on.
+    pub fn describe(self) -> &'static str {
+        match self {
+            HandoffCause::Displaced => "displaced while active by another agent",
+            HandoffCause::LeaseExpiredReclaimed => "reclaimed after the previous lease expired",
+        }
+    }
 }
 
 impl Handoff {
@@ -95,6 +155,12 @@ impl Handoff {
             created_at: chrono::Utc::now(),
             accepted_at: None,
             accepted_by_session: None,
+            // Additive, and absent until a caller says otherwise: an unstated
+            // project or derivation point is recorded as such rather than guessed.
+            project_id: None,
+            source_checkpoint: None,
+            source_task_version: None,
+            cause: None,
         }
     }
 
@@ -120,6 +186,63 @@ impl Handoff {
     pub fn touched(mut self, path: impl Into<String>) -> Self {
         self.files_touched.push(path.into());
         self
+    }
+
+    /// Name the project this handoff belongs to.
+    pub fn in_project(mut self, project_id: crate::ids::ProjectId) -> Self {
+        self.project_id = Some(project_id);
+        self
+    }
+
+    /// Record the exact state the narrative was derived from.
+    ///
+    /// This is what a staleness check compares against later. A caller that has
+    /// no checkpoint passes `None` and gets a snapshot that reads as stale —
+    /// which is the honest answer, and never "current because we had nothing to
+    /// contradict us with".
+    pub fn derived_from(
+        mut self,
+        checkpoint: Option<crate::ids::CheckpointId>,
+        task_version: Option<u64>,
+    ) -> Self {
+        self.source_checkpoint = checkpoint;
+        self.source_task_version = task_version;
+        self
+    }
+
+    /// Record the established cause. A handoff with no cause states nothing rather
+    /// than defaulting to something flattering.
+    pub fn caused_by(mut self, cause: HandoffCause) -> Self {
+        self.cause = Some(cause);
+        self
+    }
+
+    /// Whether this snapshot is still a description of the task as it stands.
+    ///
+    /// Conservative by construction: a snapshot with no recorded derivation
+    /// point, or one taken at a task version the task has since moved past, is
+    /// stale. Only an exact match on both the version and the checkpoint is
+    /// current. Stale is not an error — the record stays auditable — it means the
+    /// narrative is context and current state must come from
+    /// [`crate::checkpoint`] and the recovery package instead.
+    pub fn is_current_for(
+        &self,
+        task_version: u64,
+        checkpoint: Option<&crate::ids::CheckpointId>,
+    ) -> bool {
+        match (
+            self.source_task_version,
+            self.source_checkpoint.as_ref(),
+            checkpoint,
+        ) {
+            (Some(recorded), Some(recorded_checkpoint), Some(current)) => {
+                recorded == task_version && recorded_checkpoint == current
+            }
+            // A snapshot with no derivation point cannot be shown to be current.
+            (Some(_), None, _) | (None, _, _) => false,
+            // The task has since gained a checkpoint the snapshot never saw.
+            (Some(_), Some(_), None) => false,
+        }
     }
 
     /// Accept the handoff on behalf of the intended agent.

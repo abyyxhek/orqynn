@@ -186,11 +186,15 @@ enum KillPoint {
     AssignmentPersisted,
     /// A simulated agent reported finishing; verification has not run.
     AgentReportRecorded,
-    /// A VERIFY round committed its verdict and the task's move, and the process
-    /// died before the actions recording what the round observed were written.
+    /// A VERIFY round returned: its verdict, the task's move, the history row and
+    /// every action the round observed are already durable, because they commit
+    /// as one transaction.
     ///
-    /// The one interruption point Orqyn cannot recover from by itself: the task
-    /// has left the survey set, so no later round will ever write those actions.
+    /// This kill point and `ActionsRecorded` are now the *same* case. Both call
+    /// paths - the bare step and the runner - go through the same engine, so both
+    /// record actions inside the round's transaction. The pair is kept to pin that
+    /// fact down: if a future change ever reintroduced a gap between the two, the
+    /// parent assertions below would stop matching.
     VerdictPersisted,
     /// A VERIFY round committed its verdict *and* recorded its actions; the
     /// process died with nothing outstanding.
@@ -577,14 +581,14 @@ fn run_verify_child() {
             .await
             .expect("the simulated agent turn");
 
-        // The two sides of the recording gap.
+        // Both VERIFY kill points now describe the same durable state.
         //
-        // `after_verdict` calls the step directly, which is what the runner does
-        // before it records anything: the verdict, the task's move and the history
-        // row commit inside the store's transaction, and nothing has written an
-        // action. Parking here and being killed reproduces the exact window.
-        //
-        // `after_actions` goes through the runner, so the recording has happened.
+        // `after_verdict` calls the step directly and `after_actions` goes
+        // through the runner, but the step delegates to the same engine, and the
+        // engine commits the verdict, the task's move and the actions together.
+        // There is no longer a window where one of them is durable and the other
+        // is not, which is exactly what these two kill points used to prove was
+        // possible.
         if kill_point == KillPoint::VerdictPersisted {
             let report =
                 director_app::verify::verify_at(&store, &executor, &project, &repo_dir, stamp(5))
@@ -1273,39 +1277,48 @@ fn a_kill_after_actions_are_recorded_loses_nothing() {
 ///
 /// This is the documented trade rather than a passing bill of health. A VERIFY
 /// round commits its verdict, the task's move and the history row in one
-/// transaction; the actions recording what it observed are written after that
-/// commit. A process killed in the gap leaves a durable verdict and no actions,
-/// and because the task has left the survey set no later round will write them.
+/// A kill around the atomic commit cannot split the verdict from its actions.
 ///
-/// What must hold is that the loss is *visible*. The gap is provable from the
-/// persisted data — a verification with no action keyed on it — so recovery
-/// reports it rather than letting a briefing imply a history Orqyn does not have.
+/// This used to be the interesting boundary: the verdict committed in one
+/// transaction, the actions were written afterwards in transactions of their own,
+/// and a process killed in between left a durable verdict with no record of what
+/// it had run. They now share a transaction, so the kill lands either side of the
+/// whole pair or in the middle of a transaction that rolls back. There is no state
+/// in between any more — which is the property this asserts, from the outside,
+/// with the writer killed by `Child::kill` like every other test here.
+///
+/// The child reaches the kill point only after the round has returned, so what is
+/// being checked is the committed side: both halves present and consistent. The
+/// rolled-back side is covered deterministically elsewhere, because provoking a
+/// real kill *during* a commit would mean racing it rather than asserting it.
 #[test]
-fn a_kill_inside_the_recording_window_is_reported_rather_than_hidden() {
+fn a_kill_after_the_atomic_commit_cannot_split_the_verdict_from_its_actions() {
     let harness = KillHarness::new();
     let marker = harness.kill_role_at("verify", KillPoint::VerdictPersisted);
 
     assert_eq!(
         marker["task_status"], "done",
-        "the verdict and the task's move committed atomically before the kill"
+        "the verdict, the move and the observations all committed before the kill"
     );
     assert_eq!(
         marker["verification_count"], 1,
-        "so the verdict survived the termination"
+        "the verdict survived the termination"
     );
     assert_eq!(
-        marker["action_count"], 0,
-        "and nothing had written the actions yet - this is the window, reached for real"
+        marker["action_count"], 1,
+        "and so did the action recording the command it ran - they committed together, \
+         so there is no longer a window in which one could be missing"
     );
 
-    // The same loss, seen by a fresh process. It cannot be repaired: the task is
-    // `done`, so no round will ever survey it again.
+    // Read the pair back through a fresh handle on the same file, and check they
+    // still belong together: the action is keyed on the verification's id, which
+    // is what lets a reader (and recovery) pair them.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("a runtime");
     let task = TaskId::from_string(TASK_ID);
-    let (actions, verifications, second_round) = runtime.block_on(async move {
+    let (actions, verifications, repair_round) = runtime.block_on(async move {
         let store = Store::open(&harness.db).await.expect("the store reopens");
         let actions = store
             .actions()
@@ -1317,7 +1330,8 @@ fn a_kill_inside_the_recording_window_is_reported_rather_than_hidden() {
             .verifications_for_task(&task)
             .await
             .expect("verifications read");
-        // Would a later round repair it? No: the task has left the survey set.
+        // Would a later round have to repair anything? No: the pair is complete
+        // and the task is `done`, so nothing is surveyed again.
         let git = GitService::new(&harness.state_dir).expect("the git service");
         let memory = InMemoryProvider::new();
         let executor = LocalExecutor::default();
@@ -1329,17 +1343,22 @@ fn a_kill_inside_the_recording_window_is_reported_rather_than_hidden() {
         (actions, verifications, again.judged.len())
     });
 
-    assert!(
-        actions.is_empty(),
-        "the actions for that round are genuinely gone; this is the loss, stated plainly"
-    );
     assert_eq!(verifications.len(), 1);
     assert_eq!(
-        second_round, 0,
-        "and no later round will write them, because the task is done and no longer surveyed"
+        actions.len(),
+        1,
+        "no committed event was lost across the termination"
+    );
+    assert_eq!(
+        actions[0].id.to_string(),
+        format!("ACT-{}-0", verifications[0].id),
+        "and the action is still recognisable as the one that belongs to that verdict"
+    );
+    assert_eq!(
+        repair_round, 0,
+        "and nothing is left for a later round to repair"
     );
 }
-
 #[test]
 fn the_harness_actually_terminates_the_child() {
     // Proves the kill mechanism itself, isolated from any workflow claim: a

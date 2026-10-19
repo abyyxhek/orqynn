@@ -153,12 +153,11 @@ impl Fixture {
     /// verdict. The simulated turn is the only way to reach VERIFY without an
     /// agent driver.
     ///
-    /// Takes the runner rather than making one, because assignment ids are minted
-    /// from a per-runner counter: two runners in one process both mint
-    /// `ASSIGN-…-1` and the second assignment is refused by the store's primary
-    /// key. That is a pre-existing property of assignment id generation and not
-    /// something this file is testing, so the tests here stay inside one runner
-    /// rather than depending on how ids happen to be numbered.
+    /// Takes the runner rather than making one, so a caller can drive several
+    /// rounds through the same runner. Assignment ids are allocated by the store
+    /// inside the transaction that writes the row, so two runners would not
+    /// collide — the tests here stay inside one runner anyway because a single
+    /// runner keeps each test's account of the flow simple to read.
     async fn to_verification_pending_with(
         &self,
         runner: &mut Runner<'_, InMemoryProvider, LocalExecutor>,
@@ -273,9 +272,9 @@ async fn two_tasks_judged_in_one_run_get_distinct_actions() {
     fixture.prepared().await;
     fixture.register_second_agent().await;
 
-    // One runner for both tasks: assignment ids come from a per-runner counter,
-    // so two runners would collide on `agent_assignments.id` before the property
-    // under test was ever reached.
+    // One runner for both tasks, so the flow reads as a single driver rather than
+    // two. Assignment ids are allocated by the store, so sharing a runner is a
+    // readability choice here and not a constraint.
     let mut runner = fixture.runner();
     fixture
         .to_verification_pending_with(&mut runner, "ALPHA", &[PASSES], "PLAN-1")
@@ -309,9 +308,12 @@ async fn two_tasks_judged_in_one_run_get_distinct_actions() {
 ///
 /// Every action from one round carries the round's single instant, so equal
 /// timestamps are the normal case rather than an edge case. Ordering therefore
-/// has to come from the id, and it has to be *stable*: a briefing that reordered
-/// itself between two reads of the same rows would disagree with itself for no
-/// reason.
+/// has to come from the order the actions were recorded, and it has to be
+/// *stable*: a briefing that reordered itself between two reads of the same rows
+/// would disagree with itself for no reason.
+///
+/// This is the two-action case, where recorded order and lexical id order happen
+/// to coincide. `action_ordering.rs` covers the cases where they do not.
 #[tokio::test]
 async fn actions_sharing_a_timestamp_read_back_in_a_stable_order() {
     let fixture = Fixture::new().await;
@@ -346,7 +348,10 @@ async fn actions_sharing_a_timestamp_read_back_in_a_stable_order() {
         "the test is only meaningful if the two actions really do tie on time"
     );
 
-    // Repeated reads agree, and the order is ascending by id — the tie-break.
+    // Repeated reads agree, and the order is the order the round recorded them in
+    // — the tie-break. With two checks that is also ascending by id, so this
+    // assertion cannot tell the two mechanisms apart on its own; it pins the
+    // stability contract, which is the point of the test.
     for _ in 0..3 {
         assert_eq!(
             fixture.judged_action_log("MULTI").await,
@@ -354,13 +359,21 @@ async fn actions_sharing_a_timestamp_read_back_in_a_stable_order() {
             "the same rows read twice gave two different orders"
         );
     }
-    let ids: Vec<String> = actions.iter().map(|a| a.id.to_string()).collect();
-    let mut sorted = ids.clone();
-    sorted.sort();
+    let ordinals: Vec<usize> = actions.iter().map(|a| ordinal_of(&a.id)).collect();
     assert_eq!(
-        ids, sorted,
-        "equal timestamps are ordered by id, which is what makes the order stable"
+        ordinals,
+        vec![0, 1],
+        "the round's own checks stay in order, which is the order they were written"
     );
+}
+
+/// The check index embedded in an action id, i.e. the `0` in `ACT-...-1-0`.
+fn ordinal_of(id: &director_domain::ids::ActionId) -> usize {
+    id.as_str()
+        .rsplit('-')
+        .next()
+        .and_then(|last| last.parse().ok())
+        .unwrap_or_else(|| panic!("{id} carries no ordinal"))
 }
 
 // ---------------------------------------------------------------------------
@@ -641,20 +654,21 @@ async fn a_recorded_window_is_available_and_still_not_complete() {
     );
 }
 
-/// The one provable gap is reported rather than left to be inferred.
+/// The verdict and its actions commit together, so the gap cannot open.
 ///
-/// A VERIFY round commits its verdict before the actions recording what it
-/// observed are written, so a process killed in between leaves a durable verdict
-/// and no actions. This reproduces that window exactly — by running the step
-/// without the runner's recording pass — and asserts that recovery notices.
+/// This used to be the defect: the step committed its verdict in one transaction
+/// and the actions recording what it observed were written afterwards, in
+/// transactions of their own, and a process killed in between left a durable
+/// verdict with no record of what it had run. The actions now go through the same
+/// write, so a caller running the step directly — with no runner, and therefore
+/// nothing appending afterwards — still gets both or neither.
 #[tokio::test]
-async fn a_verdict_without_its_actions_is_reported_as_a_gap() {
+async fn the_step_writes_the_verdict_and_its_actions_together() {
     let fixture = Fixture::new().await;
     fixture.prepared().await;
     fixture.to_verification_pending("AUTH", &[PASSES]).await;
 
-    // The step on its own: the verdict, the task's move and the history row
-    // commit, and nothing writes an action. This is the inside of the window.
+    // The step on its own: no runner, no recording pass of any kind.
     let report = director_app::verify::verify_at(
         &fixture.store,
         &fixture.executor,
@@ -673,15 +687,94 @@ async fn a_verdict_without_its_actions_is_reported_as_a_gap() {
         .await
         .expect("verifications read");
     assert_eq!(verifications.len(), 1, "the verdict is durable");
-    assert!(
-        fixture.judged_action_log("AUTH").await.is_empty(),
-        "and the actions are genuinely missing"
+
+    let log = fixture.judged_action_log("AUTH").await;
+    assert_eq!(
+        log.len(),
+        1,
+        "and its actions came with it, in the same transaction"
+    );
+    assert_eq!(
+        log[0].clone(),
+        serde_json::to_string(
+            &fixture
+                .store
+                .actions()
+                .get_action(&director_domain::ids::ActionId::from_string(format!(
+                    "ACT-{}-0",
+                    verifications[0].id
+                )))
+                .await
+                .expect("the action reads back")
+        )
+        .expect("serializes"),
+        "the action is keyed on the verification it belongs to"
     );
 
-    // Now the detection: a recovery build over the same store must say so rather
-    // than present the window as whole. It needs an in-flight task, so this is
-    // asserted against the persisted data directly rather than through a briefing
-    // for a terminal one.
+    // Nothing is provably missing, so the gap flag must stay quiet.
+    let outcome =
+        director_app::recovery::RecoveryBuilder::new(&fixture.store, TaskId::from_string("AUTH"))
+            .build()
+            .await
+            .expect("the recovery build");
+    if let director_app::recovery::RecoveryOutcome::Built(recovery) = outcome {
+        assert!(
+            !recovery.gaps().actions_incomplete,
+            "an atomically committed verdict reports no gap"
+        );
+    }
+}
+
+/// The gap detector still works, which is what makes its silence meaningful.
+///
+/// `actions_incomplete` is the canary for a future path that commits a verdict
+/// without its observations. It is exercised here by writing a verification
+/// directly through the repository — bypassing the atomic path, exactly as an
+/// older Orqyn or a hand-made record would — so the detector is proven rather
+/// than merely unused.
+#[tokio::test]
+async fn a_verdict_written_without_its_actions_is_still_reported() {
+    let fixture = Fixture::new().await;
+    fixture.prepared().await;
+    fixture.to_verification_pending("AUTH", &[PASSES]).await;
+
+    // Judge for real is unnecessary here: a verdict with no actions is still a
+    // reachable state, because `apply_verification` — the API the engine used
+    // before the atomic write, still supported for callers that record their own
+    // observations — commits exactly this shape.
+    let task = TaskId::from_string("AUTH");
+    let stored = fixture
+        .store
+        .tasks()
+        .get_task(&task)
+        .await
+        .expect("the task reads");
+    let verification = director_domain::verification::Verification::new(
+        director_domain::ids::VerificationId::from_string("VER-HANDMADE-1"),
+        task.clone(),
+        fixture.project.clone(),
+        None,
+        director_domain::verification::VerificationStatus::Passed,
+        vec![director_domain::verification::Evidence {
+            kind: director_domain::verification::ProbeKind::Command,
+            criterion: "handmade".into(),
+            status: director_domain::verification::EvidenceStatus::Passed,
+            detail: "the check passed".into(),
+        }],
+        None,
+        pinned(),
+    );
+    fixture
+        .store
+        .apply_verification(&verification, stored.state_version, pinned())
+        .await
+        .expect("a verdict with no actions is still writable through this API");
+
+    assert!(
+        fixture.judged_action_log("AUTH").await.is_empty(),
+        "the verdict really did land with no observations behind it"
+    );
+
     let outcome =
         director_app::recovery::RecoveryBuilder::new(&fixture.store, TaskId::from_string("AUTH"))
             .build()

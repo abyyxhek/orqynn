@@ -69,6 +69,7 @@ use director_domain::task::{Task, TaskStatus};
 use crate::handoff::mapping::{agent_from_wire, session_from_wire, task_from_wire, task_to_wire};
 use crate::handoff::transport::McpTransport;
 use crate::handoff::wire::{AgentList, SessionSummary, TaskData, TaskTree};
+use crate::stdio_mcp::McpTimeouts;
 
 /// Errors the handoff adapter can produce.
 ///
@@ -106,6 +107,19 @@ pub enum HandoffAdapterError {
     /// A task Orqyn asked for is not in the substrate.
     #[error("no such task in handoff-mcp: {0}")]
     NotFound(String),
+    /// Another caller is using the connection and this one waited too long for
+    /// its turn.
+    ///
+    /// Distinct from a tool-call timeout, and deliberately so: nothing went
+    /// wrong with the server, no request was sent on this caller's behalf, and
+    /// the in-flight request belongs to somebody else and is unaffected. The
+    /// connection is untouched, so the call can be retried once the holder
+    /// finishes.
+    #[error("another caller has held the handoff-mcp connection for over {waited:?}")]
+    LockTimeout {
+        /// How long this caller waited for its turn.
+        waited: std::time::Duration,
+    },
 }
 
 /// A connection that can call handoff-mcp tools.
@@ -126,6 +140,15 @@ pub trait HandoffWire: Send {
 
     /// The agent identity this connection speaks as.
     fn agent_identity(&self) -> AgentId;
+
+    /// The server's most recent stderr, when this wire is backed by a real
+    /// child process.
+    ///
+    /// Defaults to `None` so a fake wire needs nothing. Diagnostic text only:
+    /// arbitrary third-party output, never part of a protocol reply.
+    fn stderr_tail(&self) -> Option<String> {
+        None
+    }
 }
 
 #[async_trait]
@@ -143,6 +166,11 @@ impl HandoffWire for McpTransport {
 
     fn agent_identity(&self) -> AgentId {
         McpTransport::agent_id(self).clone()
+    }
+
+    /// A real child process, so there is a stderr to report.
+    fn stderr_tail(&self) -> Option<String> {
+        Some(McpTransport::stderr_tail(self))
     }
 }
 
@@ -166,6 +194,12 @@ pub struct HandoffAdapter<T = McpTransport> {
     /// The identity every call is made as, captured at construction so reading
     /// it never has to touch the transport.
     agent_id: AgentId,
+    /// How long a caller waits for its turn at [`Self::transport`].
+    ///
+    /// Separate from the transport's own bounds on purpose: failing to get the
+    /// lock says nothing about the server, so it must not produce a
+    /// tool-call-style error or reach the transport at all.
+    lock_timeout: std::time::Duration,
 }
 
 impl<T: HandoffWire> HandoffAdapter<T> {
@@ -178,6 +212,20 @@ impl<T: HandoffWire> HandoffAdapter<T> {
         project_dir: impl Into<PathBuf>,
         project_name: impl Into<String>,
     ) -> Self {
+        Self::new_with_timeouts(transport, project_dir, project_name, McpTimeouts::default())
+    }
+
+    /// [`Self::new`] with explicit bounds.
+    ///
+    /// Only [`McpTimeouts::lock`] is read here: the rest belong to the
+    /// transport, which the caller already built. Passing the whole struct keeps
+    /// one configuration type in play rather than introducing a second one.
+    pub fn new_with_timeouts(
+        transport: T,
+        project_dir: impl Into<PathBuf>,
+        project_name: impl Into<String>,
+        timeouts: McpTimeouts,
+    ) -> Self {
         let agent_id = transport.agent_identity();
         HandoffAdapter {
             transport: Mutex::new(transport),
@@ -185,6 +233,23 @@ impl<T: HandoffWire> HandoffAdapter<T> {
             project_name: project_name.into(),
             trusted_done_ids: std::sync::Mutex::new(HashSet::new()),
             agent_id,
+            lock_timeout: timeouts.lock,
+        }
+    }
+
+    /// Wait this caller's turn to use the connection.
+    ///
+    /// `tokio::sync::Mutex::lock` is cancel-safe: dropping this future while it
+    /// waits removes the caller from the queue without acquiring the guard. So a
+    /// timeout here — and an outright cancellation — cannot take the guard from
+    /// the caller that holds it, cannot cancel the request already in flight,
+    /// and cannot leave the lock held by nobody.
+    async fn lock_transport(&self) -> Result<tokio::sync::MutexGuard<'_, T>, HandoffAdapterError> {
+        match tokio::time::timeout(self.lock_timeout, self.transport.lock()).await {
+            Ok(guard) => Ok(guard),
+            Err(_) => Err(HandoffAdapterError::LockTimeout {
+                waited: self.lock_timeout,
+            }),
         }
     }
 
@@ -205,7 +270,7 @@ impl<T: HandoffWire> HandoffAdapter<T> {
         name: &str,
         arguments: Value,
     ) -> Result<String, HandoffAdapterError> {
-        let mut transport = self.transport.lock().await;
+        let mut transport = self.lock_transport().await?;
         transport.call_tool(name, arguments).await
     }
 
@@ -270,7 +335,7 @@ impl<T: HandoffWire> HandoffAdapter<T> {
             obj.entry("project_dir")
                 .or_insert(Value::String(self.project_dir_str()));
         }
-        let mut transport = self.transport.lock().await;
+        let mut transport = self.lock_transport().await?;
         transport
             .call_tool(tool, arguments)
             .await
@@ -413,11 +478,56 @@ impl HandoffAdapter<McpTransport> {
         project_dir: impl Into<PathBuf>,
         project_name: impl Into<String>,
     ) -> Result<Self, HandoffAdapterError> {
+        Self::connect_with_timeouts(
+            binary,
+            agent_id,
+            project_dir,
+            project_name,
+            McpTimeouts::default(),
+        )
+        .await
+    }
+
+    /// [`Self::connect`] with explicit bounds on every blocking operation.
+    ///
+    /// The whole [`McpTimeouts`] is applied, not just part of it:
+    ///
+    /// * `handshake` bounds this method's own spawn and `initialize`, so a
+    ///   server that never answers fails to connect rather than hanging here.
+    /// * `tool_call`, `write` and `shutdown` are carried by the transport and
+    ///   apply to every later request and to cleanup.
+    /// * `lock` becomes this adapter's wait bound for its own mutex, which also
+    ///   governs the `ensure_project` calls below — they hold the same lock.
+    ///
+    /// Nothing else changes: same binary, same (empty) argv, same identity
+    /// environment, same project initialization.
+    pub async fn connect_with_timeouts(
+        binary: &str,
+        agent_id: AgentId,
+        project_dir: impl Into<PathBuf>,
+        project_name: impl Into<String>,
+        timeouts: McpTimeouts,
+    ) -> Result<Self, HandoffAdapterError> {
         let project_dir = project_dir.into();
-        let transport = McpTransport::spawn(binary, agent_id, &project_dir).await?;
-        let adapter = HandoffAdapter::new(transport, project_dir, project_name);
+        let transport =
+            McpTransport::spawn_with_timeouts(binary, agent_id, &project_dir, timeouts).await?;
+        let adapter =
+            HandoffAdapter::new_with_timeouts(transport, project_dir, project_name, timeouts);
         adapter.ensure_project().await?;
         Ok(adapter)
+    }
+
+    /// The child's most recent stderr, kept out of the JSON-RPC stream.
+    ///
+    /// Uses a non-blocking attempt at the lock, so a busy connection does not
+    /// hide a server's diagnostics.
+    pub fn stderr_tail(&self) -> Option<String> {
+        // Disambiguated from the inherent method on the concrete transport, which
+        // returns a plain String; here we want the wire trait's Option.
+        self.transport
+            .try_lock()
+            .ok()
+            .and_then(|guard| HandoffWire::stderr_tail(&*guard))
     }
 }
 

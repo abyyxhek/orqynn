@@ -228,6 +228,58 @@ pub async fn apply_verification(
     expected_task_version: u64,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(Verification, Task), StoreError> {
+    apply_verification_with_actions(pool, verification, &[], expected_task_version, now).await
+}
+
+/// [`apply_verification`], with the actions a round observed written in the same
+/// transaction as the verdict they justify.
+///
+/// This is the whole point of the operation existing. The verdict commits here and
+/// the actions used to commit afterwards, in transactions of their own, which
+/// left a window in which a process could die holding a durable verdict and no
+/// record of what it had run — a briefing that claimed a decision it could not
+/// account for. Inserting them inside this transaction makes the pair
+/// all-or-nothing: a reader sees the verdict and its observations, or neither.
+///
+/// Three properties this relies on, all already true of the surrounding code:
+///
+/// - **The transaction is the same one.** The actions go through
+///   [`crate::actions::insert_action`] on *this* [`rusqlite::Transaction`], so a
+///   failure anywhere in the block rolls back the verification row, the task's
+///   move and the history row along with them.
+/// - **Locking is unchanged.** This transaction is deferred, so it takes the
+///   write lock at its first write — which is the verification insert, before the
+///   actions. Concurrent writers therefore serialise there, and no other writer
+///   can observe or interleave with a half-written pair.
+/// - **The state-version check still decides.** The optimistic precondition on
+///   `tasks.state_version` is untouched, and a stale round is refused before its
+///   actions are attempted.
+///
+/// Actions are ignored for a round that moves no task status. An `Unverifiable`
+/// round stays in the survey set and is run again next tick, so recording its
+/// attempts would append one copy of the same attempt per tick. The gate is
+/// enforced here as well as by the caller, because "a round that will be repeated
+/// records nothing" is a property of what is durable and belongs at the boundary
+/// rather than in a convention.
+pub async fn apply_verification_with_actions(
+    pool: &crate::connection::ConnectionPool,
+    verification: &Verification,
+    actions: &[director_domain::action::Action],
+    expected_task_version: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(Verification, Task), StoreError> {
+    apply_verification_resolved(pool, verification, actions, expected_task_version, now).await
+}
+
+/// The shared body of [`apply_verification`] and its actions-bearing sibling, so
+/// the two cannot drift on the parts that must be identical.
+async fn apply_verification_resolved(
+    pool: &crate::connection::ConnectionPool,
+    verification: &Verification,
+    actions: &[director_domain::action::Action],
+    expected_task_version: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(Verification, Task), StoreError> {
     let mut conn = pool.get();
 
     // The status the task is moving from, read inside the transaction so the
@@ -293,6 +345,16 @@ pub async fn apply_verification(
                     ],
                 )
                 .map_err(translate_error)?;
+            }
+        }
+
+        // The observations behind this verdict, on the same transaction and the
+        // same lock as the verdict itself. Only for a round that actually decided
+        // something: an `Unverifiable` round is re-surveyed next tick, so its
+        // attempts are deliberately not recorded.
+        if verification.status.task_status().is_some() {
+            for action in actions {
+                crate::actions::insert_action(&tx, action)?;
             }
         }
     }

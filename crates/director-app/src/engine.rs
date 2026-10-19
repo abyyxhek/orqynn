@@ -80,7 +80,8 @@
 
 use std::path::Path;
 
-use director_domain::ids::{ProjectId, RepositoryId, TaskId, VerificationId};
+use director_domain::action::{Action, ActionKind};
+use director_domain::ids::{ActionId, ProjectId, RepositoryId, TaskId, VerificationId};
 use director_domain::providers::{CommandSpec, ExecutionProvider};
 use director_domain::task::Task;
 use director_domain::verification::{
@@ -156,17 +157,125 @@ where
         now,
     );
 
-    // The verdict lands atomically with the task's move and the history row.
+    // The observations this round produced, built here rather than by the caller
+    // because only this function has both the probe outcomes and the verdict's
+    // identity — and the actions have to be *inside* the write that persists the
+    // verdict. A caller that built them afterwards could only ever append them in
+    // a second transaction, which is the window this removes.
+    let actions = observed_actions(&verification, &outcomes, now);
+
+    // The verdict lands atomically with the task's move, the history row, and the
+    // actions recording what it ran.
     // The version the engine presents is the one the caller read, because that
     // is the task the evidence describes.
     let (stored, _) = store
-        .apply_verification(&verification, task.state_version, now)
+        .apply_verification_with_actions(&verification, &actions, task.state_version, now)
         .await?;
 
     Ok(EngineRound {
         verification: stored,
         outcomes,
     })
+}
+
+/// The actions recording what one round observed, keyed on that round's identity.
+///
+/// One action per probe that actually ran. A criterion with no machine-checkable
+/// form produces no probe and therefore no action: Orqyn ran nothing for it, so
+/// there is no observation to record, and inventing one would put a guess in a
+/// log of facts.
+///
+/// The ordinal is the probe's position among those that ran, so the ids are
+/// `ACT-{verification}-{n}` — derived from the round's own persisted identity
+/// rather than from a clock or a counter. That is what makes the write
+/// reproducible from the same inputs, and it is why the action and the verdict
+/// can be written together and still be recognised as a pair afterwards.
+///
+/// Returns nothing for a round that reached no verdict. An `Unverifiable` round
+/// stays in the survey set and runs again next tick, so recording its attempts
+/// would append one copy of the same attempt per tick; the store refuses them too,
+/// but there is no reason to build what will be discarded.
+fn observed_actions(
+    verification: &Verification,
+    outcomes: &[ProbeOutcome],
+    at: chrono::DateTime<chrono::Utc>,
+) -> Vec<Action> {
+    if verification.status.task_status().is_none() {
+        return Vec::new();
+    }
+    let mut actions = Vec::with_capacity(outcomes.len());
+    for (ordinal, outcome) in outcomes.iter().enumerate() {
+        if let Some(action) = action_for_probe(verification, outcome, ordinal, at) {
+            actions.push(action);
+        }
+    }
+    actions
+}
+
+/// The action recording one probe, or `None` when the probe decided nothing a
+/// replacement would need to see.
+fn action_for_probe(
+    verification: &Verification,
+    outcome: &ProbeOutcome,
+    ordinal: usize,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Option<Action> {
+    let command = outcome.command.clone().unwrap_or_default();
+    let (kind, summary, detail) = match outcome.status {
+        EvidenceStatus::Passed => (
+            ActionKind::Command,
+            format!("ran `{command}`: passed"),
+            format!("criterion: {}", outcome.criterion),
+        ),
+        EvidenceStatus::Failed => {
+            let because = if outcome.timed_out {
+                "timed out"
+            } else {
+                "failed"
+            };
+            let mut detail = format!("criterion: {}; {because}", outcome.criterion);
+            if !outcome.stderr.is_empty() {
+                detail.push_str(&format!(
+                    "; exit {}; stderr: {}",
+                    outcome.exit_code, outcome.stderr
+                ));
+            } else {
+                detail.push_str(&format!("; exit {}", outcome.exit_code));
+            }
+            (
+                ActionKind::Error,
+                format!("ran `{command}`: {because}"),
+                detail,
+            )
+        }
+        EvidenceStatus::Unverifiable => (
+            ActionKind::Error,
+            format!("could not run `{command}`"),
+            format!(
+                "criterion: {}; {}",
+                outcome.criterion,
+                if outcome.note.is_empty() {
+                    "the probe gathered no evidence"
+                } else {
+                    &outcome.note
+                }
+            ),
+        ),
+        // `Observed` evidence decides nothing, so there is nothing here that a
+        // replacement needs; recording it would imply the round judged something
+        // it did not.
+        EvidenceStatus::Observed => return None,
+    };
+
+    let mut action = Action::new(
+        ActionId::from_string(format!("ACT-{}-{ordinal}", verification.id)),
+        kind,
+        summary,
+    )
+    .for_task(verification.task_id.clone());
+    action.detail = Some(detail);
+    action.at = at;
+    Some(action)
 }
 
 /// What one engine round produced about one task: the durable record, plus the
