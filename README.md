@@ -7,8 +7,8 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20%2F%20MCP%20Boundary-purple.svg?style=for-the-badge)](docs/PHASE0-FORENSICS.md)
-[![Tests](https://img.shields.io/badge/Tests-727%20Passed%20%2F%2014%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
-[![Status](https://img.shields.io/badge/Status-Phases%201--3%2C%205--7%2C%2010--14%20Complete-success.svg?style=for-the-badge)](docs/)
+[![Tests](https://img.shields.io/badge/Tests-850%2B%20Passed%20%2F%2014%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
+[![Status](https://img.shields.io/badge/Status-Phases%201--26%20Complete-success.svg?style=for-the-badge)](docs/)
 
 **A vendor-independent orchestration brain for multi-agent software engineering.**
 
@@ -427,6 +427,48 @@ A task is never made eligible by rewriting what Orqyn is executing against:
 `resume` does not replan, reactivate, or supersede a plan to reach a task, and it
 refuses a task its plan does not name.
 
+### Inspecting handoff records
+
+The `handoffs` subcommand lists the persisted handoff records for a task.
+It is **read-only** — it launches no agent, writes no record, and accepts no
+handoff. Use it to audit who took over a task, why, and whether the snapshot
+still matches the current state.
+
+```bash
+orqynn handoffs --repo /path/to/your/repo --task-id AUTH
+```
+
+Output includes the handoff ID, the `from_agent → to_agent` transfer, the
+recorded `HandoffCause` (or "unknown - not established from persisted records"
+when the store could not prove one), the state (`Open` or `Accepted`), the
+creation timestamp, acceptance details, provenance (`source_checkpoint` +
+`source_task_version`), and a current-ness judgement against the task as it
+stands now.
+
+```text
+2 handoff record(s) for task AUTH in project PROJ-1
+
+  HO-AUTH-0
+    from AGENT-1  ->  to AGENT-2
+    cause: displaced while active by another agent
+    state: Accepted
+    created: 2026-10-19T14:23:12Z
+    accepted: 2026-10-19T14:23:15Z by session SESS-ASG-AUTH-2-2
+    source: checkpoint CHK-AUTH-3 at task version 5
+    snapshot: matches the task as it stands now
+    narrative: 0 open question(s), 2 next step(s), 3 file(s) touched (not shown)
+
+  HO-AUTH-1
+    from AGENT-2  ->  to AGENT-3
+    cause: reclaimed after the previous lease expired
+    state: Open
+    created: 2026-10-19T15:41:03Z
+    accepted: not yet accepted
+    source: task version 7, but NO checkpoint was recorded - provenance unavailable
+    snapshot: STALE - context only; current state comes from the recovery package
+    narrative: 1 open question(s), 3 next step(s), 0 file(s) touched (not shown)
+```
+
 ### A local-only example
 
 No external memory, no network substrate. Point it at any git repository:
@@ -527,8 +569,6 @@ orqynn run --repo . --task "..." --check "..." --db ./.orqynn/new.db
   appended lines, not a structured field. It is deterministic and auditable, but
   querying "which tasks does this plan cover" means reading `task_ids` rather
   than parsing prose.
-- **No handoff.** `HandoffAdapter` is not wired into the CLI; cross-agent
-  continuation is not available through this command.
 - **No automatic scope planning.** The task is exactly what `--task` says.
 - Exit code 4 covers both "the agent could not start" and "the agent reported an
   error".
@@ -776,6 +816,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | **12** | **Checkpointing & Recovery Context** | `checkpoint::checkpoint_round` derives evidence-backed checkpoints inside OBSERVE; `recovery::RecoveryBuilder` assembles a replacement agent's continuation package in one place, and SCHEDULE attaches it. | ✅ Complete |
 | **13** | **Deterministic Conflict Detection** | Normalized `scope_paths` compared as path prefixes; SCHEDULE refuses overlapping pairings and ASSIGN refuses the handoff, naming the task in the way and the ground in dispute. An undeclared scope is treated as unrestricted, not empty. | ✅ Complete |
 | **14** | **Recorded Events & Explicit Blockers** | VERIFY records the commands it ran and the exit codes it read as actions in the same transaction as the verdict, so the recovery log is a record of work rather than of claims, and a verdict can no longer outlive its actions. `actions_incomplete` remains as a canary for rows written by an older build. Blocker lifecycle becomes an explicit, replay-safe, contradiction-refusing operation, and an open blocker decides the resume verdict without mutating task status. | ✅ Complete |
+| **19** | **Handoff Persistence** | Displacement and lease-expiry handoffs recorded atomically with assignment in the same transaction. `HandoffCause::Displaced` and `HandoffCause::LeaseExpiredReclaimed` proven from persisted tenures. Staleness detection via `source_checkpoint` + `source_task_version`. | ✅ Complete |
+| **20** | **Plan-Membership Guard** | Transaction-level check in `assign_task`/`assign_and_start` re-reads the project's active plan inside the write lock, preventing assignments under a superseded plan. | ✅ Complete |
+| **21** | **Agent Harness Driver** | `HarnessDriver` trait + `ClaudeCodeDriver` with bounded timeouts, stderr capture, transport poisoning, output limits. Verification runs independently after drive. | ✅ Complete |
+| **22** | **MCP Transport Hardening** | Per-phase timeouts (handshake, tool_call, write, shutdown), JSON-RPC error codes preserved, transport poisoning on timeout/parse failure, stderr tail bounded and separate from protocol stream. | ✅ Complete |
+| **23** | **AI-Memory Retrieval & Continuation** | `retrieve_checkpoints` with task-association verification (path + dual-tag), briefing enrichment via `render_with_external`, `Continuation` assembles authoritative state + narrative + external copy. | ✅ Complete |
+| **24** | **Atomic Verification** | `apply_verification_with_actions` commits verdict, task move, history row, and observed actions in one SQLite transaction. Eliminates the "verdict without actions" window. | ✅ Complete |
+| **25** | **Store-Allocated IDs** | `assign_and_start_next`, `create_blocker_next` derive IDs from task's persisted history inside the write transaction. Cross-runner and cross-process collision-proof. | ✅ Complete |
+| **26** | **CLI & Plan Extension** | `orqynn run | resume | handoffs` with full lifecycle. Plan extension via `append_task_to_plan` adds tasks without supersession. Deterministic task IDs, dry-run, remediation authorization. | ✅ Complete |
 
 ---
 
