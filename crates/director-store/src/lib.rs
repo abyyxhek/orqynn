@@ -79,7 +79,7 @@ use std::path::Path;
 
 use director_domain::assignment::AgentAssignment;
 use director_domain::decision::Decision;
-use director_domain::ids::{AgentId, AssignmentId, PlanId, TaskId};
+use director_domain::ids::{AgentId, AssignmentId, PlanId, ProjectId, RepositoryId, TaskId};
 use director_domain::plan::Plan;
 use director_domain::session::AgentSession;
 use director_domain::task::Task;
@@ -452,6 +452,52 @@ impl Store {
             &self.pool,
             verification,
             actions,
+            expected_task_version,
+            now,
+        )
+        .await
+    }
+
+    /// [`Self::apply_verification_with_actions`], with the verification id
+    /// allocated inside the write transaction instead of chosen by the caller.
+    ///
+    /// This is the operation the verification engine reaches for when it has a
+    /// verdict to land and no id to name it with. The ordinal is counted on the
+    /// transaction that inserts it, under the reserved write lock, so two
+    /// concurrent rounds of one task cannot read the same count and cannot
+    /// collide. A caller that has an id it means to keep should keep using
+    /// [`Self::apply_verification_with_actions`].
+    ///
+    /// `actions_for` receives the verification as this transaction will store
+    /// it, so the actions it builds are keyed on the id that was actually
+    /// allocated — an action id embeds its verification's
+    /// (`ACT-{verification}-{n}`), and that id is not known before the
+    /// allocation.
+    #[allow(clippy::too_many_arguments)] // the verdict's fields, one per — the shape `Verification::new` takes
+    pub async fn apply_verification_with_actions_next<F>(
+        &self,
+        task_id: &TaskId,
+        project_id: &ProjectId,
+        repository_id: Option<RepositoryId>,
+        status: director_domain::verification::VerificationStatus,
+        evidence: Vec<director_domain::verification::Evidence>,
+        head_commit: Option<String>,
+        actions_for: F,
+        expected_task_version: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(Verification, Task), StoreError>
+    where
+        F: FnOnce(&Verification) -> Vec<director_domain::action::Action>,
+    {
+        verifications::apply_verification_with_actions_next(
+            &self.pool,
+            task_id,
+            project_id,
+            repository_id,
+            status,
+            evidence,
+            head_commit,
+            actions_for,
             expected_task_version,
             now,
         )

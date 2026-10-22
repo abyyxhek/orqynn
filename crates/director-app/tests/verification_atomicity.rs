@@ -859,6 +859,54 @@ async fn a_failing_check_commits_its_action_with_the_verdict() {
     assert_eq!(task.status, TaskStatus::Failed);
 }
 
+/// 10. Concurrent rounds of one task each land their own verification id.
+///
+/// The engine no longer names a verdict before it writes one: the id is
+/// allocated inside the store's write transaction. Two `Unverifiable` rounds
+/// of the same task move nothing, so both must commit, each with its own row —
+/// and the actions of a round that *does* decide are keyed on the id that was
+/// actually allocated, which `a_successful_verification_commits_its_actions`
+/// pins on the other side.
+///
+/// Before the id moved into the transaction, both rounds read the task's
+/// judgment count before either wrote, both derived the same `VER-BROKEN-1`,
+/// and the round that lost the write died on the primary key — history Orqyn
+/// tried to keep, lost to nothing but a name. The `in_parallel` barrier only
+/// stops either round getting a head start; the assertion is that *both*
+/// rounds land, which no ordering of the two can make false now.
+#[test]
+fn concurrent_unverifiable_rounds_land_distinct_verifications() {
+    let (first, second, verifications) = run(async {
+        let mut fx = Fixture::new().await;
+        fx.prepared(&[("BROKEN", UNRUNNABLE)]).await;
+        fx.to_verification_pending("BROKEN").await;
+
+        let project = fx.project.clone();
+        let (first, second) = in_parallel(
+            || run(fx.runner().verify_at(&project, pinned())),
+            || run(fx.runner().verify_at(&project, pinned())),
+        );
+        (
+            first.map(|_| ()),
+            second.map(|_| ()),
+            fx.verification_ids("BROKEN").await,
+        )
+    });
+
+    assert!(
+        first.is_ok() && second.is_ok(),
+        "both rounds land, each keeping its own judgment: {first:?} / {second:?}"
+    );
+    let mut ids = verifications;
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["VER-BROKEN-1".to_string(), "VER-BROKEN-2".to_string()],
+        "each round wrote its own row, continuing the sequence — no collision, \
+         and no judgment refused for the name it happened to take"
+    );
+}
+
 /// Two criteria in one round produce two actions, ordered by ordinal, on one
 /// transaction — and equal timestamps do not make that order arbitrary.
 #[tokio::test]

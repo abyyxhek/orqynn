@@ -81,13 +81,13 @@
 use std::path::Path;
 
 use director_domain::action::{Action, ActionKind};
-use director_domain::ids::{ActionId, ProjectId, RepositoryId, TaskId, VerificationId};
+use director_domain::ids::{ActionId, ProjectId, RepositoryId, TaskId};
 use director_domain::providers::{CommandSpec, ExecutionProvider};
 use director_domain::task::Task;
 use director_domain::verification::{
     Evidence, EvidenceStatus, Probe, ProbeKind, Verification, VerificationStatus,
 };
-use director_domain::{Id, ProjectStateRepository, VerificationRepository};
+use director_domain::ProjectStateRepository;
 use director_store::Store;
 
 /// Run the engine for one task: resolve the probes its plan names, gather their
@@ -146,30 +146,43 @@ where
     let status = judge(&evidence);
     let (repository_id, head_commit) = observed_state(store, &project_id).await?;
 
-    let verification = Verification::new(
-        next_verification_id(store, &task.id).await?,
-        task.id.clone(),
-        project_id,
-        repository_id,
-        status,
-        evidence,
-        head_commit,
-        now,
-    );
-
-    // The observations this round produced, built here rather than by the caller
-    // because only this function has both the probe outcomes and the verdict's
-    // identity — and the actions have to be *inside* the write that persists the
-    // verdict. A caller that built them afterwards could only ever append them in
-    // a second transaction, which is the window this removes.
-    let actions = observed_actions(&verification, &outcomes, now);
-
-    // The verdict lands atomically with the task's move, the history row, and the
-    // actions recording what it ran.
+    // The verdict, its identity, and the observations behind it are landed by
+    // the store in one transaction: the verification row, the task's status
+    // move, the transition that records the move, and the actions — all or
+    // nothing.
+    //
+    // The *id* is allocated inside that transaction rather than chosen here. A
+    // caller choosing one has to count the task's existing judgments to pick a
+    // free ordinal, and that count read outside the write is a guess: two
+    // concurrent rounds read the same length, build the same `VER-{task}-{n}`,
+    // and one is refused by the primary key — a judgment lost to a naming
+    // collision. Nothing about the verdict was wrong, only its name. The store
+    // counts under the reserved write lock, so the ordinal and the insert that
+    // consumes it cannot be separated by a competing round.
+    //
+    // The observations are built from the record the store allocated, not from
+    // one this function invented, because an action id embeds its verification's
+    // id (`ACT-{verification}-{n}`). Taking a builder is what keeps the keying
+    // on the right side of the transaction boundary.
+    //
     // The version the engine presents is the one the caller read, because that
-    // is the task the evidence describes.
+    // is the task the evidence describes: a task that moved under the round is
+    // refused with a `StateVersionConflict` rather than re-judged, and nothing
+    // is left behind — the row, the move, and the observations commit together
+    // or not at all.
+    let outcomes_for_actions = &outcomes;
     let (stored, _) = store
-        .apply_verification_with_actions(&verification, &actions, task.state_version, now)
+        .apply_verification_with_actions_next(
+            &task.id,
+            &project_id,
+            repository_id,
+            status,
+            evidence,
+            head_commit,
+            |verification| observed_actions(verification, outcomes_for_actions, now),
+            task.state_version,
+            now,
+        )
         .await?;
 
     Ok(EngineRound {
@@ -562,33 +575,6 @@ async fn observed_state(
         return Ok((None, None));
     };
     Ok((state.repository_id, Some(state.head_commit)))
-}
-
-/// The id the next verification of this task will carry.
-///
-/// A verification is append-only history, so the id has to be new every time
-/// without being random. It follows the same shape
-/// [`IdGenerator`](director_domain::ids::IdGenerator) mints everywhere else —
-/// `<PREFIX>-<key>-<n>`, here `VER-<task>-<n>` — where `n` counts the judgments
-/// already on record for this task. The task id is globally unique, so the
-/// combination is too, which is what keeps a re-judgment from colliding with
-/// the row it is deliberately not replacing. Reading the count from the store
-/// rather than a per-process counter is what makes the id right after a restart
-/// as well as within one tick.
-async fn next_verification_id(
-    store: &Store,
-    task: &TaskId,
-) -> Result<VerificationId, VerifyTaskError> {
-    let already = store
-        .verifications()
-        .verifications_for_task(task)
-        .await?
-        .len();
-    Ok(VerificationId::from_string(format!(
-        "{}-{task}-{}",
-        VerificationId::PREFIX,
-        already + 1
-    )))
 }
 
 /// Turn a check string into a command to run, in `working_dir`.
