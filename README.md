@@ -7,8 +7,8 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20%2F%20MCP%20Boundary-purple.svg?style=for-the-badge)](docs/PHASE0-FORENSICS.md)
-[![Tests](https://img.shields.io/badge/Tests-850%2B%20Passed%20%2F%2014%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
-[![Status](https://img.shields.io/badge/Status-Phases%201--26%20Complete-success.svg?style=for-the-badge)](docs/)
+[![Tests](https://img.shields.io/badge/Tests-1%2C049%20Passing%20%2F%2019%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
+[![Status](https://img.shields.io/badge/Status-Core%20Complete%20%C2%B7%20One--Shot%20CLI-success.svg?style=for-the-badge)](docs/)
 
 **A vendor-independent orchestration brain for multi-agent software engineering.**
 
@@ -20,14 +20,14 @@
 
 ## Project Description
 
-**Orqyn** is an autonomous, vendor-agnostic orchestration brain built in pure Rust for coordinating multi-agent software engineering teams. 
+**Orqyn** is a vendor-agnostic orchestration brain built in pure Rust for coordinating multi-agent software engineering teams.
 
 Modern coding agents (such as Claude Code, OpenAI Codex, DeepSeek, Cursor, Goose, Devin, OpenCode, and Aider) are exceptional at local syntax generation, refactoring, and code comprehension. Concurrently, specialized tool servers like [handoff-mcp](https://github.com/alphaelements/handoff-mcp) and [ai-memory](https://github.com/akitaonrails/ai-memory) provide persistence backends for session logs and vector/FTS knowledge graphs.
 
 However, existing multi-agent systems suffer from a critical architectural void: **no layer acts as an objective, supervisory brain.** 
 
 Orqyn fills this gap. Sitting **above** the coding agents and **beside** memory/task substrates, Orqyn acts as an authoritative control engine that:
-1. **Decomposes and validates objectives** into mathematically verified Directed Acyclic Graphs (DAGs).
+1. **Validates and orders a plan's tasks** into a verified Directed Acyclic Graph (DAG) — the caller names the tasks and their dependencies; Orqyn rejects invalid graphs and computes the execution order (see [Current limitations](#current-limitations): Orqyn does not decompose an objective into tasks itself).
 2. **Dispatches work via time-limited, heartbeat-monitored leases** using an intelligent multi-agent matchmaker.
 3. **Reclaims stranded work automatically** when an agent crashes, hangs, or disappears.
 4. **Independently verifies completed work** using isolated, machine-checked test probes—completely eliminating hallucinated "I am done" declarations.
@@ -73,7 +73,7 @@ Orqyn communicates with all external substrates **exclusively over Model Context
 
 | Failure Mode | Traditional Multi-Agent Setups | The Orqyn Solution |
 |---|---|---|
-| **1. Self-Reported Completion** | Agents mark tasks "Done" after generating code, even when unit tests fail or code does not compile. | **Objective Machine Probes**: `TaskStatus::Done` is unreachable by agent reports. Orqyn executes commands and test suites independently, reading exit codes directly. |
+| **1. Self-Reported Completion** | Agents mark tasks "Done" after generating code, even when unit tests fail or code does not compile. | **Objective Machine Probes**: `TaskStatus::Done` is unreachable by agent reports. Orqyn executes the check commands itself and reads the exit codes directly (see [Current limitations](#current-limitations): only the command probe kind is implemented today). |
 | **2. The Vanished Agent** | If an agent process crashes or loses its network connection, its assigned task is orphaned indefinitely. | **Heartbeat Lease Reclamation**: Assignments carry time-to-live leases. A silent agent loses its lease; the session is recorded as `vanished`, and the task returns to `todo`. |
 | **3. Dependency Deadlocks** | Unchecked task lists result in circular blockers, missing prerequisite artifacts, or race conditions between parallel agents. | **Acyclic Graph (DAG) Engine**: Plans are validated for cycles, external references, and self-dependencies using Kahn's topological sort before atomic activation. |
 | **4. Substrate Lock-in** | Orchestrators compile directly against specific memory or task libraries, creating rigid vendor lock-in. | **Zero Substrate Coupling**: Everything communicates across standard MCP JSON-RPC boundaries. Boundary tests fail the build if internal structs are imported. |
@@ -96,14 +96,14 @@ A task represents a unit of work that outlives any single agent assigned to it.
 ### 2. Zero Self-Reported Completion (Machine-Checked Verification)
 `TaskStatus::Done` is **unreachable** through an agent's self-report.
 - An agent completing its work moves a task to `VerificationPending`, never `Done`.
-- Only Orqyn's independent `VERIFY` engine can mark a task complete by executing machine-checkable probes (e.g. exit codes, test suites, deterministic diff checks) via its isolated `ExecutionProvider`.
+- Only Orqyn's independent `VERIFY` engine can mark a task complete by executing machine-checkable probes via its isolated `ExecutionProvider`. Today the only implemented probe kind is a command run for its exit code; the `TestSuite`, `Diff`, and `File` probe kinds are modelled in the domain but not implemented, and are answered `Unverifiable` (see [Current limitations](#current-limitations)).
 - If an agent claims work is done but checks fail, the task transitions to `Failed` and triggers remediation in `REPLAN`.
 
 ### 3. Deterministic & Acyclic Graph Planning
 Task dependencies form a strict Directed Acyclic Graph (DAG).
 - The planner validates and rejects self-dependencies, references to external tasks, and cyclical dependency graphs.
 - Tasks are ordered deterministically using Kahn’s topological sort with caller-order tie-breaking.
-- Plan creation, task decomposition, and activation execute in a single atomic database transaction.
+- Plan creation and activation execute in a single atomic database transaction. Decomposition is the caller's job: PLAN validates the task specs it is handed, computes their order, and persists the plan — it never invents tasks.
 
 ### 4. Lease-Based Scheduling with Automatic Stale Reclamation
 Agent assignments operate under time-limited leases backed by active heartbeats.
@@ -198,7 +198,7 @@ flowchart TD
  │   (SQLite persistence)  │   │                    ▼                │   │
  └─────────────────────────┘   │   ┌─────────────────────────────────┐   │
                                │   │  director-domain                │   │
- ┌─────────────────────────┐   │   │  • Entities & 17 Newtype IDs    │   │
+ ┌─────────────────────────┐   │   │  • Entities & 16 Newtype IDs    │   │
  │   director-adapters     │───┼──>│  • Acyclic Graph Topo-Sort      │   │
  │   (MCP & Execution)     │   │   │  • Provider Trait Definitions   │   │
  └─────────────────────────┘   │   └────────────────┬────────────────┘   │
@@ -239,7 +239,7 @@ orqyn/
 │   ├── director-store/        # Embedded SQLite store:
 │   │                          # • Checkpoints, Plans, Tasks, Assignments, Verifications
 │   │                          # • Optimistic concurrency versioning & partial unique indexes
-│   │                          # • Embedded schema migrations (0001 - 0003)
+│   │                          # • Embedded schema migrations (0001 - 0006)
 │   │
 │   └── director-app/          # Control loop orchestration:
 │                              # • Modules: observe, plan, schedule, assign, monitor,
@@ -269,8 +269,14 @@ cd orqynn
 # Build all workspace crates
 cargo build
 
-# Run the complete test suite (727 tests pass; 14 live-MCP tests are #[ignore]d
-# because they spawn real `handoff-mcp` / `ai-memory` server binaries)
+# Run the complete test suite. Measured 2026-10-24 at commit 84305e6:
+#   cargo test --workspace                ->  1,049 passed / 0 failed / 19 ignored
+#   (CI runs the same suite split: --all-targets gives 1,046; --doc gives 3)
+# These numbers are a manual snapshot, not generated from CI — re-run the
+# command and update them. 17 of the 19 ignored tests need a real substrate
+# (a `handoff-mcp` binary, an `ai-memory` binary, or an authenticated `claude`
+# CLI); the other 2 are child-process harnesses the process-kill tests spawn
+# explicitly rather than tests in their own right.
 cargo test --workspace
 
 # The same four gates CI runs on every push (see .github/workflows/ci.yml)
@@ -558,6 +564,30 @@ orqynn run --repo . --task "..." --check "..." --db ./.orqynn/new.db
 
 ### Current limitations
 
+- **One-shot CLI, not a daemon.** `orqynn` runs exactly one lifecycle per
+  invocation (`run`, `resume`, or `handoffs`) and exits. There is no loop driver
+  that ticks OBSERVE → … → REPLAN on an interval, no signal handling, no agent
+  pool supervision, and no autonomous scheduling loop. MONITOR's lease
+  reclamation runs within a lifecycle, not continuously in the background.
+- **Orqyn is an MCP client, not an MCP server.** Orqyn speaks stdio JSON-RPC to
+  `handoff-mcp` and `ai-memory` as a client. There is no Orqyn MCP server
+  surface, so other agents cannot drive Orqyn's loop over MCP. One adapter
+  instance also presents a single agent identity to a substrate — the
+  multi-identity pool once labelled "Phase 8" was never built.
+- **Only `Probe::Command` is implemented.** The `TestSuite`, `Diff`, and `File`
+  probe kinds exist in the domain model, but `run_probe` answers each with
+  `Unverifiable` and the note "this probe kind is not implemented yet". A check
+  that is not a plain command cannot be judged today.
+- **PLAN does not decompose objectives.** The caller supplies every task and
+  dependency; PLAN validates the graph and computes the order. See the note on
+  "No automatic scope planning" below — the task is exactly what `--task` says.
+- **Live-agent execution is not validated.** The 17 tests that need a real
+  substrate (10 `ai-memory`, 5 `handoff-mcp`, 2 that drive the real `claude`
+  CLI) are `#[ignore]d` and have not been run; no authenticated agent session
+  was available to validate against. The full lifecycle, the verification
+  engine, and crash recovery are validated offline only — deterministic fake
+  agents, real local commands, and real process-kill tests. Power-loss
+  durability is not claimed (SQLite `synchronous=NORMAL`).
 - **No automatic reconnection or retries.** A failed MCP transport, a crashed
   agent, or a timed-out check ends the run. `orqynn resume` recovers a task by
   decision, but it never retries on its own initiative.
@@ -824,6 +854,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | **24** | **Atomic Verification** | `apply_verification_with_actions` commits verdict, task move, history row, and observed actions in one SQLite transaction. Eliminates the "verdict without actions" window. | ✅ Complete |
 | **25** | **Store-Allocated IDs** | `assign_and_start_next`, `create_blocker_next` derive IDs from task's persisted history inside the write transaction. Cross-runner and cross-process collision-proof. | ✅ Complete |
 | **26** | **CLI & Plan Extension** | `orqynn run | resume | handoffs` with full lifecycle. Plan extension via `append_task_to_plan` adds tasks without supersession. Deterministic task IDs, dry-run, remediation authorization. | ✅ Complete |
+
+### Numbering gaps — read this before counting phases
+
+The phase numbers are **not contiguous**, and a "Phases 1–26" badge would
+misrepresent the roadmap. The table above documents 20 phases; the numbers in
+between were never built, or were absorbed elsewhere:
+
+- **Phase 4** has no document and no roadmap row because it was folded into
+  Phase 5 — the checkpoint/persistence slice it named shipped inside the Phase 5
+  store work, and its doc comments still survive in
+  `crates/director-domain/src/store.rs` ("Phase 4 stored the durable
+  foundation") and `crates/director-domain/src/checkpoint.rs`. It is finished
+  work, not missing work.
+- **Phase 8** was named once — "the pool that manages several identities is
+  Phase 8" in [`docs/PHASE2-ADAPTERS.md`](docs/PHASE2-ADAPTERS.md) — and was
+  never delivered. One adapter instance still speaks as one agent identity (see
+  Current limitations).
+- **Phase 9** was named in [`docs/PHASE0-FORENSICS.md`](docs/PHASE0-FORENSICS.md)
+  ("Control flow (Phase 9 onwards)") as a recent-context engine. The
+  `RecentContext` type it described *was* built
+  (`crates/director-domain/src/context.rs`): a bounded window that compacts
+  from the front and promotes errors, reconstructed by `RecoveryBuilder` from
+  the persisted `task_actions` table whenever a replacement is briefed. What
+  was never delivered is the standalone engine as its own phase: no roadmap
+  row and no `docs/PHASE9.md` — the window is a component of recovery, not a
+  step of the loop.
+- **Phases 15–18** are planned milestones named by the project's own audits
+  ([`ORQYNN_PROJECT_AUDIT_20261016.md`](ORQYNN_PROJECT_AUDIT_20261016.md)):
+  PLAN decomposition and advanced scheduling (15), a policy/decision engine
+  (16), the multi-identity provider pool merged with the dangling Phase 8
+  (17), and the daemon plus Orqyn MCP server (18). None of that functionality
+  exists: there is no decomposition, no policy layer, no pool, no daemon, and
+  no MCP server. The only traces of the numbers in this tree are labels, not
+  features — `SessionEnd::ContextExhausted` carries a "(Phase 17)" comment
+  over an implemented enum variant (compaction itself is not built), and one
+  test comment in `crates/director-app/tests/receive_handoff.rs` recalls
+  "Phase 16.1" as the round a fault-induction technique was established. The
+  daemon and MCP server are the largest of the missing four: their absence is
+  why the status badge reads "One-Shot CLI".
+
+No phase after 13 has a `docs/PHASE*.md` document: Phases 14–26 are recorded
+only in the table above, and working reports numbered 33–35 exist as untracked
+files at the repository root but are not part of the documented series. The
+roadmap above is the complete evidence-supported status.
 
 ---
 

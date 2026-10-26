@@ -78,10 +78,12 @@ jobs:
       - name: Gate 4b - cargo test --workspace --doc
         run: cargo test --workspace --doc
 
-      # NOTE: the 13 live MCP tests (8 ai-memory + 5 handoff) are deliberately
+      # NOTE: the 15 live MCP tests (10 ai-memory + 5 handoff) are deliberately
       # NOT run here. They are marked #[ignore] because they spawn real
       # `handoff-mcp` and `ai-memory` server binaries, which this workflow does
-      # not install. They are still type-checked above, because
+      # not install. Two further #[ignore]d suites (2 tests driving the real
+      # `claude` CLI) and 2 child-process harness functions are skipped for the
+      # same reason. They are still type-checked above, because
       # --all-targets compiles every integration target including the ignored
       # ones. Running them requires those two binaries on PATH; see
       # docs/PHASE2-ADAPTERS.md and docs/PHASE3-MEMORY.md.
