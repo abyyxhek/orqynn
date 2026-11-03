@@ -6,9 +6,13 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
-[![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20%2F%20MCP%20Boundary-purple.svg?style=for-the-badge)](docs/PHASE0-FORENSICS.md)
-[![Tests](https://img.shields.io/badge/Tests-1%2C049%20Passing%20%2F%2019%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
-[![Status](https://img.shields.io/badge/Status-Core%20Complete%20%C2%B7%20One--Shot%20CLI-success.svg?style=for-the-badge)](docs/)
+[![CI](https://github.com/abyyxhek/orqynn/actions/workflows/ci.yml/badge.svg)](https://github.com/abyyxhek/orqynn/actions/workflows/ci.yml)
+[![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20%2F%20MCP%20Client-purple.svg?style=for-the-badge)](docs/PHASE0-FORENSICS.md)
+<!-- Manually maintained snapshot of a local run, dated 2026-10-27. Not wired to
+     CI: refresh it by running `cargo test --workspace` and editing this badge.
+     The live build status is the CI badge above. -->
+[![Tests](https://img.shields.io/badge/Tests-1%2C050%20Passing%20%2F%2019%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
+[![Status](https://img.shields.io/badge/Status-Core%20Loop%20Complete%20%C2%B7%20One--Shot%20CLI-success.svg?style=for-the-badge)](#)
 
 **A vendor-independent orchestration brain for multi-agent software engineering.**
 
@@ -69,7 +73,7 @@ Orqyn communicates with all external substrates **exclusively over Model Context
 
 ## Why Orqyn?
 
-### The 6 Failure Modes of Autonomous Multi-Agent Coding
+### The 7 Failure Modes of Autonomous Multi-Agent Coding
 
 | Failure Mode | Traditional Multi-Agent Setups | The Orqyn Solution |
 |---|---|---|
@@ -184,37 +188,46 @@ flowchart TD
 
 ## Architecture
 
+Hexagonal layering: `director-domain` holds the model and the provider traits,
+everything else is an adapter or an application over it. The edges below are the
+workspace's real `path` dependencies — nothing reaches outside the workspace
+except `director-adapters`, which is the only crate allowed to talk to another
+process.
+
+```mermaid
+flowchart TD
+    subgraph workspace ["Orqyn workspace (five crates)"]
+        cli["<b>orqynn</b><br/>the CLI binary: run · resume · handoffs"]
+        app["<b>director-app</b><br/>the control loop: observe, plan, schedule,<br/>assign, monitor, verify, replan,<br/>checkpoint, recovery"]
+        adapters["<b>director-adapters</b><br/>in-memory fixtures · local executor ·<br/>git observer · agent harness driver · MCP clients"]
+        store["<b>director-store</b><br/>SQLite repositories<br/>+ migrations 0001–0006"]
+        domain["<b>director-domain</b><br/>entities, state machines,<br/>16 newtype IDs, provider traits"]
+        cli --> app
+        app --> adapters
+        app --> store
+        app --> domain
+        adapters --> domain
+        store --> domain
+    end
+
+    store -->|"embedded"| sqlite[("SQLite<br/>orqynn.db")]
+    adapters -->|"MCP client (stdio JSON-RPC)"| hmcp["handoff-mcp<br/>separate process"]
+    adapters -->|"MCP client (stdio JSON-RPC)"| aimem["ai-memory<br/>separate process"]
+    adapters -->|"spawns as a subprocess, per task"| agent["agent binary<br/>(claude by default)"]
+
+    classDef outside fill:#f0f0f0,stroke:#999,stroke-dasharray: 5 5
+    class hmcp,aimem,agent,sqlite outside
 ```
-                               ┌─────────────────────────────────────────┐
-                               │             ORQYN CORE                  │
-                               │                                         │
- ┌─────────────────────────┐   │   ┌─────────────────────────────────┐   │
- │   director-app          │───┼──>│  Control Loop Engine            │   │
- │   (Loop orchestration)  │   │   │  • observe   • schedule         │   │
- └─────────────────────────┘   │   │  • plan      • monitor          │   │
-                               │   │  • assign    • verify / replan  │   │
- ┌─────────────────────────┐   │   └────────────────┬────────────────┘   │
- │   director-store        │───┼────────────────────┼────────────────┐   │
- │   (SQLite persistence)  │   │                    ▼                │   │
- └─────────────────────────┘   │   ┌─────────────────────────────────┐   │
-                               │   │  director-domain                │   │
- ┌─────────────────────────┐   │   │  • Entities & 16 Newtype IDs    │   │
- │   director-adapters     │───┼──>│  • Acyclic Graph Topo-Sort      │   │
- │   (MCP & Execution)     │   │   │  • Provider Trait Definitions   │   │
- └─────────────────────────┘   │   └────────────────┬────────────────┘   │
-                               └────────────────────┼────────────────────┘
-                                                    │
-                                  ┌─────────────────┴─────────────────┐
-                                  ▼                                   ▼
-                      ┌───────────────────────┐           ┌───────────────────────┐
-                      │    HandoffAdapter     │           │    AiMemoryAdapter    │
-                      │  (Task, Agent,        │           │  (Durable Memory &    │
-                      │   Session Provider)   │           │   Graph Retrieval)    │
-                      └───────────┬───────────┘           └───────────┬───────────┘
-                                  │ JSON-RPC                          │ JSON-RPC
-                                  ▼                                   ▼
-                            handoff-mcp                           ai-memory
-```
+
+Dashed nodes are outside the compiled workspace. Orqyn is a **client** on both
+MCP transports and a **parent process** of the agent binary — there is no Orqyn
+MCP server surface and no inbound transport (see [Current
+limitations](#current-limitations)).
+
+The boundary is enforced by a test, not by convention:
+`crates/director-adapters/tests/boundary.rs` fails the build if any crate other
+than `director-adapters` references a substrate identifier or pulls a substrate
+dependency.
 
 ---
 
@@ -252,6 +265,41 @@ orqyn/
 
 ---
 
+## Feature Matrix
+
+Status is read off the implementation, not the phase numbers. The third column
+names the test file or source module that puts each row where it is.
+
+| Capability | Status | Where the status comes from |
+|---|---|---|
+| 7-step control loop (observe → plan → schedule → assign → monitor → verify → replan) | ✅ Implemented | `director-app/src/{observe,plan,schedule,assign,monitor,verify,replan}.rs`, driven end to end by `tests/end_to_end.rs` |
+| SQLite persistence with schema migrations | ✅ Implemented | `director-store/src/migrations.rs`, six embedded migrations `0001`–`0006`, applied on open |
+| Optimistic concurrency (versioned compare-and-set) | ✅ Implemented | `store.rs` `state_version` CAS; contested-write regressions in `tests/assign_concurrency.rs`, `tests/verification_atomicity.rs` |
+| Crash survival & process-kill recovery | ✅ Implemented | real process-kill tests: `director-app/tests/process_kill.rs`, `tests/runtime_recovery.rs`, `director-store/tests/displacement_kill.rs` |
+| Checkpointing of in-flight work from git evidence | ✅ Implemented | `director-app/src/checkpoint.rs`; lineage regressions in `tests/checkpoint_lineage.rs` |
+| Recovery briefing for a replacement agent | ✅ Implemented | `director-app/src/recovery.rs`; `tests/recovery_builder.rs` |
+| Recorded verification actions (commands Orqyn ran, exit codes it read) | ✅ Implemented | `tests/recorded_events.rs`, `tests/action_ordering.rs`, `tests/action_reliability.rs` |
+| Lease-based scheduling with stale-session reclamation | ✅ Implemented | `director-app/src/schedule.rs`, `monitor.rs`; `tests/schedule.rs`, `tests/monitor.rs` |
+| Scope-conflict refusal (no two agents on the same ground) | ✅ Implemented | `tests/conflict.rs`; `docs/PHASE13-CONFLICT-DETECTION.md` |
+| Handoff persistence with provenance | ✅ Implemented | `director-store/tests/handoffs.rs`, `director-store/tests/displacement_handoff.rs`, `director-app/tests/receive_handoff.rs` |
+| Cross-process id allocation | ✅ Implemented | `tests/cross_runner_ids.rs`, `tests/assignment_ids.rs` |
+| MCP **client** for `handoff-mcp` (stdio JSON-RPC) | ✅ Implemented | `director-adapters/src/handoff/adapter.rs`; live suite `tests/handoff_live.rs` (#[ignore]d) |
+| MCP **client** for `ai-memory` (stdio JSON-RPC) | ✅ Implemented | `director-adapters/src/aimemory/adapter.rs`; live suite `tests/aimemory_live.rs` (#[ignore]d) |
+| Agent harness driver (Claude Code subprocess) | ⚠️ Implemented, **live run unvalidated** | `director-adapters/src/harness/claude.rs`, `tests/harness_driver.rs` (offline fixture); the 2 tests driving the real `claude` CLI are #[ignore]d and have not been run in this tree |
+| MCP **server** (other agents driving Orqyn over MCP) | ❌ Not implemented | No inbound transport exists anywhere in the workspace; Orqyn is a client only |
+| Daemon / background loop mode | ❌ Not implemented | `orqynn` is one-shot: one lifecycle per invocation |
+| Multi-identity agent pool (once "Phase 8") | ❌ Not implemented | One adapter instance speaks as one agent identity |
+| Automatic objective decomposition | ❌ Not implemented | `plan()` validates and orders caller-supplied tasks; it never invents them |
+| Probe kinds beyond `Command` | ❌ Modelled, not implemented | `TestSuite`, `Diff`, `File` are answered `Unverifiable` by `run_probe` (`director-app/src/engine.rs`) |
+| Power-loss durability | ❌ Not claimed | `synchronous=NORMAL` under WAL (`director-store/src/connection.rs`) buys crash safety, not power-loss safety |
+| Reconnection / automatic retry | ❌ Not implemented | A failed transport or agent ends the run; `resume` is an explicit decision |
+
+The two ⚠️/❌ rows that matter most in practice: nothing has ever driven a live,
+authenticated agent through this code, and no inbound MCP surface exists — so
+Orqyn today is a supervisor you invoke, not a service you subscribe to.
+
+---
+
 ## Quickstart
 
 ### Prerequisites
@@ -269,9 +317,10 @@ cd orqynn
 # Build all workspace crates
 cargo build
 
-# Run the complete test suite. Measured 2026-10-24 at commit 84305e6:
-#   cargo test --workspace                ->  1,049 passed / 0 failed / 19 ignored
-#   (CI runs the same suite split: --all-targets gives 1,046; --doc gives 3)
+# Run the complete test suite. Measured 2026-10-27 at HEAD (88fc846) on
+# Windows with the in-flight CLI usage work in the working tree:
+#   cargo test --workspace                ->  1,050 passed / 0 failed / 19 ignored
+#   (CI runs the same suite split: --all-targets gives 1,047; --doc gives 3)
 # These numbers are a manual snapshot, not generated from CI — re-run the
 # command and update them. 17 of the 19 ignored tests need a real substrate
 # (a `handoff-mcp` binary, an `ai-memory` binary, or an authenticated `claude`
@@ -385,7 +434,7 @@ recovery package, and then does exactly one of three things:
 | `in_progress` with an **active** assignment | **Refuses.** An agent already holds it; a second tenure would be two agents on the same ground. |
 | `blocked`, or an open blocker stands | **Refuses.** Clearing a blocker is a decision about the work. |
 | `done` or `cancelled` | **Refuses.** Terminal states are never silently reopened. |
-| Unknown task, or a broken premise | **Refuses**, naming what is missing. |
+| Unknown task, or a broken premise | **Refuses**, naming what is missing. This is a failed `LOAD` step and surfaces as exit code **3**, not the unsafe-state refusal of exit 8 — nothing is recovered because there is nothing to recover. |
 
 Resume never retries a task on its own initiative: without `--remediate` it
 reports what it found and changes nothing.
@@ -436,9 +485,12 @@ refuses a task its plan does not name.
 ### Inspecting handoff records
 
 The `handoffs` subcommand lists the persisted handoff records for a task.
-It is **read-only** — it launches no agent, writes no record, and accepts no
-handoff. Use it to audit who took over a task, why, and whether the snapshot
-still matches the current state.
+It is **read-only with respect to records** — it launches no agent, writes no
+handoff, and accepts nothing. One side effect remains: if no database exists at
+the `--db` path, opening the store creates it (and its sibling `git-state`
+directory) so the schema is in place. An existing database is not rewritten. Use
+it to audit who took over a task, why, and whether the snapshot still matches
+the current state.
 
 ```bash
 orqynn handoffs --repo /path/to/your/repo --task-id AUTH
@@ -903,9 +955,11 @@ roadmap above is the complete evidence-supported status.
 
 ## Documentation
 
-Comprehensive design specifications and architectural reports are available in the [`docs/`](docs/) directory:
+Comprehensive design specifications and architectural reports are available in the [`docs/`](docs/) directory. The phase documents are design specs; the `AUDIT-*` files are point-in-time engineering audits whose test counts and phase numbers describe the tree as it stood on their dated day, so read them as history rather than as current status.
 
 - [📄 PHASE0-FORENSICS.md](docs/PHASE0-FORENSICS.md) — Upstream substrate audit, tool surfaces, and boundary rules.
+- [📄 AUDIT-2026-09-30.md](docs/AUDIT-2026-09-30.md) — First full workspace audit; gates re-run from a clean build, live substrate suites executed.
+- [📄 AUDIT-2026-10-04.md](docs/AUDIT-2026-10-04.md) — Full architecture review with the same clean-build gates and live suites.
 - [📄 PHASE1-DOMAIN.md](docs/PHASE1-DOMAIN.md) — Pure domain entity specifications and invariant rules.
 - [📄 PHASE2-ADAPTERS.md](docs/PHASE2-ADAPTERS.md) — Stdio JSON-RPC client and `HandoffAdapter` mappings.
 - [📄 PHASE2-OBSERVATION.md](docs/PHASE2-OBSERVATION.md) — Git working tree observer and change event system.
