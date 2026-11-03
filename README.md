@@ -8,10 +8,10 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
 [![CI](https://github.com/abyyxhek/orqynn/actions/workflows/ci.yml/badge.svg)](https://github.com/abyyxhek/orqynn/actions/workflows/ci.yml)
 [![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20%2F%20MCP%20Client-purple.svg?style=for-the-badge)](docs/PHASE0-FORENSICS.md)
-<!-- Manually maintained snapshot of a local run, dated 2026-10-27. Not wired to
+<!-- Manually maintained snapshot of a local run, dated 2026-11-03. Not wired to
      CI: refresh it by running `cargo test --workspace` and editing this badge.
      The live build status is the CI badge above. -->
-[![Tests](https://img.shields.io/badge/Tests-1%2C050%20Passing%20%2F%2019%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
+[![Tests](https://img.shields.io/badge/Tests-1%2C066%20Passing%20%2F%2019%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
 [![Status](https://img.shields.io/badge/Status-Core%20Loop%20Complete%20%C2%B7%20One--Shot%20CLI-success.svg?style=for-the-badge)](#)
 
 **A vendor-independent orchestration brain for multi-agent software engineering.**
@@ -317,10 +317,10 @@ cd orqynn
 # Build all workspace crates
 cargo build
 
-# Run the complete test suite. Measured 2026-10-27 at HEAD (88fc846) on
-# Windows with the in-flight CLI usage work in the working tree:
-#   cargo test --workspace                ->  1,050 passed / 0 failed / 19 ignored
-#   (CI runs the same suite split: --all-targets gives 1,047; --doc gives 3)
+# Run the complete test suite. Measured 2026-11-03 at HEAD (c3243cf) on
+# Windows with the Phase 42 multi-agent coordination audit probes committed:
+#   cargo test --workspace                ->  1,066 passed / 0 failed / 19 ignored
+#   (CI runs the same suite split: --all-targets gives 1,063; --doc gives 3)
 # These numbers are a manual snapshot, not generated from CI — re-run the
 # command and update them. 17 of the 19 ignored tests need a real substrate
 # (a `handoff-mcp` binary, an `ai-memory` binary, or an authenticated `claude`
@@ -630,6 +630,19 @@ orqynn run --repo . --task "..." --check "..." --db ./.orqynn/new.db
   probe kinds exist in the domain model, but `run_probe` answers each with
   `Unverifiable` and the note "this probe kind is not implemented yet". A check
   that is not a plain command cannot be judged today.
+- **A late claim can drag a task back out of verification.** The Phase 42
+  multi-agent coordination audit ([`MULTI_AGENT_AUDIT.md`](MULTI_AGENT_AUDIT.md),
+  defect D1) reproduced that `assign_and_start` carries no task-status
+  precondition: a task one process already moved to `verification_pending` can
+  be moved back to `in_progress` by a claim from another, and the finished work
+  then never reaches VERIFY, with every caller told its write succeeded. The
+  same audit found that SQLite snapshot conflicts are reported to callers as
+  constraint violations rather than as retryable contention (D2), and that the
+  app layer's "refuse rather than displace" assignment promise does not survive
+  two callers racing (D3). The hard invariants held in every probe: exactly one
+  active assignment per task, no stale overwrite of newer state, and no
+  duplicate completion or verification. The audit's recommended Phase 43 (claim
+  legality and contention classification) is not started.
 - **PLAN does not decompose objectives.** The caller supplies every task and
   dependency; PLAN validates the graph and computes the order. See the note on
   "No automatic scope planning" below — the task is exactly what `--task` says.
@@ -948,8 +961,13 @@ between were never built, or were absorbed elsewhere:
 
 No phase after 13 has a `docs/PHASE*.md` document: Phases 14–26 are recorded
 only in the table above, and working reports numbered 33–35 exist as untracked
-files at the repository root but are not part of the documented series. The
-roadmap above is the complete evidence-supported status.
+files at the repository root but are not part of the documented series. The one
+later audit that *is* tracked is the Phase 42 multi-agent coordination audit,
+[`MULTI_AGENT_AUDIT.md`](MULTI_AGENT_AUDIT.md) at the repository root
+(2026-11-03): 15 barrier-driven concurrency probes over real SQLite files, whose
+confirmed defects are recorded under [Current limitations](#current-limitations)
+and whose recommended Phase 43 is not started. The roadmap above is the complete
+evidence-supported status.
 
 ---
 
