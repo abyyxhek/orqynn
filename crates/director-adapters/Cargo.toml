@@ -1,6 +1,6 @@
 [package]
 name = "director-adapters"
-description = "Provider adapters for Orqyn: an in-memory substrate for tests and local execution"
+description = "Provider adapters for Orqyn: in-memory fixtures for tests, local command execution, git-backed observation, an agent harness driver, and stdio MCP clients for handoff-mcp and ai-memory"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

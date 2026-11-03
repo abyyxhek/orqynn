@@ -43,7 +43,7 @@ mod lifecycle;
 use crate::config as cli_config;
 use crate::lifecycle as cli_lifecycle;
 
-use cli_config::{derive_task_id, ConfigError, MapEnv, RunArgs};
+use cli_config::{derive_task_id, Command as CliCommand, ConfigError, MapEnv, RunArgs};
 use cli_lifecycle::ExitCode;
 
 use director_domain::{ActionRepository, TaskRepository, VerificationRepository};
@@ -968,5 +968,45 @@ fn the_agent_fixture_speaks_the_protocol_the_driver_parses() {
     assert!(
         source.contains("\\\"type\\\":\\\"result\\\"") || source.contains("\"type\":\"result\""),
         "the fixture must emit the result object the driver parses"
+    );
+}
+
+/// The usage text the binary actually prints must list every command it accepts.
+///
+/// `run` and `resume` were documented from the start; `handoffs` shipped later
+/// and drifted out of the message. This drives the compiled binary rather than
+/// the constant, so what is asserted is what a caller sees on a bad invocation.
+///
+/// The commands checked come from [`cli_config::Command::all`], next to the
+/// matches that the compiler keeps exhaustive — not from a list repeated here,
+/// so the usage text and this test cannot drift apart over separate copies.
+/// A usage line missing for any listed command fails here.
+#[test]
+fn the_usage_text_lists_every_command_the_binary_accepts() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_orqynn"))
+        .arg("--definitely-not-a-flag")
+        .output()
+        .expect("the orqynn binary is built alongside these tests");
+
+    // Bad configuration is refused, and refused before anything runs.
+    assert_eq!(
+        output.status.code(),
+        Some(ExitCode::Configuration.status()),
+        "an unknown flag is a configuration error, not a silent default"
+    );
+
+    let printed = String::from_utf8_lossy(&output.stderr);
+    for command in CliCommand::all() {
+        let word = command.as_str();
+        assert!(
+            printed.contains(&format!("orqynn {word} ")),
+            "the usage must show how to invoke `{word}`:\n{printed}"
+        );
+    }
+
+    // `handoffs` is read-only, and the message must not imply it can launch.
+    assert!(
+        printed.contains("read-only"),
+        "the handoffs line must say it lists records rather than drives work:\n{printed}"
     );
 }

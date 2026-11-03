@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Which of the two commands was asked for.
+/// Which of the three commands was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// Plan a new task and drive it. What Phase 7 added.
@@ -51,6 +51,23 @@ impl Command {
             Command::Resume => "resume",
             Command::Handoffs => "handoffs",
         }
+    }
+
+    /// Every command the binary accepts, in the order the usage message shows.
+    ///
+    /// Stable Rust cannot enumerate an enum's variants, so this list is written
+    /// by hand — but it sits beside [`Command::parse`] and [`Command::as_str`],
+    /// whose matches are exhaustive and will not compile until a new variant is
+    /// covered, so the three lists are as hard to drift apart as the language
+    /// allows. The usage regression tests iterate this rather than a list of
+    /// their own: keep this in step when a command is added.
+    ///
+    /// No production path calls this — it exists for the usage regression
+    /// tests, so it is allowed to read as dead code outside a test build. If a
+    /// real call site ever appears, remove the allowance.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn all() -> &'static [Command] {
+        &[Command::Run, Command::Resume, Command::Handoffs]
     }
 }
 

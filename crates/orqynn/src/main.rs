@@ -24,8 +24,10 @@ const USAGE: &str = "\
 orqynn — drive one task through Orqyn's loop, or recover one from persisted state
 
 USAGE:
-    orqynn run    --repo <path> --task <description> --check <command>... [options]
-    orqynn resume --repo <path> --task-id <id> [--check <command>]... [--remediate retry]
+    orqynn run      --repo <path> --task <description> --check <command>... [options]
+    orqynn resume   --repo <path> --task-id <id> [--check <command>]... [--remediate retry]
+    orqynn handoffs --repo <path> --task-id <id>
+                     read-only: list one task's persisted handoff records
 
 REQUIRED (for a real run):
     --repo <path>              git repository to observe and work in
@@ -241,4 +243,27 @@ fn fail(err: &RunError) -> ProcessExitCode {
 
 fn status(code: ExitCode) -> ProcessExitCode {
     ProcessExitCode::from(code.status() as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config::Command;
+    use crate::USAGE;
+
+    /// `USAGE` must advertise every command the binary accepts.
+    ///
+    /// The integration test drives the real process and checks what it prints;
+    /// this one checks the constant itself, which is what a caller would edit
+    /// by hand. It also keeps [`Command::all`] in use in this crate, so the
+    /// one place the command list lives stays compiled and in step.
+    #[test]
+    fn the_usage_constant_lists_every_command() {
+        for command in Command::all() {
+            assert!(
+                USAGE.contains(&format!("orqynn {} ", command.as_str())),
+                "USAGE does not show how to invoke `{}`",
+                command.as_str()
+            );
+        }
+    }
 }
