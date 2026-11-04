@@ -8,10 +8,10 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
 [![CI](https://github.com/abyyxhek/orqynn/actions/workflows/ci.yml/badge.svg)](https://github.com/abyyxhek/orqynn/actions/workflows/ci.yml)
 [![Architecture](https://img.shields.io/badge/Architecture-Hexagonal%20%2F%20MCP%20Client-purple.svg?style=for-the-badge)](docs/PHASE0-FORENSICS.md)
-<!-- Manually maintained snapshot of a local run, dated 2026-11-03. Not wired to
+<!-- Manually maintained snapshot of a local run, dated 2026-11-04. Not wired to
      CI: refresh it by running `cargo test --workspace` and editing this badge.
      The live build status is the CI badge above. -->
-[![Tests](https://img.shields.io/badge/Tests-1%2C066%20Passing%20%2F%2019%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
+[![Tests](https://img.shields.io/badge/Tests-1%2C092%20Passing%20%2F%2019%20Ignored-brightgreen.svg?style=for-the-badge)](crates/)
 [![Status](https://img.shields.io/badge/Status-Core%20Loop%20Complete%20%C2%B7%20One--Shot%20CLI-success.svg?style=for-the-badge)](#)
 
 **A vendor-independent orchestration brain for multi-agent software engineering.**
