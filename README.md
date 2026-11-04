@@ -960,9 +960,12 @@ between were never built, or were absorbed elsewhere:
   why the status badge reads "One-Shot CLI".
 
 No phase after 13 has a `docs/PHASE*.md` document: Phases 14–26 are recorded
-only in the table above, and working reports numbered 33–35 exist as untracked
-files at the repository root but are not part of the documented series. The one
-later audit that *is* tracked is the Phase 42 multi-agent coordination audit,
+only in the table above, and the working reports numbered 33–35
+([`PHASE33_REPORT.md`](PHASE33_REPORT.md),
+[`PHASE34_REPORT.md`](PHASE34_REPORT.md),
+[`PHASE35_REPORT.md`](PHASE35_REPORT.md)) are tracked at the repository root as
+point-in-time audits of baseline `ffe96e4`, not part of the documented series.
+The one later audit that *is* tracked is the Phase 42 multi-agent coordination audit,
 [`MULTI_AGENT_AUDIT.md`](MULTI_AGENT_AUDIT.md) at the repository root
 (2026-11-03): 15 barrier-driven concurrency probes over real SQLite files, whose
 confirmed defects are recorded under [Current limitations](#current-limitations)
